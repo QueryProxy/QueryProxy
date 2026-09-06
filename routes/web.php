@@ -5,6 +5,7 @@ use App\Http\Controllers\TeamSwitchController;
 use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
+use App\Livewire\Connections\Index as ConnectionsIndex;
 use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/dashboard');
@@ -19,6 +20,10 @@ Route::middleware('auth')->group(function () {
     Route::post('/teams/{team}/switch', TeamSwitchController::class)->name('teams.switch');
 
     Route::view('/dashboard', 'dashboard')->name('dashboard');
+
+    Route::middleware('role:dba')->group(function () {
+        Route::get('/connections', ConnectionsIndex::class)->name('connections.index');
+    });
 
     Route::middleware('admin')->prefix('admin')->name('admin.')->group(function () {
         Route::get('/teams', Teams::class)->name('teams');
