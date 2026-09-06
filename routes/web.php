@@ -7,6 +7,7 @@ use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
 use App\Livewire\Approvals\Index as ApprovalsIndex;
 use App\Livewire\Connections\Index as ConnectionsIndex;
+use App\Livewire\Masking\Index as MaskingIndex;
 use App\Livewire\Requests\Index as RequestsIndex;
 use App\Livewire\Requests\Show as RequestsShow;
 use App\Livewire\Studio\QueryStudio;
@@ -28,6 +29,7 @@ Route::middleware('auth')->group(function () {
     Route::middleware('role:dba')->group(function () {
         Route::get('/connections', ConnectionsIndex::class)->name('connections.index');
         Route::get('/approvals', ApprovalsIndex::class)->name('approvals.index');
+        Route::get('/masking', MaskingIndex::class)->name('masking.index');
     });
 
     Route::middleware('role:dba,developer')->group(function () {

@@ -3,6 +3,7 @@
 namespace Database\Seeders;
 
 use App\Enums\TeamRole;
+use App\Models\MaskingRule;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Database\Seeder;
@@ -37,5 +38,9 @@ class DatabaseSeeder extends Seeder
             User::factory()->create(['name' => 'Audrey Auditor', 'email' => 'auditor@example.com']),
             ['role' => TeamRole::Auditor->value],
         );
+
+        foreach (MaskingRule::defaults() as $default) {
+            MaskingRule::create($default + ['team_id' => $team->id]);
+        }
     }
 }
