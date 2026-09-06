@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\AuditExportController;
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\ResultDownloadController;
 use App\Http\Controllers\TeamSwitchController;
@@ -9,6 +10,7 @@ use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
 use App\Livewire\Approvals\Index as ApprovalsIndex;
+use App\Livewire\Audit\Index as AuditIndex;
 use App\Livewire\Connections\Index as ConnectionsIndex;
 use App\Livewire\Masking\Index as MaskingIndex;
 use App\Livewire\Requests\Index as RequestsIndex;
@@ -45,6 +47,11 @@ Route::middleware('auth')->group(function () {
         Route::get('/approvals', ApprovalsIndex::class)->name('approvals.index');
         Route::get('/masking', MaskingIndex::class)->name('masking.index');
         Route::get('/settings/chatops', ChatOpsSettings::class)->name('settings.chatops');
+    });
+
+    Route::middleware('role:auditor')->group(function () {
+        Route::get('/audit', AuditIndex::class)->name('audit.index');
+        Route::get('/audit/export', AuditExportController::class)->name('audit.export');
     });
 
     Route::middleware('role:dba,developer')->group(function () {

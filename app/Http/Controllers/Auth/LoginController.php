@@ -46,11 +46,15 @@ class LoginController extends Controller
         RateLimiter::clear($throttleKey);
         $request->session()->regenerate();
 
+        audit()->record('auth.login');
+
         return redirect()->intended(route('dashboard'));
     }
 
     public function destroy(Request $request): RedirectResponse
     {
+        audit()->record('auth.logout');
+
         Auth::guard('web')->logout();
 
         $request->session()->invalidate();
