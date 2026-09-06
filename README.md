@@ -1,58 +1,166 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# QueryProxy
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+**Self-hosted database access control & query approval portal.**
 
-## About Laravel
+QueryProxy sits between your developers and your databases. Instead of handing out
+production credentials, developers submit SQL through a guarded editor; DBAs approve
+or reject from the web UI or straight from Slack / Teams; approved queries run
+asynchronously on a worker, and results come back **masked, limited and fully audited**.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+> Built for small and mid-sized engineering teams, DevOps engineers and DBAs.
+> Single Laravel monolith, zero external dependencies by default. AGPLv3.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+---
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+## Features
 
-## Learning Laravel
+- **RBAC with team isolation** — Admin / DBA / Developer / Auditor roles; every
+  connection, request, masking rule and audit trail is scoped to a team.
+- **Connection vault** — target database credentials (PostgreSQL, MySQL, MariaDB,
+  SQL Server, SQLite) are AES-256-encrypted at rest; developers only see
+  connections a DBA explicitly granted them.
+- **Guarded Query Studio** — CodeMirror SQL editor with server-side AST guards:
+  - `UPDATE` / `DELETE` without `WHERE` are rejected at submission,
+  - `SELECT` without `LIMIT` gets `LIMIT 1000` injected (hard cap `10000`),
+  - multiple statements require an explicit `BEGIN; ...; COMMIT;` transaction,
+  - administrative statements (`GRANT`, `DROP DATABASE`, `SET GLOBAL`, ...) are blocked.
+- **Approval workflow** — pending requests wait indefinitely until a DBA decides;
+  self-approval is blocked; every decision records who, when and through which channel.
+- **ChatOps** — Slack messages with interactive **Approve / Reject** buttons
+  (HMAC-SHA256 signature + replay-window verification on every callback) and
+  Microsoft Teams cards with an HMAC-verified action endpoint.
+- **Async execution** — approved queries run on a queue worker; reads stream
+  through database cursors into NDJSON files with constant memory usage.
+- **Dynamic data masking** — column-pattern and content-regex rules
+  (full / partial / hash strategies) applied *while results are written*,
+  so unmasked PII never reaches the result store.
+- **Result viewer** — paginated browser + streamed CSV export, with retention pruning.
+- **Immutable audit log** — every login, grant, submission, decision, execution and
+  download; filterable auditor UI with CSV export.
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+## Quick start (Docker)
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+git clone https://github.com/queryproxy/queryproxy.git
+cd queryproxy
+docker compose up
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+Open <http://localhost:8000> — with the default compose file (`QUERYPROXY_SEED_DEMO=true`)
+you can log in as:
 
-## Contributing
+| Role | Email | Password |
+| :--- | :--- | :--- |
+| Admin | `admin@example.com` | `password` |
+| DBA | `dba@example.com` | `password` |
+| Developer | `developer@example.com` | `password` |
+| Auditor | `auditor@example.com` | `password` |
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+Three containers start: the web app, a queue worker (executes approved queries)
+and the scheduler (result retention pruning).
 
-## Code of Conduct
+## Manual installation
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+Requirements: PHP ≥ 8.3 (pdo drivers for your target databases), Composer, Node 20+.
 
-## Security Vulnerabilities
+```bash
+composer install
+cp .env.example .env
+php artisan key:generate
+touch database/database.sqlite
+php artisan migrate            # add --seed for the demo team
+npm install && npm run build
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+php artisan serve              # web app
+php artisan queue:work --queue=queries,default --timeout=310   # worker (required!)
+php artisan schedule:work      # scheduler (optional)
+```
+
+> The queue worker is **not optional** — approved queries execute there (ADR-002).
+
+## How it works
+
+```
+Developer ──▶ Query Studio ──▶ SQL guards (AST) ──▶ pending request
+                                                        │
+                       Slack / Teams ◀── notification ──┤
+                            │                           │
+                            ▼                           ▼
+                     Approve / Reject ──────▶ queue ──▶ worker
+                     (HMAC-verified)                    │ cursor streaming
+                                                        ▼
+                                        masked NDJSON result on storage disk
+                                                        │
+                              viewer / CSV download ◀───┘   (all steps audited)
+```
+
+## Configuration
+
+All knobs live in `.env` (see `.env.example` for the full list):
+
+| Key | Default | Meaning |
+| :-- | :-- | :-- |
+| `QUERYPROXY_SELECT_DEFAULT_LIMIT` | `1000` | LIMIT injected into SELECTs without one |
+| `QUERYPROXY_SELECT_HARD_LIMIT` | `10000` | Larger LIMITs are clamped to this |
+| `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution |
+| `QUERYPROXY_RESULT_DISK` | `local` | Filesystem disk for result files (`s3` supported) |
+| `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
+
+The application database defaults to SQLite; set the usual `DB_*` variables for
+MySQL/PostgreSQL. The queue uses the database driver by default; set
+`QUEUE_CONNECTION=redis` if you run Redis.
+
+## Slack setup
+
+1. Create a Slack app → enable **Incoming Webhooks** (pick the approvals channel)
+   and **Interactivity**, pointing the request URL to
+   `https://your-host/webhooks/slack/interactions`.
+2. In QueryProxy: **ChatOps** (as DBA) → paste the webhook URL and the app's
+   **signing secret**.
+3. In **Admin → Users**, fill each reviewer's **Slack member ID** (e.g. `U0123ABC`).
+
+Every callback is verified with Slack's `v0` HMAC-SHA256 signature scheme within a
+±5 minute replay window; forged or stale callbacks are rejected with `401`.
+
+## Teams setup
+
+1. Add an **Incoming Webhook** to your channel and save it under **ChatOps** for
+   announcements.
+2. For approve/reject actions, call `POST /webhooks/teams/actions` with an
+   `Authorization: HMAC <base64(hmac_sha256(raw_body, secret))>` header
+   (Teams outgoing-webhook style — easy to wire from a Power Automate flow):
+
+```json
+{ "action": "approve", "request_id": 123, "actor_email": "dba@example.com" }
+```
+
+## SQL Server support
+
+The default image ships `pdo_pgsql`, `pdo_mysql` and `pdo_sqlite`. To proxy MSSQL
+targets, extend the Dockerfile with Microsoft's ODBC driver and the `sqlsrv` /
+`pdo_sqlsrv` PECL extensions.
+
+## Development
+
+```bash
+composer install && npm install
+php artisan test        # Pest suite
+./vendor/bin/pint       # code style
+npm run dev             # Vite dev server
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Product requirements and architecture
+decisions live in the project's SSOT repository (PRD / ADR / MVP plan).
+
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
+
+Highlights: encrypted credentials at rest, HMAC-verified chat callbacks, immutable
+audit logs, login & webhook rate limiting, self-approval prevention, masked-at-write
+result storage.
 
 ## License
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+[GNU Affero General Public License v3.0](LICENSE). If you run a modified QueryProxy
+as a network service, you must publish your modifications under the same license.

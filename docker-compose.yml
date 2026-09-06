@@ -1,0 +1,76 @@
+# Zero-config: `docker compose up` boots the portal on http://localhost:8000
+# with a SQLite application database and a database-backed queue (ADR-002).
+#
+# Demo login (only when QUERYPROXY_SEED_DEMO=true): admin@example.com / password
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment: &env
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_URL: http://localhost:8000
+      DB_CONNECTION: sqlite
+      DB_DATABASE: /var/www/html/database/database.sqlite
+      QUEUE_CONNECTION: database
+      QUERYPROXY_SEED_DEMO: "true"
+    volumes:
+      - app-database:/var/www/html/database
+      - app-storage:/var/www/html/storage/app
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://localhost:8000/up') ? 0 : 1);"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build: .
+    command: php artisan queue:work --queue=queries,default --tries=1 --timeout=310
+    environment: *env
+    volumes:
+      - app-database:/var/www/html/database
+      - app-storage:/var/www/html/storage/app
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: php artisan schedule:work
+    environment: *env
+    volumes:
+      - app-database:/var/www/html/database
+      - app-storage:/var/www/html/storage/app
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  app-database:
+  app-storage:
+
+# --- Using MySQL or PostgreSQL for the application database instead ---
+# 1. Uncomment the service below and the depends_on entries you need.
+# 2. Point DB_* env vars at it, e.g.:
+#      DB_CONNECTION: pgsql
+#      DB_HOST: db
+#      DB_PORT: 5432
+#      DB_DATABASE: queryproxy
+#      DB_USERNAME: queryproxy
+#      DB_PASSWORD: change-me
+#
+#  db:
+#    image: postgres:17-alpine
+#    environment:
+#      POSTGRES_DB: queryproxy
+#      POSTGRES_USER: queryproxy
+#      POSTGRES_PASSWORD: change-me
+#    volumes:
+#      - db-data:/var/lib/postgresql/data
+#
+# volumes:
+#   db-data:
