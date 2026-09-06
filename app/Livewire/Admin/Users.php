@@ -2,6 +2,7 @@
 
 namespace App\Livewire\Admin;
 
+use App\Models\ChatIdentity;
 use App\Models\User;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Title;
@@ -81,10 +82,44 @@ class Users extends Component
         $user->delete();
     }
 
+    public function updateSlackId(int $userId, string $slackId): void
+    {
+        $user = User::findOrFail($userId);
+        $slackId = trim($slackId);
+
+        if ($slackId === '') {
+            ChatIdentity::where('user_id', $user->id)->where('provider', 'slack')->delete();
+            audit()->record('chat_identity.removed', metadata: ['user' => $user->email, 'provider' => 'slack']);
+
+            return;
+        }
+
+        $taken = ChatIdentity::where('provider', 'slack')
+            ->where('external_id', $slackId)
+            ->where('user_id', '!=', $user->id)
+            ->exists();
+
+        if ($taken) {
+            $this->addError('email', "Slack ID {$slackId} is already linked to another user.");
+
+            return;
+        }
+
+        ChatIdentity::updateOrCreate(
+            ['user_id' => $user->id, 'provider' => 'slack'],
+            ['external_id' => $slackId],
+        );
+
+        audit()->record('chat_identity.linked', metadata: [
+            'user' => $user->email, 'provider' => 'slack', 'external_id' => $slackId,
+        ]);
+    }
+
     public function render()
     {
         return view('livewire.admin.users', [
             'users' => User::withCount('teams')->orderBy('name')->get(),
+            'slackIds' => ChatIdentity::where('provider', 'slack')->pluck('external_id', 'user_id'),
         ]);
     }
 }

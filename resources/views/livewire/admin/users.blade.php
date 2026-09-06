@@ -45,6 +45,7 @@
                     <th class="px-4 py-3">Name</th>
                     <th class="px-4 py-3">Email</th>
                     <th class="px-4 py-3">Teams</th>
+                    <th class="px-4 py-3">Slack ID</th>
                     <th class="px-4 py-3">Admin</th>
                     <th class="px-4 py-3"></th>
                 </tr>
@@ -55,6 +56,11 @@
                         <td class="px-4 py-3 font-medium">{{ $u->name }}</td>
                         <td class="px-4 py-3 text-slate-500">{{ $u->email }}</td>
                         <td class="px-4 py-3">{{ $u->teams_count }}</td>
+                        <td class="px-4 py-3">
+                            <input type="text" value="{{ $slackIds[$u->id] ?? '' }}" placeholder="U0123ABC"
+                                   wire:change="updateSlackId({{ $u->id }}, $event.target.value)"
+                                   class="w-28 rounded-md border border-slate-300 px-2 py-1 font-mono text-xs">
+                        </td>
                         <td class="px-4 py-3">
                             @if($u->is_admin)
                                 <span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">Admin</span>

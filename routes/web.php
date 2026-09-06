@@ -3,6 +3,8 @@
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\ResultDownloadController;
 use App\Http\Controllers\TeamSwitchController;
+use App\Http\Controllers\Webhooks\SlackInteractionController;
+use App\Http\Controllers\Webhooks\TeamsActionController;
 use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
@@ -11,10 +13,21 @@ use App\Livewire\Connections\Index as ConnectionsIndex;
 use App\Livewire\Masking\Index as MaskingIndex;
 use App\Livewire\Requests\Index as RequestsIndex;
 use App\Livewire\Requests\Show as RequestsShow;
+use App\Livewire\Settings\ChatOps as ChatOpsSettings;
 use App\Livewire\Studio\QueryStudio;
 use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/dashboard');
+
+Route::prefix('webhooks')->middleware('throttle:60,1')->group(function () {
+    Route::post('/slack/interactions', SlackInteractionController::class)
+        ->middleware('slack.signature')
+        ->name('webhooks.slack');
+
+    Route::post('/teams/actions', TeamsActionController::class)
+        ->middleware('teams.hmac')
+        ->name('webhooks.teams');
+});
 
 Route::middleware('guest')->group(function () {
     Route::get('/login', [LoginController::class, 'create'])->name('login');
@@ -31,6 +44,7 @@ Route::middleware('auth')->group(function () {
         Route::get('/connections', ConnectionsIndex::class)->name('connections.index');
         Route::get('/approvals', ApprovalsIndex::class)->name('approvals.index');
         Route::get('/masking', MaskingIndex::class)->name('masking.index');
+        Route::get('/settings/chatops', ChatOpsSettings::class)->name('settings.chatops');
     });
 
     Route::middleware('role:dba,developer')->group(function () {

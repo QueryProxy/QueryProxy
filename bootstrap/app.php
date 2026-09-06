@@ -2,6 +2,8 @@
 
 use App\Http\Middleware\EnsureAdmin;
 use App\Http\Middleware\EnsureTeamRole;
+use App\Http\Middleware\VerifySlackSignature;
+use App\Http\Middleware\VerifyTeamsHmac;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -17,6 +19,12 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'admin' => EnsureAdmin::class,
             'role' => EnsureTeamRole::class,
+            'slack.signature' => VerifySlackSignature::class,
+            'teams.hmac' => VerifyTeamsHmac::class,
+        ]);
+
+        $middleware->validateCsrfTokens(except: [
+            'webhooks/*',
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

@@ -47,6 +47,9 @@
                     @if(Route::has('masking.index'))
                         <x-nav-link :href="route('masking.index')" :active="request()->routeIs('masking.*')">Masking</x-nav-link>
                     @endif
+                    @if(Route::has('settings.chatops'))
+                        <x-nav-link :href="route('settings.chatops')" :active="request()->routeIs('settings.*')">ChatOps</x-nav-link>
+                    @endif
                 @endif
                 @if(Route::has('audit.index') && ($role === \App\Enums\TeamRole::Auditor || $user->isAdmin()))
                     <x-nav-link :href="route('audit.index')" :active="request()->routeIs('audit.*')">Audit Log</x-nav-link>
