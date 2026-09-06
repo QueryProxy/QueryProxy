@@ -92,6 +92,8 @@
                     </div>
                 @endif
 
+                <livewire:notification-bell />
+
                 {{-- User menu --}}
                 <div x-data="{ open: false }" class="relative">
                     <button @click="open = !open" @click.outside="open = false"
