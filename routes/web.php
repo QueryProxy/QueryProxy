@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Auth\LoginController;
+use App\Http\Controllers\ResultDownloadController;
 use App\Http\Controllers\TeamSwitchController;
 use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
@@ -39,6 +40,7 @@ Route::middleware('auth')->group(function () {
     Route::middleware('role:dba,developer,auditor')->group(function () {
         Route::get('/requests', RequestsIndex::class)->name('requests.index');
         Route::get('/requests/{queryRequest}', RequestsShow::class)->name('requests.show');
+        Route::get('/requests/{queryRequest}/download', ResultDownloadController::class)->name('requests.download');
     });
 
     Route::middleware('admin')->prefix('admin')->name('admin.')->group(function () {
