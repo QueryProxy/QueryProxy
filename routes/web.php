@@ -6,6 +6,9 @@ use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
 use App\Livewire\Connections\Index as ConnectionsIndex;
+use App\Livewire\Requests\Index as RequestsIndex;
+use App\Livewire\Requests\Show as RequestsShow;
+use App\Livewire\Studio\QueryStudio;
 use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/dashboard');
@@ -23,6 +26,15 @@ Route::middleware('auth')->group(function () {
 
     Route::middleware('role:dba')->group(function () {
         Route::get('/connections', ConnectionsIndex::class)->name('connections.index');
+    });
+
+    Route::middleware('role:dba,developer')->group(function () {
+        Route::get('/studio', QueryStudio::class)->name('studio');
+    });
+
+    Route::middleware('role:dba,developer,auditor')->group(function () {
+        Route::get('/requests', RequestsIndex::class)->name('requests.index');
+        Route::get('/requests/{queryRequest}', RequestsShow::class)->name('requests.show');
     });
 
     Route::middleware('admin')->prefix('admin')->name('admin.')->group(function () {
