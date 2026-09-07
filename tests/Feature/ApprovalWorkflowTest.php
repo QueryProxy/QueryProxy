@@ -3,6 +3,7 @@
 use App\Enums\QueryRequestStatus;
 use App\Jobs\ExecuteQueryRequest;
 use App\Livewire\Approvals\Index;
+use App\Livewire\Requests\Show;
 use App\Models\AuditLog;
 use App\Models\Connection;
 use App\Models\QueryRequest;
@@ -132,4 +133,64 @@ test('non-pending requests cannot be reviewed again', function () {
 
     expect(fn () => app(ApprovalService::class)->reject($request->fresh(), $dba, 'nope'))
         ->toThrow(AuthorizationException::class);
+});
+
+test('not even an admin can review a request that has already been decided', function () {
+    Queue::fake();
+    Notification::fake();
+
+    [, $dba, , $request] = approvalSetup();
+    $admin = User::factory()->create(['is_admin' => true]);
+
+    app(ApprovalService::class)->approve($request, $dba);
+    $decided = $request->fresh();
+
+    expect(fn () => app(ApprovalService::class)->approve($decided, $admin))
+        ->toThrow(AuthorizationException::class);
+
+    expect(fn () => app(ApprovalService::class)->reject($decided, $admin, 'nope'))
+        ->toThrow(AuthorizationException::class);
+
+    // The decision that actually happened is the only one on record, and the
+    // execution job was dispatched once rather than re-queued.
+    Queue::assertPushed(ExecuteQueryRequest::class, 1);
+    expect($decided->fresh()->reviewed_by)->toBe($dba->id);
+});
+
+test('an admin is offered neither review nor cancel on a decided request', function () {
+    Queue::fake();
+    Notification::fake();
+
+    [, $dba, , $request] = approvalSetup();
+    $admin = User::factory()->create(['is_admin' => true]);
+
+    app(ApprovalService::class)->approve($request, $dba);
+    $decided = $request->fresh();
+
+    expect($admin->can('review', $decided))->toBeFalse()
+        ->and($admin->can('cancel', $decided))->toBeFalse();
+
+    Livewire::actingAs($admin)
+        ->test(Show::class, ['queryRequest' => $decided])
+        ->assertViewHas('canReview', false)
+        ->assertViewHas('canCancel', false);
+});
+
+test('an admin keeps every power the state machine still allows', function () {
+    // Deliberately not a member of the team: this is the override the
+    // Gate::before bypass used to provide, and it must survive.
+    [, , , $request] = approvalSetup();
+    $admin = User::factory()->create(['is_admin' => true]);
+
+    expect($admin->can('view', $request))->toBeTrue()
+        ->and($admin->can('review', $request))->toBeTrue()
+        ->and($admin->can('cancel', $request))->toBeTrue();
+
+    $request->update([
+        'status' => QueryRequestStatus::Completed,
+        'result_disk' => 'local',
+        'result_path' => 'results/1.ndjson',
+    ]);
+
+    expect($admin->can('downloadResult', $request->fresh()))->toBeTrue();
 });
