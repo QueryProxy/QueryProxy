@@ -4,7 +4,7 @@
             <a href="{{ route('requests.index') }}" class="text-sm text-slate-500 hover:text-slate-700">&larr; Requests</a>
             <h1 class="mt-1 flex items-center gap-3 text-2xl font-bold tracking-tight">
                 Request #{{ $request->id }}
-                <span class="rounded px-2 py-0.5 text-sm font-medium {{ $request->status->badgeClasses() }}">{{ $request->status->label() }}</span>
+                <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
                 <span class="rounded px-1.5 py-0.5 text-xs font-bold uppercase {{ $request->type->value === 'read' ? 'bg-sky-100 text-sky-700' : 'bg-orange-100 text-orange-700' }}">{{ $request->type->value }}</span>
                 @if($request->is_transaction)
                     <span class="rounded bg-violet-100 px-1.5 py-0.5 text-xs font-medium text-violet-700">transaction</span>

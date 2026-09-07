@@ -44,7 +44,7 @@
                             </span>
                         </td>
                         <td class="px-4 py-3">
-                            <span class="rounded px-1.5 py-0.5 text-xs font-medium {{ $request->status->badgeClasses() }}">{{ $request->status->label() }}</span>
+                            <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
                         </td>
                         <td class="px-4 py-3 text-slate-500" title="{{ $request->created_at }}">{{ $request->created_at->diffForHumans() }}</td>
                     </tr>

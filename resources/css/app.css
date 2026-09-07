@@ -1,9 +1,148 @@
 @import 'tailwindcss';
 
-@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
 @source '../../storage/framework/views/*.php';
 
-@theme {
-    --font-sans: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
-        'Segoe UI Symbol', 'Noto Color Emoji';
+/*
+| Ops Console design tokens.
+|
+| Dark is the base theme: the values below are the dark palette, and the
+| [data-theme='light'] block further down re-declares the same custom
+| properties. Because every Tailwind utility compiles to var(--color-*),
+| swapping the attribute on <html> re-themes the whole app — no dark:
+| variants and no duplicated class lists anywhere in the Blade views.
+|
+| `static` forces Tailwind to emit every variable even when no utility
+| references it yet; without it a variable the light block overrides can
+| be tree-shaken out of the stylesheet.
+*/
+@theme static {
+    --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+    --font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    --radius-badge: 3px;
+    --radius-control: 6px;
+    --radius-panel: 8px;
+
+    /* Surfaces */
+    --color-canvas: #0a0d12;
+    --color-header: #0b1017;
+    --color-panel: #0e131b;
+    --color-raised: #131b2a;
+    --color-line: #1a212c;
+    --color-line-strong: #232c3b;
+
+    /* Text ramp — inverts wholesale in light mode */
+    --color-ink: #e7ecf3;
+    --color-ink-2: #dbe3ee;
+    --color-ink-3: #c3ccd9;
+    --color-ink-4: #9aa7b8;
+    --color-ink-5: #8b97a8;
+    --color-mute: #7c8899;
+    --color-mute-2: #737f90;
+    --color-mute-3: #6d798a;
+    --color-mute-4: #5f6b7d;
+    --color-hairline: #4a5566;
+
+    /* Accent carries navigation, links and primary actions.
+       Every other hue below means a state, never decoration. */
+    --color-accent: #8b93ff;
+    --color-accent-ink: #080a10;
+    --color-pending: #f0b429;
+    --color-running: #4cc2f1;
+    --color-ok: #3fc98a;
+    --color-danger: #f2637a;
+    --color-write: #f5904f;
+
+    /* Status fills: a dark tint of the hue plus a matching border */
+    --color-accent-bg: #101229;
+    --color-accent-line: #2c3168;
+    --color-pending-bg: #1a1407;
+    --color-pending-line: #443614;
+    --color-running-bg: #07161e;
+    --color-running-line: #17394b;
+    --color-ok-bg: #07170f;
+    --color-ok-line: #16402c;
+    --color-danger-bg: #1c0b10;
+    --color-danger-line: #4a1f28;
+    --color-write-bg: #1c1007;
+    --color-write-line: #4a2c14;
+    --color-neutral-bg: #131923;
+    --color-neutral-line: #28313f;
+}
+
+[data-theme='light'] {
+    --color-canvas: #f6f7f9;
+    --color-header: #ffffff;
+    --color-panel: #ffffff;
+    --color-raised: #eef1f6;
+    --color-line: #e3e7ee;
+    --color-line-strong: #cdd4df;
+
+    --color-ink: #131820;
+    --color-ink-2: #1e2530;
+    --color-ink-3: #333d4c;
+    --color-ink-4: #4a5566;
+    --color-ink-5: #5f6b7d;
+    --color-mute: #6d798a;
+    --color-mute-2: #737f90;
+    --color-mute-3: #7c8899;
+    --color-mute-4: #8b97a8;
+    --color-hairline: #b9c2cf;
+
+    --color-accent: #5b63e0;
+    --color-accent-ink: #ffffff;
+    --color-pending: #a16207;
+    --color-running: #0b7fa8;
+    --color-ok: #147d54;
+    --color-danger: #c33a52;
+    --color-write: #b45309;
+
+    --color-accent-bg: #eeeffd;
+    --color-accent-line: #c8cbf5;
+    --color-pending-bg: #fdf6e7;
+    --color-pending-line: #f0ddb0;
+    --color-running-bg: #e8f6fc;
+    --color-running-line: #b3e0f0;
+    --color-ok-bg: #e8f7f0;
+    --color-ok-line: #b3e4cd;
+    --color-danger-bg: #fdedf0;
+    --color-danger-line: #f4c4cd;
+    --color-write-bg: #fdf1e7;
+    --color-write-line: #f2d4b3;
+    --color-neutral-bg: #eef1f6;
+    --color-neutral-line: #d7dde6;
+}
+
+/* The eyebrow is the console's small-caps mono label: table headers,
+   field labels and section markers all share it. */
+@utility eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--color-mute-4);
+}
+
+[x-cloak] {
+    display: none !important;
+}
+
+/* Paired with <x-ui.theme-toggle>: only the icon for the *other* theme shows. */
+[data-theme='light'] .theme-dark-only,
+:root:not([data-theme='light']) .theme-light-only {
+    display: none;
+}
+
+::selection {
+    background-color: color-mix(in oklab, var(--color-accent) 30%, transparent);
+}
+
+html {
+    color-scheme: dark;
+}
+
+[data-theme='light'] {
+    color-scheme: light;
 }
