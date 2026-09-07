@@ -4,6 +4,19 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.1.1] — 2026-09-08
+
+### Fixed
+
+- Demo seeding (`QUERYPROXY_SEED_DEMO=true`) crashed the production container
+  on first boot: the seeder relied on Faker, which is a dev-only dependency and
+  absent from `--no-dev` installs. The seeder no longer uses factories.
+
+### Added
+
+- `.dockerignore`, so local `docker build` uses the same clean context as CI
+  instead of copying host `vendor/`, `node_modules/` and `.env` into the image.
+
 ## [0.1.0] — 2026-09-08
 
 The first public release.
@@ -39,4 +52,5 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
+[0.1.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.1
 [0.1.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.0

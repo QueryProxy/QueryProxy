@@ -13,31 +13,34 @@ class DatabaseSeeder extends Seeder
     /**
      * Seed a demo environment: one admin, one team, one user per role.
      * All demo accounts use the password "password".
+     *
+     * No factories here on purpose: this seeder runs inside the production
+     * container (QUERYPROXY_SEED_DEMO=true), where dev-only packages such as
+     * Faker are not installed.
      */
     public function run(): void
     {
-        $admin = User::factory()->create([
+        User::create([
             'name' => 'Admin',
             'email' => 'admin@example.com',
+            'password' => 'password',
             'is_admin' => true,
         ]);
 
         $team = Team::create(['name' => 'Demo Team', 'slug' => 'demo-team']);
 
-        $team->users()->attach(
-            User::factory()->create(['name' => 'Dana DBA', 'email' => 'dba@example.com']),
-            ['role' => TeamRole::Dba->value],
-        );
+        $members = [
+            ['Dana DBA', 'dba@example.com', TeamRole::Dba],
+            ['Devin Developer', 'developer@example.com', TeamRole::Developer],
+            ['Audrey Auditor', 'auditor@example.com', TeamRole::Auditor],
+        ];
 
-        $team->users()->attach(
-            User::factory()->create(['name' => 'Devin Developer', 'email' => 'developer@example.com']),
-            ['role' => TeamRole::Developer->value],
-        );
-
-        $team->users()->attach(
-            User::factory()->create(['name' => 'Audrey Auditor', 'email' => 'auditor@example.com']),
-            ['role' => TeamRole::Auditor->value],
-        );
+        foreach ($members as [$name, $email, $role]) {
+            $team->users()->attach(
+                User::create(['name' => $name, 'email' => $email, 'password' => 'password']),
+                ['role' => $role->value],
+            );
+        }
 
         foreach (MaskingRule::defaults() as $default) {
             MaskingRule::create($default + ['team_id' => $team->id]);
