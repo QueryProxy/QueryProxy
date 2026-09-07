@@ -4,6 +4,7 @@ namespace App\Livewire\Results;
 
 use App\Models\QueryRequest;
 use Illuminate\Support\Facades\Storage;
+use Livewire\Attributes\Locked;
 use Livewire\Component;
 
 /**
@@ -14,13 +15,15 @@ class Viewer extends Component
 {
     public QueryRequest $queryRequest;
 
+    #[Locked]
     public int $page = 1;
 
+    #[Locked]
     public int $perPage = 50;
 
     public function mount(): void
     {
-        $this->authorize('view', $this->queryRequest);
+        $this->authorize('viewResult', $this->queryRequest);
     }
 
     public function nextPage(): void

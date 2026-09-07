@@ -71,7 +71,13 @@
             @endif
 
             @if ($request->hasResult())
-                <livewire:results.viewer :query-request="$request" :key="'result-'.$request->id" />
+                @can('viewResult', $request)
+                    <livewire:results.viewer :query-request="$request" :key="'result-'.$request->id" />
+                @else
+                    <x-ui.alert tone="neutral" icon="lock">
+                        Result data is visible to the requester and team DBAs only.
+                    </x-ui.alert>
+                @endcan
             @endif
         </div>
 

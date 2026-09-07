@@ -54,8 +54,22 @@ class QueryRequestPolicy
         return $user->isAdmin() || $request->user_id === $user->id;
     }
 
+    /**
+     * Result *data* is scoped tighter than request metadata: auditors review
+     * histories and approval traces (PRD role definition) but do not get the
+     * row payloads.
+     */
+    public function viewResult(User $user, QueryRequest $request): bool
+    {
+        if ($user->isAdmin() || $request->user_id === $user->id) {
+            return true;
+        }
+
+        return $user->isDbaIn($request->team);
+    }
+
     public function downloadResult(User $user, QueryRequest $request): bool
     {
-        return $request->hasResult() && $this->view($user, $request);
+        return $request->hasResult() && $this->viewResult($user, $request);
     }
 }

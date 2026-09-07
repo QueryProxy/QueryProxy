@@ -14,10 +14,12 @@
     "license": "AGPL-3.0-only",
     "require": {
         "php": "^8.3",
+        "bacon/bacon-qr-code": "^3.1",
         "laravel/framework": "^13.17",
         "laravel/tinker": "^3.0",
         "livewire/livewire": "^4.4",
-        "phpmyadmin/sql-parser": "^6.0"
+        "phpmyadmin/sql-parser": "^6.0",
+        "pragmarx/google2fa": "^9.1"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

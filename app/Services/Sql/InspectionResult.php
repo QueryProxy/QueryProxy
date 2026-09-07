@@ -33,6 +33,18 @@ final class InspectionResult
         return StatementType::Read;
     }
 
+    /** True when any statement is DDL (CREATE / ALTER / DROP / TRUNCATE / RENAME). */
+    public function hasDdl(): bool
+    {
+        foreach ($this->statements as $statement) {
+            if ($statement->isDdl) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function preparedSql(): string
     {
         return implode(";\n", array_map(

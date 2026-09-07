@@ -41,6 +41,18 @@ class Index extends Component
         return auth()->user()->currentTeam() ?? abort(403);
     }
 
+    /**
+     * Route middleware only guards the initial page load; every action must
+     * re-check because Livewire updates arrive on a separate endpoint and the
+     * actor's role may have been changed since the page was served.
+     */
+    private function assertDba(Team $team): void
+    {
+        $user = auth()->user();
+
+        abort_unless($user->isAdmin() || $user->isDbaIn($team), 403);
+    }
+
     public function openCreate(): void
     {
         $this->reset('editingId', 'name', 'pattern', 'connectionId');
@@ -67,6 +79,7 @@ class Index extends Component
     public function save(): void
     {
         $team = $this->team();
+        $this->assertDba($team);
 
         $validated = $this->validate([
             'name' => ['required', 'string', 'max:100'],
@@ -76,10 +89,21 @@ class Index extends Component
             'connectionId' => ['nullable', Rule::exists('connections', 'id')->where('team_id', $team->id)],
         ]);
 
-        if ($validated['matchType'] === 'regex' && @preg_match($validated['pattern'], '') === false) {
-            $this->addError('pattern', 'This is not a valid PCRE regular expression (delimiters required, e.g. /.../).');
+        if ($validated['matchType'] === 'regex') {
+            if (@preg_match($validated['pattern'], '') === false) {
+                $this->addError('pattern', 'This is not a valid PCRE regular expression (delimiters required, e.g. /.../).');
 
-            return;
+                return;
+            }
+
+            // Stress the pattern against a long probe string: catastrophic
+            // backtracking trips PCRE's backtrack limit and returns false,
+            // so a rule that would burn worker CPU is rejected up-front.
+            if (@preg_match($validated['pattern'], str_repeat('aA0.! ', 2000)) === false) {
+                $this->addError('pattern', 'This pattern is too complex to evaluate safely (catastrophic backtracking).');
+
+                return;
+            }
         }
 
         $attributes = [
@@ -104,6 +128,8 @@ class Index extends Component
 
     public function toggle(int $ruleId): void
     {
+        $this->assertDba($this->team());
+
         $rule = MaskingRule::forTeam($this->team())->findOrFail($ruleId);
         $rule->update(['enabled' => ! $rule->enabled]);
 
@@ -114,6 +140,8 @@ class Index extends Component
 
     public function deleteRule(int $ruleId): void
     {
+        $this->assertDba($this->team());
+
         $rule = MaskingRule::forTeam($this->team())->findOrFail($ruleId);
 
         audit()->record('masking_rule.deleted', team: $rule->team, metadata: ['rule' => $rule->name]);
@@ -124,6 +152,7 @@ class Index extends Component
     public function addDefaults(): void
     {
         $team = $this->team();
+        $this->assertDba($team);
 
         foreach (MaskingRule::defaults() as $default) {
             MaskingRule::firstOrCreate(

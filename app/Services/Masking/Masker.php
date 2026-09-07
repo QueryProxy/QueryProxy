@@ -65,7 +65,17 @@ class Masker
 
         if (is_string($value)) {
             foreach ($rules as $rule) {
-                if ($rule->match_type === MaskMatchType::Regex && @preg_match($rule->pattern, $value) === 1) {
+                if ($rule->match_type !== MaskMatchType::Regex) {
+                    continue;
+                }
+
+                $matched = @preg_match($rule->pattern, $value);
+
+                // Fail closed: when PCRE cannot evaluate the pattern against
+                // this value (backtrack/recursion limit), treat it as a match —
+                // emitting the raw value on evaluation failure would silently
+                // bypass masking exactly when the data is most pathological.
+                if ($matched === 1 || $matched === false) {
                     return $this->apply($rule->strategy, $value);
                 }
             }

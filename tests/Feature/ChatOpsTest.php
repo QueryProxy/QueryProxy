@@ -150,25 +150,32 @@ test('slack users cannot approve their own requests', function () {
         ->and($own->fresh()->status)->toBe(QueryRequestStatus::Pending);
 });
 
+function teamsHeaders(string $body, string $secret = TEAMS_SECRET, ?int $timestamp = null): array
+{
+    $timestamp ??= time();
+
+    return [
+        'HTTP_AUTHORIZATION' => 'HMAC '.base64_encode(hash_hmac('sha256', "{$timestamp}:{$body}", $secret, true)),
+        'HTTP_X_QUERYPROXY_TIMESTAMP' => (string) $timestamp,
+        'CONTENT_TYPE' => 'application/json',
+    ];
+}
+
 test('a correctly signed teams action approves the request', function () {
     Queue::fake();
     Notification::fake();
     Http::fake();
 
     [, $dba, , $request] = chatSetup();
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'teams', 'external_id' => 'AAD_DBA']);
 
     $body = json_encode([
         'action' => 'approve',
         'request_id' => $request->id,
-        'actor_email' => $dba->email,
+        'actor_id' => 'AAD_DBA',
     ]);
 
-    $signature = base64_encode(hash_hmac('sha256', $body, TEAMS_SECRET, true));
-
-    $this->call('POST', route('webhooks.teams'), [], [], [], [
-        'HTTP_AUTHORIZATION' => 'HMAC '.$signature,
-        'CONTENT_TYPE' => 'application/json',
-    ], $body)->assertOk();
+    $this->call('POST', route('webhooks.teams'), [], [], [], teamsHeaders($body), $body)->assertOk();
 
     expect($request->fresh()->status)->toBe(QueryRequestStatus::Queued)
         ->and($request->fresh()->review_channel)->toBe('teams');
@@ -176,13 +183,39 @@ test('a correctly signed teams action approves the request', function () {
 
 test('teams requests with a bad hmac are rejected', function () {
     [, $dba, , $request] = chatSetup();
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'teams', 'external_id' => 'AAD_DBA']);
 
-    $body = json_encode(['action' => 'approve', 'request_id' => $request->id, 'actor_email' => $dba->email]);
+    $body = json_encode(['action' => 'approve', 'request_id' => $request->id, 'actor_id' => 'AAD_DBA']);
 
-    $this->call('POST', route('webhooks.teams'), [], [], [], [
-        'HTTP_AUTHORIZATION' => 'HMAC '.base64_encode(hash_hmac('sha256', $body, 'wrong', true)),
-        'CONTENT_TYPE' => 'application/json',
-    ], $body)->assertUnauthorized();
+    $this->call('POST', route('webhooks.teams'), [], [], [], teamsHeaders($body, 'wrong'), $body)
+        ->assertUnauthorized();
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Pending);
+});
+
+test('teams requests with a stale timestamp are rejected even when correctly signed', function () {
+    [, $dba, , $request] = chatSetup();
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'teams', 'external_id' => 'AAD_DBA']);
+
+    $body = json_encode(['action' => 'approve', 'request_id' => $request->id, 'actor_id' => 'AAD_DBA']);
+
+    $this->call('POST', route('webhooks.teams'), [], [], [], teamsHeaders($body, timestamp: time() - 600), $body)
+        ->assertUnauthorized();
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Pending);
+});
+
+test('teams actors must be linked through a chat identity, not a self-declared email', function () {
+    Queue::fake();
+    Notification::fake();
+
+    [, $dba, , $request] = chatSetup();
+
+    // No teams ChatIdentity linked: even a valid signature with a real user id must fail.
+    $body = json_encode(['action' => 'approve', 'request_id' => $request->id, 'actor_id' => 'AAD_UNLINKED']);
+
+    $this->call('POST', route('webhooks.teams'), [], [], [], teamsHeaders($body), $body)
+        ->assertStatus(422);
 
     expect($request->fresh()->status)->toBe(QueryRequestStatus::Pending);
 });

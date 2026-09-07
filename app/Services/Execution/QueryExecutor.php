@@ -10,6 +10,7 @@ use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Masking\Masker;
 use App\Services\Sql\SqlInspector;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
 use Throwable;
@@ -32,18 +33,26 @@ class QueryExecutor
 
     public function execute(QueryRequest $request): void
     {
-        if (! in_array($request->status, [QueryRequestStatus::Queued, QueryRequestStatus::Approved], true)) {
+        // Conditional claim: with duplicate job copies (queue re-reservation,
+        // double dispatch) only one worker wins; the rest exit silently.
+        $claimed = QueryRequest::whereKey($request->id)
+            ->whereIn('status', [QueryRequestStatus::Queued, QueryRequestStatus::Approved])
+            ->update([
+                'status' => QueryRequestStatus::Running,
+                'executed_at' => now(),
+            ]);
+
+        if ($claimed === 0) {
             return;
         }
 
+        $request->refresh();
+
         $connection = $request->connection;
 
-        $request->update([
-            'status' => QueryRequestStatus::Running,
-            'executed_at' => now(),
-        ]);
-
-        audit()->record('request.execution_started', actor: $request->reviewer, request: $request);
+        // The immutable log records the SQL that actually runs: query_requests
+        // rows are mutable and cascade-deletable, the audit trail is not.
+        audit()->record('request.execution_started', actor: $request->reviewer, request: $request, sql: $request->sql_prepared);
 
         $connectionName = $this->factory->configure($connection);
         $start = hrtime(true);
@@ -72,14 +81,25 @@ class QueryExecutor
                 'result_rows' => $request->result_row_count,
             ]);
         } catch (Throwable $e) {
+            // Driver errors can echo the connection host / username / database
+            // (fields we encrypt at rest) — redact them before anything
+            // user- or auditor-visible; the full exception goes to the log.
+            $safeMessage = $this->factory->redactError($e->getMessage(), $connection);
+
+            Log::warning('Query execution failed.', [
+                'query_request_id' => $request->id,
+                'exception' => $e::class,
+                'message' => $e->getMessage(),
+            ]);
+
             $request->update([
                 'status' => QueryRequestStatus::Failed,
                 'duration_ms' => intdiv(hrtime(true) - $start, 1_000_000),
-                'error_message' => $e->getMessage(),
+                'error_message' => $safeMessage,
             ]);
 
             audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
-                'error' => $e->getMessage(),
+                'error' => $safeMessage,
             ]);
         } finally {
             $this->factory->purge($connection);
@@ -95,11 +115,23 @@ class QueryExecutor
 
         $temp = tmpfile() ?: throw new RuntimeException('Could not create temporary result file.');
 
+        // Absolute row ceiling, enforced regardless of what the SQL says:
+        // even a query that dodges the LIMIT guard (dialect quirks, SHOW,
+        // EXPLAIN, ...) can never stream more than the hard cap.
+        $hardLimit = max(1, (int) config('queryproxy.select_hard_limit', 10000));
+
         try {
             $columns = [];
             $rowCount = 0;
+            $truncated = false;
 
             foreach (DB::connection($connectionName)->cursor($sql) as $row) {
+                if ($rowCount >= $hardLimit) {
+                    $truncated = true;
+
+                    break;
+                }
+
                 $row = (array) $row;
 
                 if ($rowCount === 0) {
@@ -119,6 +151,7 @@ class QueryExecutor
                 'result_disk' => $disk,
                 'result_path' => $path,
                 'result_row_count' => $rowCount,
+                'result_truncated' => $truncated,
                 'result_columns' => $columns,
             ]);
         } finally {

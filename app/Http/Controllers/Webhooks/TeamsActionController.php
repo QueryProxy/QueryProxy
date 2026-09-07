@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Webhooks;
 
 use App\Http\Controllers\Controller;
+use App\Models\ChatIdentity;
 use App\Models\ChatIntegration;
 use App\Models\QueryRequest;
-use App\Models\User;
 use App\Services\Approvals\ApprovalService;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\JsonResponse;
@@ -13,11 +13,15 @@ use Illuminate\Http\Request;
 
 /**
  * Generic HMAC-verified action endpoint for Microsoft Teams automations
- * (outgoing webhooks / Power Automate flows).
+ * (Power Automate flows / custom automations).
  *
  * Expected JSON body:
  *   { "action": "approve"|"reject", "request_id": 123,
- *     "actor_email": "dba@example.com", "reason": "optional for reject" }
+ *     "actor_id": "<AAD object id>", "reason": "optional for reject" }
+ *
+ * The actor is resolved through the admin-managed ChatIdentity mapping, never
+ * from a self-declared email: whoever holds the shared HMAC secret must not
+ * be able to approve as an arbitrary user.
  */
 class TeamsActionController extends Controller
 {
@@ -26,7 +30,7 @@ class TeamsActionController extends Controller
         $validated = $request->validate([
             'action' => ['required', 'in:approve,reject'],
             'request_id' => ['required', 'integer'],
-            'actor_email' => ['required', 'email'],
+            'actor_id' => ['required', 'string', 'max:255'],
             'reason' => ['nullable', 'string', 'max:1000'],
         ]);
 
@@ -41,11 +45,19 @@ class TeamsActionController extends Controller
             return response()->json(['ok' => false, 'message' => 'Query request not found.'], 404);
         }
 
-        $reviewer = User::where('email', $validated['actor_email'])->first();
+        $identity = ChatIdentity::query()
+            ->where('provider', 'teams')
+            ->where('external_id', $validated['actor_id'])
+            ->first();
 
-        if (! $reviewer) {
-            return response()->json(['ok' => false, 'message' => 'No QueryProxy user with this email.'], 422);
+        if (! $identity) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'This Teams user is not linked to a QueryProxy user. Ask an admin to set the Teams ID in Admin → Users.',
+            ], 422);
         }
+
+        $reviewer = $identity->user;
 
         try {
             if ($validated['action'] === 'approve') {

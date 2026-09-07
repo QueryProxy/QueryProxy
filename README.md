@@ -63,18 +63,18 @@ Prefer a prebuilt image? Every release is published to GitHub Container
 Registry as `ghcr.io/queryproxy/queryproxy` (`latest` and per-version tags) —
 point the compose services' `image:` at it instead of `build: .`.
 
-Open <http://localhost:8000> — with the default compose file (`QUERYPROXY_SEED_DEMO=true`)
-you can log in as:
-
-| Role | Email | Password |
-| :--- | :--- | :--- |
-| Admin | `admin@example.com` | `password` |
-| DBA | `dba@example.com` | `password` |
-| Developer | `developer@example.com` | `password` |
-| Auditor | `auditor@example.com` | `password` |
-
-Three containers start: the web app, a queue worker (executes approved queries)
+Open <http://localhost:8000>. Three containers start: the web app (nginx +
+php-fpm, running as a non-root user), a queue worker (executes approved queries)
 and the scheduler (result retention pruning).
+
+The default compose file creates **no accounts**. To explore with demo data,
+set `QUERYPROXY_SEED_DEMO=true` (the seeder refuses to run while
+`APP_ENV=production` unless you also set `QUERYPROXY_SEED_DEMO_FORCE=true`).
+It creates `admin@example.com`, `dba@example.com`, `developer@example.com` and
+`auditor@example.com` sharing **one randomly generated password, printed once in
+the app container logs** (`docker compose logs app`).
+
+> **Before exposing QueryProxy to a network, read [Production hardening](#production-hardening).**
 
 ## Manual installation
 
@@ -88,12 +88,14 @@ touch database/database.sqlite
 php artisan migrate            # add --seed for the demo team
 npm install && npm run build
 
-php artisan serve              # web app
+php artisan serve              # dev only — use nginx + php-fpm in production
 php artisan queue:work --queue=queries,default --timeout=310   # worker (required!)
 php artisan schedule:work      # scheduler (optional)
 ```
 
 > The queue worker is **not optional** — approved queries execute there (ADR-002).
+> For production, serve `public/` through nginx/php-fpm (as the Docker image
+> does) rather than `php artisan serve`, and read [Production hardening](#production-hardening).
 
 ## How it works
 
@@ -122,10 +124,40 @@ All knobs live in `.env` (see `.env.example` for the full list):
 | `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution |
 | `QUERYPROXY_RESULT_DISK` | `local` | Filesystem disk for result files (`s3` supported) |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
+| `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none` / `admins` / `dba` / `all` |
+| `QUERYPROXY_CHAT_WEBHOOK_ALLOWED_HOSTS` | — | Extra allowed hosts for outbound chat webhooks |
+| `QUERYPROXY_CHAT_INCLUDE_SQL` | `true` | Embed a SQL preview in chat notifications |
+| `QUERYPROXY_CONNECTION_HOST_DENYLIST` | — | Extra hosts blocked as connection targets |
+| `QUERYPROXY_SQLITE_ALLOWED_DIR` | — | Restrict SQLite connection files to this directory |
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL/PostgreSQL. The queue uses the database driver by default; set
 `QUEUE_CONNECTION=redis` if you run Redis.
+
+## Production hardening
+
+QueryProxy stores the credentials to every database it fronts, so treat the
+instance itself as sensitive.
+
+- **Set `APP_KEY` explicitly** and keep it stable. It encrypts connection
+  credentials and chat secrets; changing it makes every stored credential
+  unreadable. Generate one with `docker run --rm ghcr.io/queryproxy/queryproxy php artisan key:generate --show`
+  and put it in the compose `environment:` (all three services share it). When
+  rotating, move the old key into `APP_PREVIOUS_KEYS` so existing ciphertext
+  still decrypts. Without an explicit `APP_KEY`, the container generates one on
+  first boot and persists it to the database volume.
+- **Serve over HTTPS** behind a TLS-terminating reverse proxy (the container
+  serves plain HTTP on `:8000`). Then set `SESSION_SECURE_COOKIE=true` and, if
+  your proxy is not on the compose network, narrow the trusted-proxy setting in
+  `bootstrap/app.php` from `*` to your proxy's address.
+- **Keep demo seeding off** (`QUERYPROXY_SEED_DEMO=false`, the default) on any
+  reachable instance.
+- **Require 2FA** for privileged roles with `QUERYPROXY_REQUIRE_2FA=admins`
+  (or `dba` / `all`). Users are funneled to enrollment on next login.
+- **Restrict connection targets** with `QUERYPROXY_CONNECTION_HOST_DENYLIST` /
+  `QUERYPROXY_SQLITE_ALLOWED_DIR` if DBAs should not reach arbitrary hosts.
+- Security response headers, CSP and the Livewire-endpoint rate limit are on by
+  default; no configuration needed.
 
 ## Slack setup
 
@@ -143,13 +175,22 @@ Every callback is verified with Slack's `v0` HMAC-SHA256 signature scheme within
 
 1. Add an **Incoming Webhook** to your channel and save it under **ChatOps** for
    announcements.
-2. For approve/reject actions, call `POST /webhooks/teams/actions` with an
-   `Authorization: HMAC <base64(hmac_sha256(raw_body, secret))>` header
-   (Teams outgoing-webhook style — easy to wire from a Power Automate flow):
+2. For approve/reject actions, call `POST /webhooks/teams/actions` with a
+   timestamp header and a signature over `{timestamp}:{body}` (mirrors Slack's
+   replay-protected scheme — easy to wire from a Power Automate flow):
 
-```json
-{ "action": "approve", "request_id": 123, "actor_email": "dba@example.com" }
-```
+   ```
+   X-QueryProxy-Timestamp: <unix seconds>       (must be within ±5 minutes)
+   Authorization: HMAC <base64(hmac_sha256("{timestamp}:{raw_body}", secret))>
+   ```
+
+   ```json
+   { "action": "approve", "request_id": 123, "actor_id": "<AAD object id>" }
+   ```
+
+   The approver is resolved through the admin-managed **Teams ID** mapping
+   (Admin → Users), never from a self-declared email — whoever holds the shared
+   secret must not be able to act as an arbitrary user.
 
 ## SQL Server support
 
@@ -173,9 +214,11 @@ decisions live in the project's SSOT repository (PRD / ADR / MVP plan).
 
 Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 
-Highlights: encrypted credentials at rest, HMAC-verified chat callbacks, immutable
-audit logs, login & webhook rate limiting, self-approval prevention, masked-at-write
-result storage.
+Highlights: encrypted credentials at rest, TOTP two-factor authentication,
+comment-normalized SQL guards with an executor-enforced row ceiling, replay-protected
+and identity-bound chat callbacks, immutable audit logs, login/webhook/Livewire rate
+limiting, self-approval prevention, SSRF-guarded outbound webhooks, masked-at-write
+(fail-closed) result storage, and security response headers.
 
 ## License
 

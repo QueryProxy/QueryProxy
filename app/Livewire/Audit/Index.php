@@ -27,6 +27,10 @@ class Index extends Component
     #[Url]
     public string $to = '';
 
+    /** 'team' or, for system admins, 'system' (rows with no team: logins, user admin). */
+    #[Url]
+    public string $scope = 'team';
+
     public ?int $expandedId = null;
 
     private function team(): Team
@@ -34,9 +38,15 @@ class Index extends Component
         return auth()->user()->currentTeam() ?? abort(403);
     }
 
+    /** System-scope rows (team_id NULL: logins, user administration) are admin-only. */
+    private function systemScope(): bool
+    {
+        return $this->scope === 'system' && auth()->user()->isAdmin();
+    }
+
     public function updated(string $property): void
     {
-        if (in_array($property, ['action', 'actor', 'from', 'to'], true)) {
+        if (in_array($property, ['action', 'actor', 'from', 'to', 'scope'], true)) {
             $this->resetPage();
         }
     }
@@ -49,7 +59,11 @@ class Index extends Component
     public function filteredQuery(): Builder
     {
         return AuditLog::query()
-            ->where('team_id', $this->team()->id)
+            ->when(
+                $this->systemScope(),
+                fn ($q) => $q->whereNull('team_id'),
+                fn ($q) => $q->where('team_id', $this->team()->id),
+            )
             ->with(['user', 'connection'])
             ->when($this->action !== '', fn ($q) => $q->where('action', 'like', $this->action.'%'))
             ->when($this->actor !== '', fn ($q) => $q->whereHas('user', fn ($u) => $u->where('email', 'like', '%'.$this->actor.'%')
@@ -63,7 +77,12 @@ class Index extends Component
     {
         return view('livewire.audit.index', [
             'logs' => $this->filteredQuery()->paginate(30),
-            'actions' => AuditLog::where('team_id', $this->team()->id)
+            'actions' => AuditLog::query()
+                ->when(
+                    $this->systemScope(),
+                    fn ($q) => $q->whereNull('team_id'),
+                    fn ($q) => $q->where('team_id', $this->team()->id),
+                )
                 ->select('action')->distinct()->orderBy('action')->pluck('action'),
         ]);
     }

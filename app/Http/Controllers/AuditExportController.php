@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\AuditLog;
+use App\Support\Csv;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -10,10 +11,23 @@ class AuditExportController extends Controller
 {
     public function __invoke(Request $request): StreamedResponse
     {
-        $team = $request->user()->currentTeam() ?? abort(403);
+        $user = $request->user();
+        $systemScope = $request->string('scope')->toString() === 'system';
+
+        if ($systemScope) {
+            // System-scope rows (team_id NULL: logins, user administration,
+            // privilege changes) are admin-only.
+            abort_unless($user->isAdmin(), 403);
+        }
+
+        $team = $systemScope ? null : ($user->currentTeam() ?? abort(403));
 
         $query = AuditLog::query()
-            ->where('team_id', $team->id)
+            ->when(
+                $systemScope,
+                fn ($q) => $q->whereNull('team_id'),
+                fn ($q) => $q->where('team_id', $team->id),
+            )
             ->with('user')
             ->when($request->filled('action'), fn ($q) => $q->where('action', 'like', $request->string('action').'%'))
             ->when($request->filled('actor'), fn ($q) => $q->whereHas('user', fn ($u) => $u->where('email', 'like', '%'.$request->string('actor').'%')
@@ -28,7 +42,7 @@ class AuditExportController extends Controller
             fputcsv($out, ['timestamp', 'action', 'actor', 'query_request_id', 'connection_id', 'ip', 'sql', 'metadata']);
 
             $query->lazyById(500)->each(function (AuditLog $log) use ($out) {
-                fputcsv($out, [
+                fputcsv($out, array_map([Csv::class, 'sanitize'], [
                     $log->created_at->toIso8601String(),
                     $log->action,
                     $log->user?->email,
@@ -37,7 +51,7 @@ class AuditExportController extends Controller
                     $log->ip,
                     $log->sql,
                     $log->metadata ? json_encode($log->metadata) : null,
-                ]);
+                ]));
             });
 
             fclose($out);

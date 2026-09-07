@@ -13,5 +13,6 @@ final class StatementInfo
         public readonly bool $parsed,
         public readonly bool $limitInjected = false,
         public readonly bool $limitClamped = false,
+        public readonly bool $isDdl = false,
     ) {}
 }

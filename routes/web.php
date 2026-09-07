@@ -3,6 +3,7 @@
 use App\Http\Controllers\AuditExportController;
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\Auth\PasswordResetController;
+use App\Http\Controllers\Auth\TwoFactorChallengeController;
 use App\Http\Controllers\ResultDownloadController;
 use App\Http\Controllers\TeamSwitchController;
 use App\Http\Controllers\Webhooks\SlackInteractionController;
@@ -46,9 +47,12 @@ Route::middleware('guest')->group(function () {
     Route::post('/reset-password', [PasswordResetController::class, 'update'])
         ->middleware('throttle:5,1')
         ->name('password.update');
+
+    Route::get('/two-factor-challenge', [TwoFactorChallengeController::class, 'create'])->name('two-factor.challenge');
+    Route::post('/two-factor-challenge', [TwoFactorChallengeController::class, 'store'])->middleware('throttle:5,1');
 });
 
-Route::middleware('auth')->group(function () {
+Route::middleware(['auth', '2fa.required'])->group(function () {
     Route::post('/logout', [LoginController::class, 'destroy'])->name('logout');
     Route::post('/teams/{team}/switch', TeamSwitchController::class)->name('teams.switch');
 

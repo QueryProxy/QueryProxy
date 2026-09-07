@@ -12,10 +12,10 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 #[Fillable([
     'team_id', 'connection_id', 'user_id', 'title', 'sql_original', 'sql_prepared',
-    'statement_count', 'is_transaction', 'type', 'status', 'note',
+    'statement_count', 'is_transaction', 'is_ddl', 'type', 'status', 'note',
     'reviewed_by', 'reviewed_at', 'rejection_reason', 'review_channel',
     'executed_at', 'duration_ms', 'affected_rows',
-    'result_disk', 'result_path', 'result_row_count', 'result_columns',
+    'result_disk', 'result_path', 'result_row_count', 'result_truncated', 'result_columns',
     'error_message',
 ])]
 class QueryRequest extends Model
@@ -28,6 +28,8 @@ class QueryRequest extends Model
             'status' => QueryRequestStatus::class,
             'type' => StatementType::class,
             'is_transaction' => 'boolean',
+            'is_ddl' => 'boolean',
+            'result_truncated' => 'boolean',
             'reviewed_at' => 'datetime',
             'executed_at' => 'datetime',
             'result_columns' => 'array',

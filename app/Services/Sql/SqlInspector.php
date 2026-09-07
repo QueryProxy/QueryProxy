@@ -2,6 +2,7 @@
 
 namespace App\Services\Sql;
 
+use App\Enums\DbDriver;
 use App\Enums\StatementType;
 use PhpMyAdmin\SqlParser\Lexer;
 use PhpMyAdmin\SqlParser\Parser;
@@ -10,7 +11,6 @@ use PhpMyAdmin\SqlParser\Statements\ExplainStatement;
 use PhpMyAdmin\SqlParser\Statements\SelectStatement;
 use PhpMyAdmin\SqlParser\Statements\ShowStatement;
 use PhpMyAdmin\SqlParser\Statements\UpdateStatement;
-use PhpMyAdmin\SqlParser\Token;
 use PhpMyAdmin\SqlParser\TokenType;
 
 /**
@@ -20,10 +20,17 @@ use PhpMyAdmin\SqlParser\TokenType;
  * Guard rules (PRD 3.2):
  *  - UPDATE / DELETE without WHERE are rejected.
  *  - SELECT without LIMIT gets the default limit injected; LIMITs above the
- *    hard cap are clamped.
+ *    hard cap are clamped. The executor additionally enforces the hard cap on
+ *    every read cursor, so the cap holds even for dialects this guard cannot
+ *    rewrite.
  *  - Multiple statements are only allowed inside an explicit
  *    BEGIN; ...; COMMIT; transaction block.
- *  - A small set of administrative statements is always rejected.
+ *  - A set of administrative / file-IO statements is always rejected.
+ *
+ * All pattern checks run against a normalized form of the statement (comments
+ * stripped, whitespace collapsed, string literals blanked) so that comment
+ * tricks like "DROP/**\/DATABASE" cannot smuggle a forbidden statement past
+ * the anchored patterns.
  *
  * The parser is MySQL-dialect-first; statements it cannot fully parse are
  * guarded best-effort by keyword heuristics and classified as writes unless
@@ -33,6 +40,8 @@ class SqlInspector
 {
     private const READ_KEYWORDS = ['SELECT', 'SHOW', 'EXPLAIN', 'DESCRIBE', 'DESC'];
 
+    private const DDL_KEYWORDS = ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME'];
+
     private const FORBIDDEN_PATTERNS = [
         '/^DROP\s+(DATABASE|SCHEMA)\b/i' => 'DROP DATABASE is not allowed through QueryProxy.',
         '/^GRANT\b/i' => 'GRANT statements are not allowed through QueryProxy.',
@@ -40,9 +49,13 @@ class SqlInspector
         '/^(CREATE|ALTER|DROP)\s+(USER|ROLE|LOGIN)\b/i' => 'User / role management statements are not allowed through QueryProxy.',
         '/^SET\s+GLOBAL\b/i' => 'SET GLOBAL is not allowed through QueryProxy.',
         '/^SHUTDOWN\b/i' => 'SHUTDOWN is not allowed through QueryProxy.',
+        '/^LOAD\s+DATA\b/i' => 'LOAD DATA is not allowed through QueryProxy.',
+        '/^COPY\b/i' => 'COPY is not allowed through QueryProxy (server-side file / program IO).',
+        '/\bINTO\s+(OUTFILE|DUMPFILE)\b/i' => 'SELECT ... INTO OUTFILE / DUMPFILE is not allowed through QueryProxy.',
+        '/\bLOAD_FILE\s*\(/i' => 'LOAD_FILE() is not allowed through QueryProxy.',
     ];
 
-    public function inspect(string $sql): InspectionResult
+    public function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
     {
         $violations = [];
 
@@ -66,7 +79,7 @@ class SqlInspector
         $infos = [];
 
         foreach ($executables as $index => $statementSql) {
-            [$info, $statementViolations] = $this->analyzeStatement($statementSql, $index + 1);
+            [$info, $statementViolations] = $this->analyzeStatement($statementSql, $index + 1, $driver);
             $infos[] = $info;
             $violations = array_merge($violations, $statementViolations);
         }
@@ -109,6 +122,29 @@ class SqlInspector
         }
 
         return $statements;
+    }
+
+    /**
+     * Comment-free, whitespace-collapsed, literal-blanked view of a statement,
+     * used for every textual guard check. String literals become '?' so their
+     * contents can never satisfy (or dodge) a pattern.
+     */
+    private function normalize(string $sql): string
+    {
+        $tokens = (new Lexer($sql))->list->tokens;
+        $normalized = '';
+
+        foreach ($tokens as $token) {
+            if (in_array($token->type, [TokenType::Comment, TokenType::Whitespace], true)) {
+                $normalized .= ' ';
+
+                continue;
+            }
+
+            $normalized .= $token->type === TokenType::String ? "'?'" : $token->token;
+        }
+
+        return trim((string) preg_replace('/\s+/', ' ', $normalized));
     }
 
     /**
@@ -167,13 +203,15 @@ class SqlInspector
     /**
      * @return array{0: StatementInfo, 1: list<string>}
      */
-    private function analyzeStatement(string $sql, int $position): array
+    private function analyzeStatement(string $sql, int $position, ?DbDriver $driver): array
     {
         $violations = [];
         $label = "Statement {$position}";
 
+        $normalized = $this->normalize($sql);
+
         foreach (self::FORBIDDEN_PATTERNS as $pattern => $message) {
-            if (preg_match($pattern, $sql)) {
+            if (preg_match($pattern, $normalized)) {
                 $violations[] = "{$label}: {$message}";
             }
         }
@@ -182,9 +220,10 @@ class SqlInspector
         $statement = $parser->statements[0] ?? null;
         $parsed = $statement !== null && $parser->errors === [];
 
-        $keyword = strtoupper((string) preg_replace('/^\s*(\w+).*/s', '$1', $sql));
+        $keyword = strtoupper(explode(' ', $normalized, 2)[0]);
 
         $type = $this->classify($statement, $keyword, $sql, $parsed);
+        $isDdl = in_array($keyword, self::DDL_KEYWORDS, true);
 
         // WHERE guard for UPDATE / DELETE.
         if ($statement instanceof UpdateStatement || $statement instanceof DeleteStatement) {
@@ -192,7 +231,7 @@ class SqlInspector
                 $violations[] = "{$label}: ".strtoupper($keyword).' without a WHERE clause is not allowed.';
             }
         } elseif (! $parsed && in_array($keyword, ['UPDATE', 'DELETE'], true)) {
-            if (! preg_match('/\bWHERE\b/i', $sql)) {
+            if (! preg_match('/\bWHERE\b/i', $normalized)) {
                 $violations[] = "{$label}: {$keyword} without a WHERE clause is not allowed.";
             }
         }
@@ -203,11 +242,15 @@ class SqlInspector
         $limitClamped = false;
 
         if ($type === StatementType::Read && in_array($keyword, ['SELECT', 'WITH'], true)) {
-            [$preparedSql, $limitInjected, $limitClamped] = $this->applyLimitGuard($sql);
+            [$preparedSql, $limitInjected, $limitClamped, $limitViolations] = $this->applyLimitGuard($sql, $driver);
+
+            foreach ($limitViolations as $violation) {
+                $violations[] = "{$label}: {$violation}";
+            }
         }
 
         return [
-            new StatementInfo($sql, $preparedSql, $type, $parsed, $limitInjected, $limitClamped),
+            new StatementInfo($sql, $preparedSql, $type, $parsed, $limitInjected, $limitClamped, $isDdl),
             $violations,
         ];
     }
@@ -217,12 +260,18 @@ class SqlInspector
         if ($statement instanceof SelectStatement
             || $statement instanceof ShowStatement
             || $statement instanceof ExplainStatement) {
-            return StatementType::Read;
+            // A parsed SELECT can still smuggle a write inside a CTE body
+            // (PostgreSQL WITH ... AS (INSERT ...)), so WITH is re-checked below.
+            if (strtoupper($keyword) !== 'WITH') {
+                return StatementType::Read;
+            }
         }
 
         if ($keyword === 'WITH') {
-            // A CTE wrapping data modification (PostgreSQL) is a write.
-            return $this->hasTopLevelWriteKeyword($sql)
+            // A CTE wrapping data modification (PostgreSQL) is a write. The
+            // write keyword may sit inside the parenthesised CTE body, so the
+            // scan covers every nesting depth.
+            return $this->hasWriteKeyword($sql)
                 ? StatementType::Write
                 : StatementType::Read;
         }
@@ -237,9 +286,12 @@ class SqlInspector
     /**
      * Inject or clamp the LIMIT clause of a SELECT statement.
      *
-     * @return array{0: string, 1: bool, 2: bool} [preparedSql, injected, clamped]
+     * The injected clause always starts on a fresh line so a trailing line
+     * comment ("-- ..." / "# ...") can never swallow it.
+     *
+     * @return array{0: string, 1: bool, 2: bool, 3: list<string>} [preparedSql, injected, clamped, violations]
      */
-    private function applyLimitGuard(string $sql): array
+    private function applyLimitGuard(string $sql, ?DbDriver $driver): array
     {
         $defaultLimit = (int) config('queryproxy.select_default_limit', 1000);
         $hardLimit = (int) config('queryproxy.select_hard_limit', 10000);
@@ -249,6 +301,8 @@ class SqlInspector
         $depth = 0;
         $limitIndex = null;
         $forIndex = null;
+        $hasFetch = false;
+        $hasTop = false;
 
         foreach ($tokens as $i => $token) {
             if ($token->type === TokenType::Operator) {
@@ -261,7 +315,7 @@ class SqlInspector
                 continue;
             }
 
-            if ($depth !== 0 || $token->type !== TokenType::Keyword) {
+            if ($depth !== 0 || in_array($token->type, [TokenType::Whitespace, TokenType::Comment, TokenType::String], true)) {
                 continue;
             }
 
@@ -269,91 +323,174 @@ class SqlInspector
 
             if ($upper === 'LIMIT') {
                 $limitIndex = $i;
-            } elseif ($forIndex === null && str_starts_with($upper, 'FOR ')) {
+            } elseif ($upper === 'FETCH') {
+                $hasFetch = true;
+            } elseif ($upper === 'TOP' && $driver === DbDriver::Sqlsrv) {
+                $hasTop = true;
+            } elseif ($forIndex === null && $token->type === TokenType::Keyword && str_starts_with($upper, 'FOR ')) {
                 // Locking clauses lex as compound keywords: "FOR UPDATE", "FOR SHARE", ...
                 $forIndex = $i;
             }
         }
 
+        // ANSI FETCH FIRST/NEXT n ROWS ONLY (PostgreSQL, SQL Server, Oracle).
+        if ($hasFetch) {
+            return $this->clampFetchClause($sql, $hardLimit);
+        }
+
+        // T-SQL SELECT TOP n: clamp the count; never append LIMIT.
+        if ($hasTop) {
+            return $this->clampTopClause($sql, $hardLimit);
+        }
+
         if ($limitIndex === null) {
+            if ($driver === DbDriver::Sqlsrv) {
+                // LIMIT is not valid T-SQL; the executor-level hard cap
+                // bounds the result instead.
+                return [$sql, false, false, []];
+            }
+
             // No top-level LIMIT: inject the default, before a FOR UPDATE/SHARE
             // locking clause when one exists.
             if ($forIndex !== null && $tokens[$forIndex]->position !== null) {
                 $pos = $tokens[$forIndex]->position;
 
-                return [rtrim(substr($sql, 0, $pos))." LIMIT {$defaultLimit} ".substr($sql, $pos), true, false];
+                return [rtrim(substr($sql, 0, $pos))."\nLIMIT {$defaultLimit}\n".substr($sql, $pos), true, false, []];
             }
 
-            return [rtrim(rtrim($sql), ';')." LIMIT {$defaultLimit}", true, false];
+            return [rtrim(rtrim($sql), ';')."\nLIMIT {$defaultLimit}", true, false, []];
         }
 
-        // Locate the row-count token of the LIMIT clause:
+        // Collect the LIMIT clause tokens:
         //   LIMIT n | LIMIT offset, n | LIMIT n OFFSET o | LIMIT ALL
-        $meaningful = [];
+        // Anything else (arithmetic, placeholders, ...) is rejected outright:
+        // a limit the guard cannot understand is a limit it cannot enforce.
+        $clause = [];
 
-        for ($i = $limitIndex + 1, $count = count($tokens); $i < $count && count($meaningful) < 3; $i++) {
+        for ($i = $limitIndex + 1, $count = count($tokens); $i < $count; $i++) {
             $token = $tokens[$i];
 
             if (in_array($token->type, [TokenType::Whitespace, TokenType::Comment], true)) {
                 continue;
             }
 
-            $meaningful[] = $token;
+            $upper = strtoupper($token->token);
+
+            if ($token->type === TokenType::Delimiter) {
+                break;
+            }
+
+            if ($token->type === TokenType::Keyword && ! ($clause === [] && $upper === 'ALL')) {
+                break;
+            }
+
+            $clause[] = $token;
+
+            if (count($clause) > 3) {
+                break;
+            }
         }
 
         $rowCountToken = null;
 
-        if (isset($meaningful[0]) && $meaningful[0]->type === TokenType::Number) {
-            $rowCountToken = $meaningful[0];
-
-            if (isset($meaningful[1], $meaningful[2])
-                && $meaningful[1]->type === TokenType::Operator
-                && $meaningful[1]->token === ','
-                && $meaningful[2]->type === TokenType::Number) {
-                // MySQL "LIMIT offset, count" form: the second number is the count.
-                $rowCountToken = $meaningful[2];
-            }
-        } elseif (isset($meaningful[0]) && strtoupper($meaningful[0]->token) === 'ALL') {
+        if (count($clause) === 1 && $clause[0]->type === TokenType::Number) {
+            $rowCountToken = $clause[0];
+        } elseif (count($clause) === 1 && strtoupper($clause[0]->token) === 'ALL') {
             // PostgreSQL "LIMIT ALL" means unlimited: clamp to the hard cap.
-            $rowCountToken = $meaningful[0];
+            $rowCountToken = $clause[0];
+        } elseif (count($clause) === 3
+            && $clause[0]->type === TokenType::Number
+            && $clause[1]->type === TokenType::Operator
+            && $clause[1]->token === ','
+            && $clause[2]->type === TokenType::Number) {
+            // MySQL "LIMIT offset, count" form: the second number is the count.
+            $rowCountToken = $clause[2];
         }
 
         if ($rowCountToken === null || $rowCountToken->position === null) {
-            return [$sql, false, false];
+            return [$sql, false, false, [
+                'Unsupported LIMIT clause; use a plain row count (e.g. LIMIT 100).',
+            ]];
         }
 
         $value = strtoupper($rowCountToken->token) === 'ALL' ? PHP_INT_MAX : (int) $rowCountToken->token;
 
         if ($value <= $hardLimit) {
-            return [$sql, false, false];
+            return [$sql, false, false, []];
         }
 
         $prepared = substr($sql, 0, $rowCountToken->position)
             .$hardLimit
             .substr($sql, $rowCountToken->position + strlen($rowCountToken->token));
 
-        return [$prepared, false, true];
+        return [$prepared, false, true, []];
     }
 
-    private function hasTopLevelWriteKeyword(string $sql): bool
+    /**
+     * @return array{0: string, 1: bool, 2: bool, 3: list<string>}
+     */
+    private function clampFetchClause(string $sql, int $hardLimit): array
+    {
+        $pattern = '/\bFETCH\s+(?:FIRST|NEXT)\s+(?:(\d+)\s+)?ROWS?\s+(?:ONLY|WITH\s+TIES)\b/i';
+
+        if (! preg_match($pattern, $sql, $matches, PREG_OFFSET_CAPTURE)) {
+            return [$sql, false, false, [
+                'Unsupported FETCH clause; use FETCH FIRST <n> ROWS ONLY.',
+            ]];
+        }
+
+        $count = isset($matches[1]) && $matches[1][1] !== -1 ? (int) $matches[1][0] : 1;
+
+        if ($count <= $hardLimit) {
+            return [$sql, false, false, []];
+        }
+
+        $prepared = substr($sql, 0, $matches[1][1])
+            .$hardLimit
+            .substr($sql, $matches[1][1] + strlen($matches[1][0]));
+
+        return [$prepared, false, true, []];
+    }
+
+    /**
+     * @return array{0: string, 1: bool, 2: bool, 3: list<string>}
+     */
+    private function clampTopClause(string $sql, int $hardLimit): array
+    {
+        if (! preg_match('/\bTOP\s*\(?\s*(\d+)\s*\)?/i', $sql, $matches, PREG_OFFSET_CAPTURE)) {
+            return [$sql, false, false, [
+                'Unsupported TOP clause; use TOP <n> with a plain row count.',
+            ]];
+        }
+
+        $count = (int) $matches[1][0];
+
+        if ($count <= $hardLimit) {
+            return [$sql, false, false, []];
+        }
+
+        $prepared = substr($sql, 0, $matches[1][1])
+            .$hardLimit
+            .substr($sql, $matches[1][1] + strlen($matches[1][0]));
+
+        return [$prepared, false, true, []];
+    }
+
+    /**
+     * True when a data-modifying keyword appears anywhere in the statement,
+     * at any nesting depth — CTE bodies are always parenthesised, so a
+     * depth-0-only scan would miss WITH x AS (INSERT ...) entirely.
+     */
+    private function hasWriteKeyword(string $sql): bool
     {
         $tokens = (new Lexer($sql))->list->tokens;
-        $depth = 0;
 
         foreach ($tokens as $token) {
-            if ($token->type === TokenType::Operator) {
-                if ($token->token === '(') {
-                    $depth++;
-                } elseif ($token->token === ')') {
-                    $depth--;
-                }
-
+            if (in_array($token->type, [TokenType::Whitespace, TokenType::Comment, TokenType::String], true)) {
                 continue;
             }
 
-            if ($depth === 0
-                && $token->type === TokenType::Keyword
-                && in_array(strtoupper($token->token), ['INSERT', 'UPDATE', 'DELETE', 'MERGE'], true)) {
+            if (in_array(strtoupper($token->token), ['INSERT', 'UPDATE', 'DELETE', 'MERGE'], true)) {
                 return true;
             }
         }

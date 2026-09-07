@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\QueryRequest;
+use App\Support\Csv;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -35,7 +36,7 @@ class ResultDownloadController extends Controller
 
                     if (is_array($row)) {
                         fputcsv($out, array_map(
-                            fn ($v) => is_scalar($v) || $v === null ? $v : json_encode($v),
+                            fn ($v) => Csv::sanitize(is_scalar($v) || $v === null ? $v : json_encode($v)),
                             $row,
                         ));
                     }

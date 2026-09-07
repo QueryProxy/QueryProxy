@@ -54,16 +54,15 @@ test('admins can reset another users password', function () {
     $user = User::factory()->create();
     $oldHash = $user->password;
 
-    $component = Livewire::actingAs($admin)
+    Livewire::actingAs($admin)
         ->test(Users::class)
         ->call('resetPassword', $user->id)
         ->assertHasNoErrors();
 
-    $generated = $component->get('generatedPassword');
-
-    expect($generated)->not->toBeNull()
-        ->and($user->fresh()->password)->not->toBe($oldHash)
-        ->and(Hash::check($generated, $user->fresh()->password))->toBeTrue();
+    // The generated password is flashed for one-time display, never kept in a
+    // public property (which would round-trip through every Livewire request).
+    expect(property_exists(Users::class, 'generatedPassword'))->toBeFalse()
+        ->and($user->fresh()->password)->not->toBe($oldHash);
 });
 
 test('admins cannot reset their own password from the users page', function () {

@@ -19,9 +19,9 @@
 
             <div class="p-3.5">
                 <form wire:submit="saveSlack" class="flex flex-col gap-3">
-                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('slackWebhookUrl')">
+                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('slackWebhookUrl')" :hint="$hasSlack ? 'blank = keep current' : null">
                         <x-ui.input type="url" wire:model="slackWebhookUrl" class="font-mono text-[11.5px]"
-                                    placeholder="https://hooks.slack.com/services/…" />
+                                    placeholder="{{ $hasSlack ? 'configured — enter a new URL to replace' : 'https://hooks.slack.com/services/…' }}" />
                     </x-ui.field>
 
                     <x-ui.field label="Signing secret" :hint="$hasSlack ? 'blank = keep current' : null">
@@ -57,9 +57,9 @@
 
             <div class="p-3.5">
                 <form wire:submit="saveTeams" class="flex flex-col gap-3">
-                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('teamsWebhookUrl')">
+                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('teamsWebhookUrl')" :hint="$hasTeams ? 'blank = keep current' : null">
                         <x-ui.input type="url" wire:model="teamsWebhookUrl" class="font-mono text-[11.5px]"
-                                    placeholder="https://outlook.office.com/webhook/…" />
+                                    placeholder="{{ $hasTeams ? 'configured — enter a new URL to replace' : 'https://xxx.webhook.office.com/…' }}" />
                     </x-ui.field>
 
                     <x-ui.field label="HMAC secret" :hint="$hasTeams ? 'blank = keep current' : null">
@@ -77,10 +77,12 @@
                 <div class="mt-3.5 rounded-control border border-line bg-canvas p-3 text-[11.5px] leading-[1.7] text-mute">
                     <p class="eyebrow mb-1.5">Setup</p>
                     1. Add an incoming webhook to your channel for announcements.<br>
-                    2. For approve/reject actions, call
+                    2. For approve/reject actions, have your Power Automate flow POST to
                     <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">{{ route('webhooks.teams') }}</code>
-                    with an <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">Authorization: HMAC …</code> header
-                    (e.g. from an outgoing webhook or Power Automate flow).
+                    with an <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">X-QueryProxy-Timestamp</code> header (unix seconds) and
+                    <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">Authorization: HMAC base64(hmac_sha256("&#123;timestamp&#125;:&#123;body&#125;", secret))</code>.<br>
+                    3. The body carries the approver's AAD object id as
+                    <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">actor_id</code>; link AAD ids to users in Admin → Users (Teams ID).
                 </div>
             </div>
         </x-ui.panel>

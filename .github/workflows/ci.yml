@@ -45,5 +45,10 @@ jobs:
       - name: Code style
         run: ./vendor/bin/pint --test
 
+      - name: Dependency vulnerability audit
+        run: |
+          composer audit
+          npm audit --omit=dev --audit-level=high
+
       - name: Tests
         run: ./vendor/bin/pest --ci

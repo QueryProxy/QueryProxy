@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
+use App\Models\User;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -35,7 +36,7 @@ class LoginController extends Controller
             ]);
         }
 
-        if (! Auth::attempt($credentials, $request->boolean('remember'))) {
+        if (! Auth::validate($credentials)) {
             RateLimiter::hit($throttleKey);
 
             throw ValidationException::withMessages([
@@ -44,6 +45,21 @@ class LoginController extends Controller
         }
 
         RateLimiter::clear($throttleKey);
+
+        $user = User::where('email', $credentials['email'])->firstOrFail();
+
+        if ($user->hasTwoFactorEnabled()) {
+            // Credentials are correct but the session is not authenticated yet:
+            // park the login and demand the TOTP code first.
+            $request->session()->put([
+                'two_factor.id' => $user->id,
+                'two_factor.remember' => $request->boolean('remember'),
+            ]);
+
+            return redirect()->route('two-factor.challenge');
+        }
+
+        Auth::login($user, $request->boolean('remember'));
         $request->session()->regenerate();
 
         audit()->record('auth.login');

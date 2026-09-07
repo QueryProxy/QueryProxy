@@ -38,7 +38,7 @@ test('a developer can submit a guarded select', function () {
     $request = QueryRequest::first();
 
     expect($request)->not->toBeNull()
-        ->and($request->sql_prepared)->toBe('SELECT * FROM customers LIMIT 1000')
+        ->and($request->sql_prepared)->toBe("SELECT * FROM customers\nLIMIT 1000")
         ->and($request->status)->toBe(QueryRequestStatus::Pending)
         ->and($request->type->value)->toBe('read')
         ->and($request->user_id)->toBe($developer->id)

@@ -28,16 +28,22 @@ class ExecuteQueryRequest implements ShouldQueue
         $executor->execute($this->request->fresh());
     }
 
-    /** Safety net: mark the request failed if the job dies outside execute(). */
+    /**
+     * Safety net: mark the request failed if the job dies outside execute().
+     * Conditional update so a duplicate job copy can never flip a request
+     * another worker already completed.
+     */
     public function failed(?Throwable $exception): void
     {
-        $request = $this->request->fresh();
-
-        if ($request && ! $request->status->isFinal()) {
-            $request->update([
+        QueryRequest::whereKey($this->request->id)
+            ->whereIn('status', [
+                QueryRequestStatus::Queued,
+                QueryRequestStatus::Approved,
+                QueryRequestStatus::Running,
+            ])
+            ->update([
                 'status' => QueryRequestStatus::Failed,
                 'error_message' => $exception?->getMessage() ?? 'Job failed unexpectedly.',
             ]);
-        }
     }
 }

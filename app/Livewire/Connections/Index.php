@@ -5,8 +5,10 @@ namespace App\Livewire\Connections;
 use App\Enums\DbDriver;
 use App\Enums\TeamRole;
 use App\Models\Connection;
+use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Services\Connections\DynamicConnectionFactory;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Livewire\Attributes\Title;
 use Livewire\Component;
@@ -68,7 +70,7 @@ class Index extends Component
         $this->showForm = true;
     }
 
-    public function save(): void
+    public function save(DynamicConnectionFactory $factory): void
     {
         $team = $this->team();
 
@@ -90,6 +92,14 @@ class Index extends Component
             'database' => $validated['database'],
             'username' => $validated['username'] ?: null,
         ];
+
+        $violations = $factory->targetViolations(new Connection($attributes));
+
+        if ($violations !== []) {
+            $this->addError('database', $violations[0]);
+
+            return;
+        }
 
         if ($this->editingId) {
             $connection = Connection::forTeam($team)->findOrFail($this->editingId);
@@ -123,6 +133,16 @@ class Index extends Component
         $this->authorize('delete', $connection);
 
         audit()->record('connection.deleted', connection: $connection, metadata: ['name' => $connection->name]);
+
+        // The DB cascade removes the query_requests rows without firing model
+        // events, so stored result files must be deleted explicitly.
+        QueryRequest::where('connection_id', $connection->id)
+            ->whereNotNull('result_path')
+            ->lazyById()
+            ->each(function (QueryRequest $request) {
+                Storage::disk($request->result_disk ?? config('queryproxy.result_disk', 'local'))
+                    ->delete($request->result_path);
+            });
 
         $connection->delete();
     }

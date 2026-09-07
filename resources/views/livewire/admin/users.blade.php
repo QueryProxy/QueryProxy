@@ -10,10 +10,10 @@
         </p>
     </div>
 
-    @if ($generatedPassword)
+    @if (session('generated_password'))
         <x-ui.alert tone="pending" icon="key" class="mb-3.5">
             Generated password (shown once):
-            <code class="ml-1 rounded-badge border border-pending-line bg-canvas px-1.5 py-0.5 font-mono text-pending">{{ $generatedPassword }}</code>
+            <code class="ml-1 rounded-badge border border-pending-line bg-canvas px-1.5 py-0.5 font-mono text-pending">{{ session('generated_password') }}</code>
         </x-ui.alert>
     @endif
 
@@ -48,6 +48,7 @@
                     <x-ui.th class="w-64">Email</x-ui.th>
                     <x-ui.th class="w-20">Teams</x-ui.th>
                     <x-ui.th class="w-36">Slack ID</x-ui.th>
+                    <x-ui.th class="w-36">Teams ID</x-ui.th>
                     <x-ui.th class="w-20">Admin</x-ui.th>
                     <x-ui.th class="w-72" align="right"></x-ui.th>
                 </tr>
@@ -61,6 +62,11 @@
                     <x-ui.td>
                         <x-ui.input type="text" value="{{ $slackIds[$u->id] ?? '' }}" placeholder="U0123ABC"
                                     wire:change="updateSlackId({{ $u->id }}, $event.target.value)"
+                                    class="h-[26px] font-mono text-[11.5px]" />
+                    </x-ui.td>
+                    <x-ui.td>
+                        <x-ui.input type="text" value="{{ $teamsIds[$u->id] ?? '' }}" placeholder="AAD object ID"
+                                    wire:change="updateTeamsId({{ $u->id }}, $event.target.value)"
                                     class="h-[26px] font-mono text-[11.5px]" />
                     </x-ui.td>
                     <x-ui.td>
@@ -78,6 +84,10 @@
                                 </x-ui.action>
                                 <x-ui.action wire:click="resetPassword({{ $u->id }})"
                                              wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                @if ($u->hasTwoFactorEnabled())
+                                    <x-ui.action wire:click="resetTwoFactor({{ $u->id }})"
+                                                 wire:confirm="Reset two-factor authentication for {{ $u->email }}? They will log in with password only until they re-enroll.">Reset 2FA</x-ui.action>
+                                @endif
                                 <x-ui.action wire:click="deleteUser({{ $u->id }})" wire:confirm="Delete user {{ $u->email }}?" tone="danger">Delete</x-ui.action>
                             </div>
                         @else

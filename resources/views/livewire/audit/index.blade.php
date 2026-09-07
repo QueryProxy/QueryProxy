@@ -3,14 +3,23 @@
         title="Audit Log"
         subtitle="Append-only trail of every security-relevant event in this team: who asked, who decided, what actually ran, and what came back. Rows are never edited or deleted.">
         <x-slot:actions>
-            <x-ui.btn :href="route('audit.export', ['action' => $action, 'actor' => $actor, 'from' => $from, 'to' => $to])" icon="download">
+            <x-ui.btn :href="route('audit.export', ['action' => $action, 'actor' => $actor, 'from' => $from, 'to' => $to, 'scope' => $scope])" icon="download">
                 Export CSV
             </x-ui.btn>
         </x-slot:actions>
     </x-ui.page-header>
 
     <x-ui.panel padded class="mb-3.5">
-        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div class="grid grid-cols-2 gap-3 sm:grid-cols-4 @if(auth()->user()->isAdmin()) sm:grid-cols-5 @endif">
+            @if (auth()->user()->isAdmin())
+                <x-ui.field label="Scope">
+                    <x-ui.select wire:model.live="scope">
+                        <option value="team">This team</option>
+                        <option value="system">System (logins, user admin)</option>
+                    </x-ui.select>
+                </x-ui.field>
+            @endif
+
             <x-ui.field label="Action">
                 <x-ui.select wire:model.live="action">
                     <option value="">All actions</option>

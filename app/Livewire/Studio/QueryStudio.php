@@ -59,7 +59,11 @@ class QueryStudio extends Component
             'sql' => ['required', 'string', 'max:65535'],
         ]);
 
-        $result = $inspector->inspect($this->sql);
+        $driver = $this->connectionId
+            ? Connection::forTeam($this->team())->find($this->connectionId)?->driver
+            : null;
+
+        $result = $inspector->inspect($this->sql, $driver);
 
         $this->violations = $result->violations;
         $this->preparedPreview = $result->passes() ? $result->preparedSql() : null;
@@ -84,7 +88,7 @@ class QueryStudio extends Component
             return;
         }
 
-        $result = $inspector->inspect($this->sql);
+        $result = $inspector->inspect($this->sql, $connection->driver);
 
         $request = QueryRequest::create([
             'team_id' => $this->team()->id,
@@ -95,6 +99,7 @@ class QueryStudio extends Component
             'sql_prepared' => $result->preparedSql(),
             'statement_count' => count($result->statements),
             'is_transaction' => $result->isTransaction,
+            'is_ddl' => $result->hasDdl(),
             'type' => $result->type(),
             'status' => QueryRequestStatus::Pending,
         ]);

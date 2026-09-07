@@ -1,7 +1,14 @@
 # Zero-config: `docker compose up` boots the portal on http://localhost:8000
 # with a SQLite application database and a database-backed queue (ADR-002).
 #
-# Demo login (only when QUERYPROXY_SEED_DEMO=true): admin@example.com / password
+# APP_KEY: set one explicitly for production (`php artisan key:generate --show`).
+# Without it, a key is generated once and persisted on the database volume so
+# app/worker/scheduler always share the same key.
+#
+# Demo data is OFF by default. To try the demo accounts on a non-production
+# instance, set QUERYPROXY_SEED_DEMO=true (and QUERYPROXY_SEED_DEMO_FORCE=true
+# if APP_ENV stays "production"); the generated demo password is printed once
+# in the app container logs.
 
 services:
   app:
@@ -12,15 +19,21 @@ services:
       APP_ENV: production
       APP_DEBUG: "false"
       APP_URL: http://localhost:8000
+      APP_KEY: ${APP_KEY:-}
       DB_CONNECTION: sqlite
       DB_DATABASE: /var/www/html/database/database.sqlite
       QUEUE_CONNECTION: database
-      QUERYPROXY_SEED_DEMO: "true"
+      # Must stay above the worker --timeout (310s) so a slow query is never
+      # re-reserved and executed twice.
+      DB_QUEUE_RETRY_AFTER: "330"
+      QUERYPROXY_SEED_DEMO: "false"
+      # Uncomment when serving over HTTPS (behind a TLS-terminating proxy):
+      # SESSION_SECURE_COOKIE: "true"
     volumes:
       - app-database:/var/www/html/database
       - app-storage:/var/www/html/storage/app
     healthcheck:
-      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://localhost:8000/up') ? 0 : 1);"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/up"]
       interval: 10s
       timeout: 3s
       retries: 10

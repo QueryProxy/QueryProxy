@@ -18,8 +18,25 @@ class TeamMembers extends Component
 
     public string $role = 'developer';
 
+    public function mount(): void
+    {
+        $this->assertAdmin();
+    }
+
+    /**
+     * Route middleware only guards the initial page load; every action must
+     * re-check because Livewire updates arrive on a separate endpoint and the
+     * actor's privileges may have been revoked since the page was served.
+     */
+    private function assertAdmin(): void
+    {
+        abort_unless(auth()->user()?->isAdmin(), 403);
+    }
+
     public function addMember(): void
     {
+        $this->assertAdmin();
+
         $this->validate([
             'email' => ['required', 'email'],
             'role' => ['required', Rule::enum(TeamRole::class)],
@@ -51,23 +68,30 @@ class TeamMembers extends Component
 
     public function updateRole(int $userId, string $role): void
     {
+        $this->assertAdmin();
+
         abort_unless(TeamRole::tryFrom($role) !== null, 422);
 
-        $this->team->users()->updateExistingPivot($userId, ['role' => $role]);
+        $member = $this->team->users()->findOrFail($userId);
+
+        $this->team->users()->updateExistingPivot($member->id, ['role' => $role]);
 
         audit()->record('team.member_role_changed', team: $this->team, metadata: [
-            'member_id' => $userId,
+            'member' => $member->email,
             'role' => $role,
         ]);
     }
 
     public function removeMember(int $userId): void
     {
-        $user = User::findOrFail($userId);
-        $this->team->users()->detach($userId);
+        $this->assertAdmin();
+
+        $member = $this->team->users()->findOrFail($userId);
+
+        $this->team->users()->detach($member->id);
 
         audit()->record('team.member_removed', team: $this->team, metadata: [
-            'member' => $user->email,
+            'member' => $member->email,
         ]);
     }
 

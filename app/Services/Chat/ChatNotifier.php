@@ -63,7 +63,12 @@ class ChatNotifier
     private function post(ChatIntegration $integration, array $payload): void
     {
         try {
-            Http::timeout(5)->post($integration->webhook_url, $payload)->throw();
+            // No redirects: an allowed host must not be able to bounce the
+            // request to an internal target (SSRF via 30x).
+            Http::timeout(5)
+                ->withOptions(['allow_redirects' => false])
+                ->post($integration->webhook_url, $payload)
+                ->throw();
         } catch (Throwable $e) {
             Log::warning('QueryProxy: chat notification failed', [
                 'team_id' => $integration->team_id,
@@ -81,7 +86,7 @@ class ChatNotifier
      */
     private function slackSubmittedMessage(QueryRequest $request): array
     {
-        $sqlPreview = str($request->sql_prepared)->limit(400);
+        $sqlPreview = $this->sqlPreview($request);
 
         return [
             'text' => sprintf('New query request #%d from %s', $request->id, $request->requester->name),
@@ -139,6 +144,16 @@ class ChatNotifier
         ];
     }
 
+    /** SQL literals can carry sensitive values; sending them to chat is opt-out. */
+    private function sqlPreview(QueryRequest $request): string
+    {
+        if (! config('queryproxy.chat_include_sql', true)) {
+            return '(SQL preview disabled — review in QueryProxy)';
+        }
+
+        return (string) str($request->sql_prepared)->limit(400);
+    }
+
     /**
      * Teams MessageCard: informational with a deep link (interactive approval
      * for Teams runs through the generic HMAC action endpoint, e.g. from a
@@ -161,7 +176,7 @@ class ChatNotifier
                         ['name' => 'Connection', 'value' => $request->connection->name],
                         ['name' => 'Statements', 'value' => (string) $request->statement_count],
                     ],
-                    'text' => '```'.str($request->sql_prepared)->limit(400).'```',
+                    'text' => '```'.$this->sqlPreview($request).'```',
                 ],
             ],
             'potentialAction' => [

@@ -32,7 +32,22 @@ class PruneResults extends Command
                 $pruned++;
             });
 
-        $this->info("Pruned {$pruned} result file(s) older than {$days} days.");
+        // Disk-scan fallback: catch files orphaned by DB cascades (deleted
+        // teams / connections remove query_requests rows without firing
+        // model events, leaving their NDJSON files unreachable above).
+        $disk = Storage::disk(config('queryproxy.result_disk', 'local'));
+        $orphaned = 0;
+
+        foreach ($disk->allFiles('results') as $file) {
+            $lastModified = $disk->lastModified($file);
+
+            if ($lastModified < $cutoff->getTimestamp() && ! QueryRequest::where('result_path', $file)->exists()) {
+                $disk->delete($file);
+                $orphaned++;
+            }
+        }
+
+        $this->info("Pruned {$pruned} result file(s) older than {$days} days ({$orphaned} orphaned).");
 
         return self::SUCCESS;
     }

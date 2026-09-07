@@ -76,13 +76,20 @@ test('users without view access cannot download results', function () {
     $this->actingAs($stranger)->get(route('requests.download', $request))->assertForbidden();
 });
 
-test('auditors can view but strangers cannot', function () {
+test('team dbas can view result data, auditors and strangers cannot', function () {
     [$request, , $team] = completedRequest(5);
 
+    $dba = User::factory()->create();
+    $team->users()->attach($dba, ['role' => 'dba']);
+
+    Livewire::actingAs($dba)->test(Viewer::class, ['queryRequest' => $request])->assertSee('name-0001');
+
+    // Auditors see request metadata and the audit trail — not the row payloads
+    // (PRD scopes the auditor role to logs/histories/metrics/traces).
     $auditor = User::factory()->create();
     $team->users()->attach($auditor, ['role' => 'auditor']);
 
-    Livewire::actingAs($auditor)->test(Viewer::class, ['queryRequest' => $request])->assertSee('name-0001');
+    Livewire::actingAs($auditor)->test(Viewer::class, ['queryRequest' => $request])->assertForbidden();
 });
 
 test('results:prune removes expired files and clears pointers', function () {

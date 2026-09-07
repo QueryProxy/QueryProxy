@@ -33,7 +33,9 @@ return [
         'local' => [
             'driver' => 'local',
             'root' => storage_path('app/private'),
-            'serve' => true,
+            // No unauthenticated /storage/{path} serve route: result files must
+            // only ever leave through the policy-checked download controller.
+            'serve' => false,
             'throw' => false,
             'report' => false,
         ],

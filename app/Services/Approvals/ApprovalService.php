@@ -24,12 +24,22 @@ class ApprovalService
 
         $isOverride = ! $reviewer->isDbaIn($request->team) || $request->user_id === $reviewer->id;
 
-        $request->update([
-            'status' => QueryRequestStatus::Approved,
-            'reviewed_by' => $reviewer->id,
-            'reviewed_at' => now(),
-            'review_channel' => $channel,
-        ]);
+        // Conditional update so two concurrent approvals (e.g. web + a stale
+        // Slack button) can never both claim the request and dispatch it twice.
+        $claimed = QueryRequest::whereKey($request->id)
+            ->where('status', QueryRequestStatus::Pending)
+            ->update([
+                'status' => QueryRequestStatus::Approved,
+                'reviewed_by' => $reviewer->id,
+                'reviewed_at' => now(),
+                'review_channel' => $channel,
+            ]);
+
+        if ($claimed === 0) {
+            throw new AuthorizationException('This request has already been decided.');
+        }
+
+        $request->refresh();
 
         audit()->record('request.approved', actor: $reviewer, request: $request, metadata: [
             'channel' => $channel,
@@ -50,13 +60,21 @@ class ApprovalService
     {
         Gate::forUser($reviewer)->authorize('review', $request);
 
-        $request->update([
-            'status' => QueryRequestStatus::Rejected,
-            'reviewed_by' => $reviewer->id,
-            'reviewed_at' => now(),
-            'rejection_reason' => $reason,
-            'review_channel' => $channel,
-        ]);
+        $claimed = QueryRequest::whereKey($request->id)
+            ->where('status', QueryRequestStatus::Pending)
+            ->update([
+                'status' => QueryRequestStatus::Rejected,
+                'reviewed_by' => $reviewer->id,
+                'reviewed_at' => now(),
+                'rejection_reason' => $reason,
+                'review_channel' => $channel,
+            ]);
+
+        if ($claimed === 0) {
+            throw new AuthorizationException('This request has already been decided.');
+        }
+
+        $request->refresh();
 
         audit()->record('request.rejected', actor: $reviewer, request: $request, metadata: [
             'channel' => $channel,
@@ -70,7 +88,15 @@ class ApprovalService
     {
         Gate::forUser($user)->authorize('cancel', $request);
 
-        $request->update(['status' => QueryRequestStatus::Cancelled]);
+        $claimed = QueryRequest::whereKey($request->id)
+            ->where('status', QueryRequestStatus::Pending)
+            ->update(['status' => QueryRequestStatus::Cancelled]);
+
+        if ($claimed === 0) {
+            throw new AuthorizationException('This request has already been decided.');
+        }
+
+        $request->refresh();
 
         audit()->record('request.cancelled', actor: $user, request: $request);
     }

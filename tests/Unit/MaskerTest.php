@@ -85,8 +85,8 @@ test('null values stay null', function () {
     expect(app(Masker::class)->maskValue('email', null, $rules))->toBeNull();
 });
 
-test('an invalid regex never matches and never crashes', function () {
+test('an invalid regex fails closed: the value is masked, never emitted raw', function () {
     $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/(unclosed', 'strategy' => 'full'])]);
 
-    expect(app(Masker::class)->maskValue('note', 'hello', $rules))->toBe('hello');
+    expect(app(Masker::class)->maskValue('note', 'hello', $rules))->toBe('*****');
 });
