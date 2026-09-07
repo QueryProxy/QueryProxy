@@ -1,59 +1,52 @@
 <div>
-    <div class="mb-6 flex items-center justify-between">
-        <div>
-            <h1 class="text-2xl font-bold tracking-tight">Query Requests</h1>
-            <p class="mt-1 text-sm text-slate-500">Track submission, approval and execution status.</p>
-        </div>
-        <select wire:model.live="status" class="rounded-md border border-slate-300 px-3 py-2 text-sm">
-            <option value="">All statuses</option>
-            @foreach(\App\Enums\QueryRequestStatus::cases() as $s)
-                <option value="{{ $s->value }}">{{ $s->label() }}</option>
-            @endforeach
-        </select>
+    <x-ui.page-header
+        title="Query Requests"
+        subtitle="Every statement anyone in this team has submitted, with its approval trail and execution outcome." />
+
+    <div class="mb-3.5 flex flex-wrap items-center gap-1.5">
+        <x-ui.chip wire:click="$set('status', '')" :active="$status === ''">All</x-ui.chip>
+        @foreach (\App\Enums\QueryRequestStatus::cases() as $case)
+            <x-ui.chip wire:click="$set('status', '{{ $case->value }}')" :active="$status === $case->value">{{ $case->label() }}</x-ui.chip>
+        @endforeach
     </div>
 
-    <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table class="w-full text-sm">
-            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+    <x-ui.panel>
+        <x-ui.table>
+            <x-slot:head>
                 <tr>
-                    <th class="px-4 py-3">#</th>
-                    <th class="px-4 py-3">Title / SQL</th>
-                    <th class="px-4 py-3">Connection</th>
-                    <th class="px-4 py-3">Requester</th>
-                    <th class="px-4 py-3">Type</th>
-                    <th class="px-4 py-3">Status</th>
-                    <th class="px-4 py-3">Submitted</th>
+                    <x-ui.th class="w-14">Req</x-ui.th>
+                    <x-ui.th>Title / SQL</x-ui.th>
+                    <x-ui.th class="w-40">Connection</x-ui.th>
+                    <x-ui.th class="w-32">Requester</x-ui.th>
+                    <x-ui.th class="w-16">Type</x-ui.th>
+                    <x-ui.th class="w-28">Status</x-ui.th>
+                    <x-ui.th class="w-24" align="right">Submitted</x-ui.th>
                 </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-                @forelse($requests as $request)
-                    <tr class="hover:bg-slate-50">
-                        <td class="px-4 py-3 text-slate-500">
-                            <a href="{{ route('requests.show', $request) }}" class="font-medium text-indigo-600 hover:text-indigo-500">#{{ $request->id }}</a>
-                        </td>
-                        <td class="max-w-xs px-4 py-3">
-                            <a href="{{ route('requests.show', $request) }}" class="block truncate font-medium text-slate-800 hover:text-indigo-600">
-                                {{ $request->title ?? str($request->sql_original)->limit(60) }}
-                            </a>
-                        </td>
-                        <td class="px-4 py-3 text-slate-500">{{ $request->connection->name }}</td>
-                        <td class="px-4 py-3 text-slate-500">{{ $request->requester->name }}</td>
-                        <td class="px-4 py-3">
-                            <span class="rounded px-1.5 py-0.5 text-xs font-bold uppercase {{ $request->type->value === 'read' ? 'bg-sky-100 text-sky-700' : 'bg-orange-100 text-orange-700' }}">
-                                {{ $request->type->value }}
-                            </span>
-                        </td>
-                        <td class="px-4 py-3">
-                            <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
-                        </td>
-                        <td class="px-4 py-3 text-slate-500" title="{{ $request->created_at }}">{{ $request->created_at->diffForHumans() }}</td>
-                    </tr>
-                @empty
-                    <tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">No requests yet.</td></tr>
-                @endforelse
-            </tbody>
-        </table>
-    </div>
+            </x-slot:head>
 
-    <div class="mt-4">{{ $requests->links() }}</div>
+            @forelse ($requests as $request)
+                <x-ui.tr>
+                    <x-ui.td mono>
+                        <a href="{{ route('requests.show', $request) }}" class="text-accent hover:brightness-125">#{{ $request->id }}</a>
+                    </x-ui.td>
+                    <x-ui.td truncate>
+                        <a href="{{ route('requests.show', $request) }}" class="block truncate text-ink-2 hover:text-accent">
+                            {{ $request->title ?? str($request->sql_original)->limit(60) }}
+                        </a>
+                    </x-ui.td>
+                    <x-ui.td mono muted nowrap>{{ $request->connection->name }}</x-ui.td>
+                    <x-ui.td muted nowrap>{{ $request->requester->name }}</x-ui.td>
+                    <x-ui.td><x-ui.badge :tone="$request->type->tone()">{{ $request->type->label() }}</x-ui.badge></x-ui.td>
+                    <x-ui.td><x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge></x-ui.td>
+                    <x-ui.td mono muted nowrap align="right" title="{{ $request->created_at }}">{{ $request->created_at->diffForHumans() }}</x-ui.td>
+                </x-ui.tr>
+            @empty
+                <x-ui.empty :colspan="7">No requests yet.</x-ui.empty>
+            @endforelse
+        </x-ui.table>
+
+        @if ($requests->hasPages())
+            <x-slot:footer>{{ $requests->links() }}</x-slot:footer>
+        @endif
+    </x-ui.panel>
 </div>
