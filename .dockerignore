@@ -1,0 +1,23 @@
+# Keep the build context clean: CI builds from a fresh checkout, and a local
+# build must behave the same — host artifacts would otherwise clobber the
+# image's own composer/npm output via `COPY . .`.
+.git
+.github
+.env
+.env.*
+!.env.example
+vendor
+node_modules
+public/build
+public/hot
+storage/app/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/testing/*
+storage/framework/views/*
+storage/logs/*
+database/*.sqlite
+.phpunit.result.cache
+CLAUDE.md
+AGENTS.md
+.ai
