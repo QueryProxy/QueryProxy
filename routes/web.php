@@ -13,6 +13,7 @@ use App\Livewire\Admin\Users;
 use App\Livewire\Approvals\Index as ApprovalsIndex;
 use App\Livewire\Audit\Index as AuditIndex;
 use App\Livewire\Connections\Index as ConnectionsIndex;
+use App\Livewire\Dashboard;
 use App\Livewire\Masking\Index as MaskingIndex;
 use App\Livewire\Profile;
 use App\Livewire\Requests\Index as RequestsIndex;
@@ -51,7 +52,7 @@ Route::middleware('auth')->group(function () {
     Route::post('/logout', [LoginController::class, 'destroy'])->name('logout');
     Route::post('/teams/{team}/switch', TeamSwitchController::class)->name('teams.switch');
 
-    Route::view('/dashboard', 'dashboard')->name('dashboard');
+    Route::get('/dashboard', Dashboard::class)->name('dashboard');
     Route::get('/profile', Profile::class)->name('profile');
 
     Route::middleware('role:dba')->group(function () {
