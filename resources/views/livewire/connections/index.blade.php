@@ -1,139 +1,127 @@
 <div>
-    <div class="mb-6 flex items-center justify-between">
-        <div>
-            <h1 class="text-2xl font-bold tracking-tight">Connections</h1>
-            <p class="mt-1 text-sm text-slate-500">Target databases this team can query through QueryProxy. Credentials are encrypted at rest.</p>
-        </div>
-        <button wire:click="openCreate" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">
-            New Connection
-        </button>
-    </div>
+    <x-ui.page-header
+        title="Connections"
+        subtitle="Target databases this team can reach through QueryProxy. Credentials are encrypted at rest and are never rendered back into the browser.">
+        <x-slot:actions>
+            <x-ui.btn wire:click="openCreate" variant="primary" icon="plus">New connection</x-ui.btn>
+        </x-slot:actions>
+    </x-ui.page-header>
 
-    @if($testResult)
-        <div class="mb-4 rounded-md border px-4 py-3 text-sm {{ $testResult['ok'] ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-rose-200 bg-rose-50 text-rose-800' }}">
-            @if($testResult['ok'])
+    @if ($testResult)
+        <x-ui.alert :tone="$testResult['ok'] ? 'ok' : 'danger'" :icon="$testResult['ok'] ? 'check' : 'x'" class="mb-3.5">
+            @if ($testResult['ok'])
                 Connection OK — {{ $testResult['latency_ms'] }} ms
             @else
                 Connection failed: {{ $testResult['error'] }}
             @endif
-        </div>
+        </x-ui.alert>
     @endif
 
-    @if($showForm)
-        <div class="mb-6 rounded-xl border border-indigo-200 bg-white p-5 shadow-sm">
-            <h2 class="mb-4 text-lg font-semibold">{{ $editingId ? 'Edit Connection' : 'New Connection' }}</h2>
-            <form wire:submit="save" class="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                <div>
-                    <label class="mb-1 block text-sm font-medium text-slate-700">Name</label>
-                    <input type="text" wire:model="name" placeholder="e.g. Orders (prod replica)" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                    @error('name') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                </div>
-                <div>
-                    <label class="mb-1 block text-sm font-medium text-slate-700">Driver</label>
-                    <select wire:model.live="driver" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                        @foreach($drivers as $d)
+    @if ($showForm)
+        <x-ui.panel padded class="mb-3.5 border-accent-line">
+            <h2 class="mb-3.5 font-display text-[13px] font-semibold text-ink">{{ $editingId ? 'Edit connection' : 'New connection' }}</h2>
+
+            <form wire:submit="save" class="grid grid-cols-1 gap-3.5 sm:grid-cols-3">
+                <x-ui.field label="Name" :error="$errors->first('name')">
+                    <x-ui.input type="text" wire:model="name" placeholder="e.g. orders-prod" />
+                </x-ui.field>
+
+                <x-ui.field label="Driver">
+                    <x-ui.select wire:model.live="driver">
+                        @foreach ($drivers as $d)
                             <option value="{{ $d->value }}">{{ $d->label() }}</option>
                         @endforeach
-                    </select>
-                </div>
+                    </x-ui.select>
+                </x-ui.field>
+
                 <div></div>
-                @if($driver !== 'sqlite')
-                    <div>
-                        <label class="mb-1 block text-sm font-medium text-slate-700">Host</label>
-                        <input type="text" wire:model="host" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                        @error('host') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                    </div>
-                    <div>
-                        <label class="mb-1 block text-sm font-medium text-slate-700">Port <span class="text-slate-400">(blank = default)</span></label>
-                        <input type="number" wire:model="port" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                        @error('port') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                    </div>
+
+                @if ($driver !== 'sqlite')
+                    <x-ui.field label="Host" :error="$errors->first('host')">
+                        <x-ui.input type="text" wire:model="host" />
+                    </x-ui.field>
+
+                    <x-ui.field label="Port" hint="blank = default" :error="$errors->first('port')">
+                        <x-ui.input type="number" wire:model="port" />
+                    </x-ui.field>
                 @endif
-                <div>
-                    <label class="mb-1 block text-sm font-medium text-slate-700">{{ $driver === 'sqlite' ? 'Database file path' : 'Database' }}</label>
-                    <input type="text" wire:model="database" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                    @error('database') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                </div>
-                @if($driver !== 'sqlite')
-                    <div>
-                        <label class="mb-1 block text-sm font-medium text-slate-700">Username</label>
-                        <input type="text" wire:model="username" autocomplete="off" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                        @error('username') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                    </div>
-                    <div>
-                        <label class="mb-1 block text-sm font-medium text-slate-700">
-                            Password @if($editingId)<span class="text-slate-400">(blank = keep current)</span>@endif
-                        </label>
-                        <input type="password" wire:model="password" autocomplete="new-password" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
-                        @error('password') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-                    </div>
+
+                <x-ui.field :label="$driver === 'sqlite' ? 'Database file path' : 'Database'" :error="$errors->first('database')">
+                    <x-ui.input type="text" wire:model="database" class="font-mono" />
+                </x-ui.field>
+
+                @if ($driver !== 'sqlite')
+                    <x-ui.field label="Username" :error="$errors->first('username')">
+                        <x-ui.input type="text" wire:model="username" autocomplete="off" />
+                    </x-ui.field>
+
+                    <x-ui.field label="Password" :hint="$editingId ? 'blank = keep current' : null" :error="$errors->first('password')">
+                        <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
+                    </x-ui.field>
                 @endif
+
                 <div class="flex items-end gap-2 sm:col-span-3">
-                    <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">
-                        {{ $editingId ? 'Save Changes' : 'Create Connection' }}
-                    </button>
-                    <button type="button" wire:click="$set('showForm', false)" class="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-                        Cancel
-                    </button>
+                    <x-ui.btn type="submit" variant="primary">{{ $editingId ? 'Save changes' : 'Create connection' }}</x-ui.btn>
+                    <x-ui.btn type="button" wire:click="$set('showForm', false)">Cancel</x-ui.btn>
                 </div>
             </form>
-        </div>
+        </x-ui.panel>
     @endif
 
-    <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table class="w-full text-sm">
-            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+    <x-ui.panel>
+        <x-ui.table>
+            <x-slot:head>
                 <tr>
-                    <th class="px-4 py-3">Name</th>
-                    <th class="px-4 py-3">Driver</th>
-                    <th class="px-4 py-3">Database</th>
-                    <th class="px-4 py-3">Granted Devs</th>
-                    <th class="px-4 py-3"></th>
+                    <x-ui.th class="w-48">Name</x-ui.th>
+                    <x-ui.th class="w-24">Driver</x-ui.th>
+                    <x-ui.th>Database</x-ui.th>
+                    <x-ui.th class="w-28">Developers</x-ui.th>
+                    <x-ui.th class="w-52" align="right">Actions</x-ui.th>
                 </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-                @forelse($connections as $connection)
-                    <tr>
-                        <td class="px-4 py-3 font-medium">{{ $connection->name }}</td>
-                        <td class="px-4 py-3">
-                            <span class="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">{{ $connection->driver->label() }}</span>
-                        </td>
-                        <td class="px-4 py-3 font-mono text-xs text-slate-500">{{ $connection->database }}</td>
-                        <td class="px-4 py-3">{{ $connection->grantedUsers->count() }}</td>
-                        <td class="px-4 py-3 text-right whitespace-nowrap">
-                            <button wire:click="testConnection({{ $connection->id }})" wire:loading.attr="disabled" class="font-medium text-slate-600 hover:text-slate-500">
+            </x-slot:head>
+
+            @forelse ($connections as $connection)
+                <x-ui.tr :hover="false">
+                    <x-ui.td mono class="text-ink-2">{{ $connection->name }}</x-ui.td>
+                    <x-ui.td><x-ui.badge>{{ $connection->driver->label() }}</x-ui.badge></x-ui.td>
+                    <x-ui.td mono muted truncate>{{ $connection->database }}</x-ui.td>
+                    <x-ui.td mono muted>{{ $connection->grantedUsers->count() }} granted</x-ui.td>
+                    <x-ui.td align="right" nowrap>
+                        <div class="flex items-center justify-end gap-2.5">
+                            <x-ui.action wire:click="testConnection({{ $connection->id }})" wire:loading.attr="disabled">
                                 <span wire:loading.remove wire:target="testConnection({{ $connection->id }})">Test</span>
                                 <span wire:loading wire:target="testConnection({{ $connection->id }})">Testing…</span>
-                            </button>
-                            <button wire:click="toggleGrants({{ $connection->id }})" class="ml-3 font-medium text-indigo-600 hover:text-indigo-500">Grants</button>
-                            <button wire:click="openEdit({{ $connection->id }})" class="ml-3 font-medium text-indigo-600 hover:text-indigo-500">Edit</button>
-                            <button wire:click="deleteConnection({{ $connection->id }})"
-                                    wire:confirm="Delete connection {{ $connection->name }}?"
-                                    class="ml-3 font-medium text-rose-600 hover:text-rose-500">Delete</button>
-                        </td>
-                    </tr>
-                    @if($grantsForId === $connection->id)
-                        <tr class="bg-slate-50">
-                            <td colspan="5" class="px-4 py-4">
-                                <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Developer access to “{{ $connection->name }}”</p>
-                                @forelse($developers as $developer)
-                                    <label class="mr-6 inline-flex items-center gap-2 text-sm">
-                                        <input type="checkbox"
-                                               wire:change="toggleGrant({{ $connection->id }}, {{ $developer->id }})"
-                                               @checked($connection->grantedUsers->contains($developer))
-                                               class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
-                                        {{ $developer->name }} <span class="text-slate-400">({{ $developer->email }})</span>
+                            </x-ui.action>
+                            <x-ui.action wire:click="toggleGrants({{ $connection->id }})" tone="accent">Grants</x-ui.action>
+                            <x-ui.action wire:click="openEdit({{ $connection->id }})" tone="accent">Edit</x-ui.action>
+                            <x-ui.action wire:click="deleteConnection({{ $connection->id }})"
+                                         wire:confirm="Delete connection {{ $connection->name }}?" tone="danger">Delete</x-ui.action>
+                        </div>
+                    </x-ui.td>
+                </x-ui.tr>
+
+                @if ($grantsForId === $connection->id)
+                    <tr class="bg-canvas">
+                        <td colspan="5" class="border-b border-line px-3.5 py-3.5">
+                            <p class="eyebrow mb-2.5">Developer access to “{{ $connection->name }}”</p>
+                            <div class="flex flex-wrap gap-x-5 gap-y-2">
+                                @forelse ($developers as $developer)
+                                    <label class="inline-flex items-center gap-2 text-[12.5px] text-ink-3">
+                                        <x-ui.checkbox wire:change="toggleGrant({{ $connection->id }}, {{ $developer->id }})"
+                                                       @checked($connection->grantedUsers->contains($developer)) />
+                                        {{ $developer->name }}
+                                        <span class="font-mono text-[11px] text-mute-4">{{ $developer->email }}</span>
                                     </label>
                                 @empty
-                                    <p class="text-sm text-slate-400">This team has no developers yet.</p>
+                                    <p class="text-[12.5px] text-mute-4">This team has no developers yet.</p>
                                 @endforelse
-                            </td>
-                        </tr>
-                    @endif
-                @empty
-                    <tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">No connections yet.</td></tr>
-                @endforelse
-            </tbody>
-        </table>
-    </div>
+                            </div>
+                        </td>
+                    </tr>
+                @endif
+            @empty
+                <x-ui.empty :colspan="5">No connections yet.</x-ui.empty>
+            @endforelse
+        </x-ui.table>
+    </x-ui.panel>
 </div>

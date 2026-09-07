@@ -53,11 +53,12 @@ test('audit entries can be filtered by action', function () {
     AuditLog::create(['team_id' => $team->id, 'action' => 'connection.created']);
 
     // The action dropdown always lists every action, so assert on the table cells.
+    // data-audit-action is the view's stable hook for exactly this.
     Livewire::actingAs($auditor)
         ->test(Index::class)
         ->set('action', 'request.')
-        ->assertSeeHtml('text-xs">request.approved</code>')
-        ->assertDontSeeHtml('text-xs">connection.created</code>');
+        ->assertSeeHtml('data-audit-action="request.approved"')
+        ->assertDontSeeHtml('data-audit-action="connection.created"');
 });
 
 test('audit csv export streams filtered rows', function () {
