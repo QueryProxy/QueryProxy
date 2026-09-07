@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please **do not open public issues for security problems**.
-Email `security@queryproxy.dev` (or use GitHub private vulnerability reporting)
+Email `info@queryproxy.com` (or use GitHub private vulnerability reporting)
 with a description, reproduction steps and impact assessment. You will get an
 acknowledgement within 72 hours.
 
