@@ -10,6 +10,19 @@ asynchronously on a worker, and results come back **masked, limited and fully au
 > Built for small and mid-sized engineering teams, DevOps engineers and DBAs.
 > Single Laravel monolith, zero external dependencies by default. AGPLv3.
 
+**Website & docs: [queryproxy.com](https://queryproxy.com) · [Documentation](https://queryproxy.com/docs/)**
+
+![A completed request: guards injected the LIMIT, a DBA approved from Slack, and the results came back masked](.github/assets/request-result.png)
+
+<details>
+<summary><strong>More screenshots</strong> — the approvals queue and the Query Studio</summary>
+
+![The DBA approvals queue with a pending write request](.github/assets/approvals.png)
+
+![The Query Studio: connection picker and guarded SQL editor](.github/assets/query-studio.png)
+
+</details>
+
 ---
 
 ## Features
@@ -41,10 +54,14 @@ asynchronously on a worker, and results come back **masked, limited and fully au
 ## Quick start (Docker)
 
 ```bash
-git clone https://github.com/queryproxy/queryproxy.git
-cd queryproxy
+git clone https://github.com/QueryProxy/QueryProxy.git
+cd QueryProxy
 docker compose up
 ```
+
+Prefer a prebuilt image? Every release is published to GitHub Container
+Registry as `ghcr.io/queryproxy/queryproxy` (`latest` and per-version tags) —
+point the compose services' `image:` at it instead of `build: .`.
 
 Open <http://localhost:8000> — with the default compose file (`QUERYPROXY_SEED_DEMO=true`)
 you can log in as:
