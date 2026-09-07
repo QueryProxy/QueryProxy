@@ -63,7 +63,7 @@ Prefer a prebuilt image? Every release is published to GitHub Container
 Registry as `ghcr.io/queryproxy/queryproxy` (`latest` and per-version tags) —
 point the compose services' `image:` at it instead of `build: .`.
 
-Open <http://localhost:8000>. Three containers start: the web app (nginx +
+Open <http://localhost:7432>. Three containers start: the web app (nginx +
 php-fpm, running as a non-root user), a queue worker (executes approved queries)
 and the scheduler (result retention pruning).
 
@@ -147,7 +147,7 @@ instance itself as sensitive.
   still decrypts. Without an explicit `APP_KEY`, the container generates one on
   first boot and persists it to the database volume.
 - **Serve over HTTPS** behind a TLS-terminating reverse proxy (the container
-  serves plain HTTP on `:8000`). Then set `SESSION_SECURE_COOKIE=true` and, if
+  serves plain HTTP on `:7432`). Then set `SESSION_SECURE_COOKIE=true` and, if
   your proxy is not on the compose network, narrow the trusted-proxy setting in
   `bootstrap/app.php` from `*` to your proxy's address.
 - **Keep demo seeding off** (`QUERYPROXY_SEED_DEMO=false`, the default) on any

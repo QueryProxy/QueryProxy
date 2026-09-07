@@ -67,7 +67,7 @@ ENV APP_ENV=production \
 # workers) runs as www-data; no process in the container is root.
 USER www-data
 
-EXPOSE 8000
+EXPOSE 7432
 
 ENTRYPOINT ["docker/entrypoint.sh"]
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]
