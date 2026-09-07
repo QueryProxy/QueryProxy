@@ -1,137 +1,161 @@
 @props(['title' => null])
+
 <!DOCTYPE html>
-<html lang="{{ str_replace('_', '-', app()->getLocale()) }}">
+<html lang="{{ str_replace('_', '-', app()->getLocale()) }}" class="h-full">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{{ $title ? $title.' — ' : '' }}{{ config('app.name', 'QueryProxy') }}</title>
+    <x-theme-script />
+    @fonts
     @vite(['resources/css/app.css', 'resources/js/app.js'])
     @livewireStyles
 </head>
-<body class="min-h-screen bg-slate-100 font-sans text-slate-900 antialiased">
+<body class="min-h-full bg-canvas font-sans text-ink-3 antialiased">
 @php
     $user = auth()->user();
     $team = $user?->currentTeam();
     $role = $team ? $user->roleIn($team) : null;
+    $isDba = $role === \App\Enums\TeamRole::Dba || $user?->isAdmin();
 @endphp
 
-<nav class="border-b border-slate-800 bg-slate-900 text-slate-100">
-    <div class="mx-auto flex h-14 max-w-7xl items-center gap-6 px-4 sm:px-6">
-        <a href="{{ route('dashboard') }}" class="flex items-center gap-2 font-semibold tracking-tight">
-            <svg class="h-6 w-6 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                <ellipse cx="12" cy="5.5" rx="7.5" ry="3" />
-                <path d="M4.5 5.5v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3v-6" />
-                <path d="M4.5 11.5v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3v-6" />
-                <path d="M15 13.5l-2.5 4h3l-2.5 4" stroke="currentColor" stroke-linejoin="round" class="text-amber-400" />
-            </svg>
-            QueryProxy
-        </a>
-
-        <div class="hidden items-center gap-1 text-sm md:flex">
-            <x-nav-link :href="route('dashboard')" :active="request()->routeIs('dashboard')">Dashboard</x-nav-link>
-            @if($team)
-                @if(Route::has('studio') && ($role === \App\Enums\TeamRole::Developer || $role === \App\Enums\TeamRole::Dba || $user->isAdmin()))
-                    <x-nav-link :href="route('studio')" :active="request()->routeIs('studio')">Query Studio</x-nav-link>
-                @endif
-                @if(Route::has('requests.index') && $role !== \App\Enums\TeamRole::Auditor)
-                    <x-nav-link :href="route('requests.index')" :active="request()->routeIs('requests.*')">Requests</x-nav-link>
-                @endif
-                @if($role === \App\Enums\TeamRole::Dba || $user->isAdmin())
-                    @if(Route::has('approvals.index'))
-                        <x-nav-link :href="route('approvals.index')" :active="request()->routeIs('approvals.*')">Approvals</x-nav-link>
-                    @endif
-                    @if(Route::has('connections.index'))
-                        <x-nav-link :href="route('connections.index')" :active="request()->routeIs('connections.*')">Connections</x-nav-link>
-                    @endif
-                    @if(Route::has('masking.index'))
-                        <x-nav-link :href="route('masking.index')" :active="request()->routeIs('masking.*')">Masking</x-nav-link>
-                    @endif
-                    @if(Route::has('settings.chatops'))
-                        <x-nav-link :href="route('settings.chatops')" :active="request()->routeIs('settings.*')">ChatOps</x-nav-link>
-                    @endif
-                @endif
-                @if(Route::has('audit.index') && ($role === \App\Enums\TeamRole::Auditor || $user->isAdmin()))
-                    <x-nav-link :href="route('audit.index')" :active="request()->routeIs('audit.*')">Audit Log</x-nav-link>
-                @endif
-            @endif
-            @if(Route::has('admin.teams') && $user?->isAdmin())
-                <x-nav-link :href="route('admin.teams')" :active="request()->routeIs('admin.*')">Admin</x-nav-link>
-            @endif
+<div class="grid min-h-screen grid-cols-[232px_minmax(0,1fr)]">
+    <aside class="flex min-h-0 flex-col border-r border-line bg-header">
+        <div class="flex h-12 items-center gap-2.5 border-b border-line px-3.5">
+            <a href="{{ route('dashboard') }}" class="flex items-center gap-2.5 text-ink">
+                <x-app-logo />
+                <span class="font-display text-[12.5px] font-semibold uppercase tracking-[0.16em]">QueryProxy</span>
+            </a>
         </div>
 
-        <div class="ml-auto flex items-center gap-3">
-            @if($user)
-                {{-- Team switcher --}}
-                @php $teams = $user->accessibleTeams(); @endphp
-                @if($teams->count() > 0)
-                    <div x-data="{ open: false }" class="relative">
-                        <button @click="open = !open" @click.outside="open = false"
-                                class="flex items-center gap-1.5 rounded-md bg-slate-800 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-700">
-                            <span class="text-slate-400">Team:</span>
-                            <span class="font-medium">{{ $team?->name ?? '—' }}</span>
-                            @if($role)
-                                <span class="rounded bg-indigo-500/20 px-1.5 py-0.5 text-xs font-medium text-indigo-300">{{ $role->label() }}</span>
-                            @elseif($user->isAdmin())
-                                <span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-xs font-medium text-amber-300">Admin</span>
+        @if ($user)
+            @php $teams = $user->accessibleTeams(); @endphp
+            @if ($teams->count() > 0)
+                <x-ui.dropdown align="left" width="w-56" class="mx-3 mt-3 mb-0.5">
+                    <x-slot:trigger>
+                        <button type="button" class="flex w-full items-center gap-2 rounded-control border border-line bg-panel px-2.5 py-2 text-left transition-colors hover:border-line-strong">
+                            <span class="size-1.5 shrink-0 rounded-full bg-ok"></span>
+                            <span class="truncate text-[12.5px] font-medium text-ink">{{ $team?->name ?? 'No team' }}</span>
+                            @if ($role)
+                                <x-ui.badge tone="accent" class="ml-auto">{{ $role->label() }}</x-ui.badge>
+                            @elseif ($user->isAdmin())
+                                <x-ui.badge tone="pending" class="ml-auto">Admin</x-ui.badge>
                             @endif
-                            <svg class="h-4 w-4 text-slate-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/></svg>
+                            <x-ui.icon name="chevron-down" :size="14" class="text-mute-3" />
                         </button>
-                        <div x-show="open" x-transition.opacity x-cloak
-                             class="absolute right-0 z-20 mt-1 w-56 overflow-hidden rounded-md border border-slate-200 bg-white py-1 text-sm text-slate-700 shadow-lg">
-                            @foreach($teams as $t)
-                                <form method="POST" action="{{ route('teams.switch', $t) }}">
-                                    @csrf
-                                    <button type="submit"
-                                            class="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-slate-50 {{ $team && $t->id === $team->id ? 'font-semibold text-indigo-600' : '' }}">
-                                        {{ $t->name }}
-                                        @if($rt = $user->roleIn($t))
-                                            <span class="text-xs text-slate-400">{{ $rt->label() }}</span>
-                                        @endif
-                                    </button>
-                                </form>
-                            @endforeach
-                        </div>
-                    </div>
+                    </x-slot:trigger>
+
+                    @foreach ($teams as $t)
+                        <form method="POST" action="{{ route('teams.switch', $t) }}">
+                            @csrf
+                            <x-ui.dropdown-item type="submit" :active="$team && $t->id === $team->id">
+                                <span class="truncate">{{ $t->name }}</span>
+                                @if ($rt = $user->roleIn($t))
+                                    <span class="ml-auto text-[11px] text-mute-3">{{ $rt->label() }}</span>
+                                @endif
+                            </x-ui.dropdown-item>
+                        </form>
+                    @endforeach
+                </x-ui.dropdown>
+            @endif
+        @endif
+
+        <nav class="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto p-2">
+            <div class="eyebrow px-2 pt-3 pb-1.5">Workspace</div>
+            <x-ui.nav-item :href="route('dashboard')" :active="request()->routeIs('dashboard')" icon="dashboard">Dashboard</x-ui.nav-item>
+
+            @if ($team)
+                @if (Route::has('studio') && ($role === \App\Enums\TeamRole::Developer || $role === \App\Enums\TeamRole::Dba || $user->isAdmin()))
+                    <x-ui.nav-item :href="route('studio')" :active="request()->routeIs('studio')" icon="terminal">Query Studio</x-ui.nav-item>
+                @endif
+                @if (Route::has('requests.index') && $role !== \App\Enums\TeamRole::Auditor)
+                    <x-ui.nav-item :href="route('requests.index')" :active="request()->routeIs('requests.*')" icon="list">Requests</x-ui.nav-item>
                 @endif
 
-                <livewire:notification-bell />
+                @if ($isDba)
+                    <div class="eyebrow px-2 pt-3.5 pb-1.5">Governance</div>
+                    @if (Route::has('approvals.index'))
+                        <x-ui.nav-item :href="route('approvals.index')" :active="request()->routeIs('approvals.*')" icon="shield">Approvals</x-ui.nav-item>
+                    @endif
+                    @if (Route::has('connections.index'))
+                        <x-ui.nav-item :href="route('connections.index')" :active="request()->routeIs('connections.*')" icon="database">Connections</x-ui.nav-item>
+                    @endif
+                    @if (Route::has('masking.index'))
+                        <x-ui.nav-item :href="route('masking.index')" :active="request()->routeIs('masking.*')" icon="mask">Masking</x-ui.nav-item>
+                    @endif
+                    @if (Route::has('settings.chatops'))
+                        <x-ui.nav-item :href="route('settings.chatops')" :active="request()->routeIs('settings.*')" icon="chat">ChatOps</x-ui.nav-item>
+                    @endif
+                @endif
 
-                {{-- User menu --}}
-                <div x-data="{ open: false }" class="relative">
-                    <button @click="open = !open" @click.outside="open = false"
-                            class="flex items-center gap-2 rounded-full py-1 pl-1 pr-2 text-sm hover:bg-slate-800">
-                        <span class="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-500 text-xs font-bold text-white">
-                            {{ strtoupper(mb_substr($user->name, 0, 1)) }}
-                        </span>
-                        <span class="hidden text-slate-200 sm:inline">{{ $user->name }}</span>
-                    </button>
-                    <div x-show="open" x-transition.opacity x-cloak
-                         class="absolute right-0 z-20 mt-1 w-44 overflow-hidden rounded-md border border-slate-200 bg-white py-1 text-sm text-slate-700 shadow-lg">
-                        <div class="border-b border-slate-100 px-3 py-2 text-xs text-slate-400">{{ $user->email }}</div>
-                        <a href="{{ route('profile') }}" class="block px-3 py-2 hover:bg-slate-50">Profile</a>
+                @if (Route::has('audit.index') && ($role === \App\Enums\TeamRole::Auditor || $user->isAdmin()))
+                    <div class="eyebrow px-2 pt-3.5 pb-1.5">Records</div>
+                    <x-ui.nav-item :href="route('audit.index')" :active="request()->routeIs('audit.*')" icon="audit">Audit Log</x-ui.nav-item>
+                @endif
+            @endif
+
+            @if (Route::has('admin.teams') && $user?->isAdmin())
+                <div class="eyebrow px-2 pt-3.5 pb-1.5">Administration</div>
+                <x-ui.nav-item :href="route('admin.teams')" :active="request()->routeIs('admin.*')" icon="users">Teams &amp; Users</x-ui.nav-item>
+            @endif
+        </nav>
+
+        @if ($user)
+            <div class="flex items-center gap-2.5 border-t border-line px-3 py-2.5">
+                <x-ui.avatar :name="$user->name" />
+                <div class="min-w-0">
+                    <div class="truncate text-[12px] font-medium text-ink">{{ $user->name }}</div>
+                    <div class="font-mono text-[10px] text-mute-4">self-hosted</div>
+                </div>
+                <x-ui.theme-toggle class="ml-auto" />
+            </div>
+        @endif
+    </aside>
+
+    <div class="flex min-w-0 flex-col">
+        <header class="flex h-12 shrink-0 items-center gap-3 border-b border-line bg-header px-4">
+            <span class="truncate font-mono text-[12px] text-mute-3">
+                {{ $team ? \Illuminate\Support\Str::slug($team->name) : 'no-team' }}<span class="text-hairline"> / </span><span class="text-ink-3">{{ $title ? \Illuminate\Support\Str::slug($title) : 'dashboard' }}</span>
+            </span>
+
+            @if ($user)
+                <div class="ml-auto flex items-center gap-2">
+                    <livewire:notification-bell />
+
+                    <x-ui.dropdown width="w-52">
+                        <x-slot:trigger>
+                            <button type="button" class="flex items-center gap-2 rounded-control py-1 pr-2 pl-1 transition-colors hover:bg-raised">
+                                <x-ui.avatar :name="$user->name" size="sm" />
+                                <span class="hidden text-[12.5px] text-ink-3 sm:inline">{{ $user->name }}</span>
+                            </button>
+                        </x-slot:trigger>
+
+                        <div class="border-b border-line px-3 py-2 font-mono text-[11px] text-mute-3">{{ $user->email }}</div>
+                        <x-ui.dropdown-item :href="route('profile')">
+                            <x-ui.icon name="user" :size="14" /> Profile
+                        </x-ui.dropdown-item>
                         <form method="POST" action="{{ route('logout') }}">
                             @csrf
-                            <button type="submit" class="w-full px-3 py-2 text-left hover:bg-slate-50">Log out</button>
+                            <x-ui.dropdown-item type="submit">
+                                <x-ui.icon name="logout" :size="14" /> Log out
+                            </x-ui.dropdown-item>
                         </form>
-                    </div>
+                    </x-ui.dropdown>
                 </div>
             @endif
-        </div>
+        </header>
+
+        <main class="min-w-0 flex-1 p-5">
+            @if (session('status'))
+                <x-ui.alert tone="ok" icon="check" class="mb-4">{{ session('status') }}</x-ui.alert>
+            @endif
+
+            {{ $slot }}
+        </main>
     </div>
-</nav>
-
-<main class="mx-auto max-w-7xl px-4 py-8 sm:px-6">
-    @if(session('status'))
-        <div class="mb-4 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-            {{ session('status') }}
-        </div>
-    @endif
-
-    {{ $slot }}
-</main>
+</div>
 
 @livewireScripts
-<style>[x-cloak]{display:none!important}</style>
 </body>
 </html>
