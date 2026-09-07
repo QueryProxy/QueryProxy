@@ -26,7 +26,11 @@ test('admin pages render for admins', function () {
     $admin = User::factory()->create(['is_admin' => true]);
     $team = Team::factory()->create();
 
-    $this->actingAs($admin)->get(route('admin.teams'))->assertOk()->assertSee('Teams');
-    $this->actingAs($admin)->get(route('admin.users'))->assertOk()->assertSee('Users');
+    // Assert on copy unique to each page: the sidebar now renders "Teams & Users"
+    // everywhere, so a bare 'Teams' / 'Users' assertion would pass vacuously.
+    $this->actingAs($admin)->get(route('admin.teams'))->assertOk()
+        ->assertSee('Teams isolate connections');
+    $this->actingAs($admin)->get(route('admin.users'))->assertOk()
+        ->assertSee('Create accounts, grant system-admin');
     $this->actingAs($admin)->get(route('admin.teams.members', $team))->assertOk()->assertSee($team->name);
 });

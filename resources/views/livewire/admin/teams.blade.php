@@ -1,57 +1,49 @@
 <div>
-    <div class="mb-6 flex items-center justify-between">
-        <div>
-            <h1 class="text-2xl font-bold tracking-tight">Teams</h1>
-            <p class="mt-1 text-sm text-slate-500">Teams isolate connections, requests and audit trails.</p>
-        </div>
-        <div class="flex gap-2 text-sm">
-            <a href="{{ route('admin.users') }}" class="rounded-md border border-slate-300 bg-white px-3 py-2 font-medium text-slate-700 hover:bg-slate-50">Manage Users</a>
-        </div>
-    </div>
+    <x-ui.page-header title="Teams" subtitle="Teams isolate connections, requests and audit trails.">
+        <x-slot:actions>
+            <x-ui.btn :href="route('admin.users')" icon="users">Manage users</x-ui.btn>
+        </x-slot:actions>
+    </x-ui.page-header>
 
-    <div class="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <form wire:submit="createTeam" class="flex items-end gap-3">
-            <div class="flex-1">
-                <label class="mb-1 block text-sm font-medium text-slate-700">New team name</label>
-                <input type="text" wire:model="name" placeholder="e.g. Payments Squad"
-                       class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('name') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">
-                Create Team
-            </button>
+    <x-ui.panel padded class="mb-3.5">
+        <form wire:submit="createTeam" class="flex items-end gap-2.5">
+            <x-ui.field label="New team name" class="flex-1" :error="$errors->first('name')">
+                <x-ui.input type="text" wire:model="name" placeholder="e.g. Payments Squad" />
+            </x-ui.field>
+            <x-ui.btn type="submit" variant="primary" icon="plus">Create team</x-ui.btn>
         </form>
-    </div>
+    </x-ui.panel>
 
-    <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table class="w-full text-sm">
-            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+    <x-ui.panel>
+        <x-ui.table>
+            <x-slot:head>
                 <tr>
-                    <th class="px-4 py-3">Team</th>
-                    <th class="px-4 py-3">Slug</th>
-                    <th class="px-4 py-3">Members</th>
-                    <th class="px-4 py-3">Created</th>
-                    <th class="px-4 py-3"></th>
+                    <x-ui.th>Team</x-ui.th>
+                    <x-ui.th class="w-48">Slug</x-ui.th>
+                    <x-ui.th class="w-24">Members</x-ui.th>
+                    <x-ui.th class="w-28">Created</x-ui.th>
+                    <x-ui.th class="w-36" align="right"></x-ui.th>
                 </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-                @forelse($teams as $team)
-                    <tr>
-                        <td class="px-4 py-3 font-medium">{{ $team->name }}</td>
-                        <td class="px-4 py-3 text-slate-500">{{ $team->slug }}</td>
-                        <td class="px-4 py-3">{{ $team->users_count }}</td>
-                        <td class="px-4 py-3 text-slate-500">{{ $team->created_at->format('Y-m-d') }}</td>
-                        <td class="px-4 py-3 text-right">
-                            <a href="{{ route('admin.teams.members', $team) }}" class="font-medium text-indigo-600 hover:text-indigo-500">Members</a>
-                            <button wire:click="deleteTeam({{ $team->id }})"
-                                    wire:confirm="Delete team {{ $team->name }}? Connections and requests in it will be removed."
-                                    class="ml-3 font-medium text-rose-600 hover:text-rose-500">Delete</button>
-                        </td>
-                    </tr>
-                @empty
-                    <tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">No teams yet — create the first one above.</td></tr>
-                @endforelse
-            </tbody>
-        </table>
-    </div>
+            </x-slot:head>
+
+            @forelse ($teams as $team)
+                <x-ui.tr>
+                    <x-ui.td class="text-ink-2">{{ $team->name }}</x-ui.td>
+                    <x-ui.td mono muted>{{ $team->slug }}</x-ui.td>
+                    <x-ui.td mono>{{ $team->users_count }}</x-ui.td>
+                    <x-ui.td mono muted>{{ $team->created_at->format('Y-m-d') }}</x-ui.td>
+                    <x-ui.td align="right" nowrap>
+                        <div class="flex items-center justify-end gap-2.5">
+                            <x-ui.action :href="route('admin.teams.members', $team)" tone="accent">Members</x-ui.action>
+                            <x-ui.action wire:click="deleteTeam({{ $team->id }})"
+                                         wire:confirm="Delete team {{ $team->name }}? Connections and requests in it will be removed."
+                                         tone="danger">Delete</x-ui.action>
+                        </div>
+                    </x-ui.td>
+                </x-ui.tr>
+            @empty
+                <x-ui.empty :colspan="5">No teams yet — create the first one above.</x-ui.empty>
+            @endforelse
+        </x-ui.table>
+    </x-ui.panel>
 </div>

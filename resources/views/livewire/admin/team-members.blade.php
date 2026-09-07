@@ -1,64 +1,60 @@
 <div>
-    <div class="mb-6">
-        <a href="{{ route('admin.teams') }}" class="text-sm text-slate-500 hover:text-slate-700">&larr; Teams</a>
-        <h1 class="mt-1 text-2xl font-bold tracking-tight">{{ $team->name }} — Members</h1>
+    <div class="mb-5">
+        <a href="{{ route('admin.teams') }}" class="inline-flex items-center gap-1.5 font-mono text-[11.5px] text-mute-3 transition-colors hover:text-ink-3">
+            <x-ui.icon name="arrow-left" :size="14" />
+            Teams
+        </a>
+        <h1 class="mt-1.5 font-display text-[19px] font-semibold tracking-[-0.012em] text-ink">{{ $team->name }} — Members</h1>
     </div>
 
-    <div class="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <form wire:submit="addMember" class="flex items-end gap-3">
-            <div class="flex-1">
-                <label class="mb-1 block text-sm font-medium text-slate-700">User email</label>
-                <input type="email" wire:model="email" placeholder="user@example.com"
-                       class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('email') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">Role</label>
-                <select wire:model="role" class="rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none">
-                    @foreach($roles as $r)
+    <x-ui.panel padded class="mb-3.5">
+        <form wire:submit="addMember" class="flex items-end gap-2.5">
+            <x-ui.field label="User email" class="flex-1" :error="$errors->first('email')">
+                <x-ui.input type="email" wire:model="email" placeholder="user@example.com" />
+            </x-ui.field>
+
+            <x-ui.field label="Role" class="w-40">
+                <x-ui.select wire:model="role">
+                    @foreach ($roles as $r)
                         <option value="{{ $r->value }}">{{ $r->label() }}</option>
                     @endforeach
-                </select>
-            </div>
-            <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">
-                Add Member
-            </button>
-        </form>
-    </div>
+                </x-ui.select>
+            </x-ui.field>
 
-    <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table class="w-full text-sm">
-            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            <x-ui.btn type="submit" variant="primary" icon="plus">Add member</x-ui.btn>
+        </form>
+    </x-ui.panel>
+
+    <x-ui.panel>
+        <x-ui.table>
+            <x-slot:head>
                 <tr>
-                    <th class="px-4 py-3">Name</th>
-                    <th class="px-4 py-3">Email</th>
-                    <th class="px-4 py-3">Role</th>
-                    <th class="px-4 py-3"></th>
+                    <x-ui.th>Name</x-ui.th>
+                    <x-ui.th class="w-64">Email</x-ui.th>
+                    <x-ui.th class="w-44">Role</x-ui.th>
+                    <x-ui.th class="w-28" align="right"></x-ui.th>
                 </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-                @forelse($members as $member)
-                    <tr>
-                        <td class="px-4 py-3 font-medium">{{ $member->name }}</td>
-                        <td class="px-4 py-3 text-slate-500">{{ $member->email }}</td>
-                        <td class="px-4 py-3">
-                            <select wire:change="updateRole({{ $member->id }}, $event.target.value)"
-                                    class="rounded-md border border-slate-300 px-2 py-1 text-sm">
-                                @foreach($roles as $r)
-                                    <option value="{{ $r->value }}" @selected($member->pivot->role === $r->value)>{{ $r->label() }}</option>
-                                @endforeach
-                            </select>
-                        </td>
-                        <td class="px-4 py-3 text-right">
-                            <button wire:click="removeMember({{ $member->id }})"
-                                    wire:confirm="Remove {{ $member->name }} from {{ $team->name }}?"
-                                    class="font-medium text-rose-600 hover:text-rose-500">Remove</button>
-                        </td>
-                    </tr>
-                @empty
-                    <tr><td colspan="4" class="px-4 py-8 text-center text-slate-400">No members yet.</td></tr>
-                @endforelse
-            </tbody>
-        </table>
-    </div>
+            </x-slot:head>
+
+            @forelse ($members as $member)
+                <x-ui.tr>
+                    <x-ui.td class="text-ink-2">{{ $member->name }}</x-ui.td>
+                    <x-ui.td mono muted>{{ $member->email }}</x-ui.td>
+                    <x-ui.td>
+                        <x-ui.select wire:change="updateRole({{ $member->id }}, $event.target.value)" class="h-[26px] text-[12px]">
+                            @foreach ($roles as $r)
+                                <option value="{{ $r->value }}" @selected($member->pivot->role === $r->value)>{{ $r->label() }}</option>
+                            @endforeach
+                        </x-ui.select>
+                    </x-ui.td>
+                    <x-ui.td align="right">
+                        <x-ui.action wire:click="removeMember({{ $member->id }})"
+                                     wire:confirm="Remove {{ $member->name }} from {{ $team->name }}?" tone="danger">Remove</x-ui.action>
+                    </x-ui.td>
+                </x-ui.tr>
+            @empty
+                <x-ui.empty :colspan="4">No members yet.</x-ui.empty>
+            @endforelse
+        </x-ui.table>
+    </x-ui.panel>
 </div>

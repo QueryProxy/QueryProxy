@@ -1,45 +1,34 @@
 <div class="mx-auto max-w-xl">
-    <div class="mb-6">
-        <h1 class="text-2xl font-bold tracking-tight">Profile</h1>
-        <p class="mt-1 text-sm text-slate-500">{{ auth()->user()->email }}</p>
-    </div>
+    <x-ui.page-header title="Profile" :subtitle="auth()->user()->email" />
 
-    @if(session('status'))
-        <div class="mb-4 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{{ session('status') }}</div>
+    @if (session('status'))
+        <x-ui.alert tone="ok" icon="check" class="mb-3.5">{{ session('status') }}</x-ui.alert>
     @endif
 
-    <div class="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 class="mb-4 text-sm font-semibold text-slate-700">Name</h2>
-        <form wire:submit="updateName" class="flex items-end gap-3">
-            <div class="flex-1">
-                <input type="text" wire:model="name" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('name') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">Save</button>
+    <x-ui.panel title="Name" padded class="mb-3.5">
+        <form wire:submit="updateName" class="flex items-end gap-2.5">
+            <x-ui.field class="flex-1" :error="$errors->first('name')">
+                <x-ui.input type="text" wire:model="name" />
+            </x-ui.field>
+            <x-ui.btn type="submit" variant="primary">Save</x-ui.btn>
         </form>
-    </div>
+    </x-ui.panel>
 
-    <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <h2 class="mb-4 text-sm font-semibold text-slate-700">Change password</h2>
-        <form wire:submit="updatePassword" class="space-y-4">
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">Current password</label>
-                <input type="password" wire:model="currentPassword" autocomplete="current-password"
-                       class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('currentPassword') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">New password</label>
-                <input type="password" wire:model="password" autocomplete="new-password"
-                       class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('password') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">New password (again)</label>
-                <input type="password" wire:model="password_confirmation" autocomplete="new-password"
-                       class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-            </div>
-            <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">Change Password</button>
+    <x-ui.panel title="Change password" padded>
+        <form wire:submit="updatePassword" class="flex flex-col gap-3.5">
+            <x-ui.field label="Current password" :error="$errors->first('currentPassword')">
+                <x-ui.input type="password" wire:model="currentPassword" autocomplete="current-password" />
+            </x-ui.field>
+
+            <x-ui.field label="New password" :error="$errors->first('password')">
+                <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
+            </x-ui.field>
+
+            <x-ui.field label="New password (again)">
+                <x-ui.input type="password" wire:model="password_confirmation" autocomplete="new-password" />
+            </x-ui.field>
+
+            <x-ui.btn type="submit" variant="primary" class="self-start">Change password</x-ui.btn>
         </form>
-    </div>
+    </x-ui.panel>
 </div>

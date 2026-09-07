@@ -1,92 +1,91 @@
 <div>
-    <div class="mb-6">
-        <a href="{{ route('admin.teams') }}" class="text-sm text-slate-500 hover:text-slate-700">&larr; Teams</a>
-        <h1 class="mt-1 text-2xl font-bold tracking-tight">Users</h1>
-        <p class="mt-1 text-sm text-slate-500">Create accounts, grant system-admin, or remove users. Team roles are managed per team.</p>
+    <div class="mb-5">
+        <a href="{{ route('admin.teams') }}" class="inline-flex items-center gap-1.5 font-mono text-[11.5px] text-mute-3 transition-colors hover:text-ink-3">
+            <x-ui.icon name="arrow-left" :size="14" />
+            Teams
+        </a>
+        <h1 class="mt-1.5 font-display text-[19px] font-semibold tracking-[-0.012em] text-ink">Users</h1>
+        <p class="mt-1.5 max-w-[78ch] text-[12.5px] leading-[1.55] text-mute">
+            Create accounts, grant system-admin, or remove users. Team roles are managed per team.
+        </p>
     </div>
 
-    @if($generatedPassword)
-        <div class="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            Generated password (shown once): <code class="rounded bg-amber-100 px-1.5 py-0.5 font-mono">{{ $generatedPassword }}</code>
-        </div>
+    @if ($generatedPassword)
+        <x-ui.alert tone="pending" icon="key" class="mb-3.5">
+            Generated password (shown once):
+            <code class="ml-1 rounded-badge border border-pending-line bg-canvas px-1.5 py-0.5 font-mono text-pending">{{ $generatedPassword }}</code>
+        </x-ui.alert>
     @endif
 
-    <div class="mb-6 rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-        <form wire:submit="createUser" class="grid grid-cols-1 gap-3 sm:grid-cols-5 sm:items-end">
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">Name</label>
-                <input type="text" wire:model="name" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('name') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">Email</label>
-                <input type="email" wire:model="email" class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('email') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <div>
-                <label class="mb-1 block text-sm font-medium text-slate-700">Password <span class="text-slate-400">(blank = generate)</span></label>
-                <input type="text" wire:model="password" class="w-full rounded-md border border-slate-300 px-3 py-2 font-mono text-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200">
-                @error('password') <p class="mt-1 text-sm text-rose-600">{{ $message }}</p> @enderror
-            </div>
-            <label class="flex items-center gap-2 pb-2 text-sm text-slate-600">
-                <input type="checkbox" wire:model="isAdmin" class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
+    <x-ui.panel padded class="mb-3.5">
+        <form wire:submit="createUser" class="grid grid-cols-1 items-end gap-3 sm:grid-cols-5">
+            <x-ui.field label="Name" :error="$errors->first('name')">
+                <x-ui.input type="text" wire:model="name" />
+            </x-ui.field>
+
+            <x-ui.field label="Email" :error="$errors->first('email')">
+                <x-ui.input type="email" wire:model="email" />
+            </x-ui.field>
+
+            <x-ui.field label="Password" hint="blank = generate" :error="$errors->first('password')">
+                <x-ui.input type="text" wire:model="password" class="font-mono" />
+            </x-ui.field>
+
+            <label class="flex h-[30px] items-center gap-2 text-[12.5px] text-ink-4">
+                <x-ui.checkbox wire:model="isAdmin" />
                 System admin
             </label>
-            <button type="submit" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500">
-                Create User
-            </button>
-        </form>
-    </div>
 
-    <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <table class="w-full text-sm">
-            <thead class="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            <x-ui.btn type="submit" variant="primary" icon="plus">Create user</x-ui.btn>
+        </form>
+    </x-ui.panel>
+
+    <x-ui.panel>
+        <x-ui.table>
+            <x-slot:head>
                 <tr>
-                    <th class="px-4 py-3">Name</th>
-                    <th class="px-4 py-3">Email</th>
-                    <th class="px-4 py-3">Teams</th>
-                    <th class="px-4 py-3">Slack ID</th>
-                    <th class="px-4 py-3">Admin</th>
-                    <th class="px-4 py-3"></th>
+                    <x-ui.th>Name</x-ui.th>
+                    <x-ui.th class="w-64">Email</x-ui.th>
+                    <x-ui.th class="w-20">Teams</x-ui.th>
+                    <x-ui.th class="w-36">Slack ID</x-ui.th>
+                    <x-ui.th class="w-20">Admin</x-ui.th>
+                    <x-ui.th class="w-72" align="right"></x-ui.th>
                 </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-                @foreach($users as $u)
-                    <tr>
-                        <td class="px-4 py-3 font-medium">{{ $u->name }}</td>
-                        <td class="px-4 py-3 text-slate-500">{{ $u->email }}</td>
-                        <td class="px-4 py-3">{{ $u->teams_count }}</td>
-                        <td class="px-4 py-3">
-                            <input type="text" value="{{ $slackIds[$u->id] ?? '' }}" placeholder="U0123ABC"
-                                   wire:change="updateSlackId({{ $u->id }}, $event.target.value)"
-                                   class="w-28 rounded-md border border-slate-300 px-2 py-1 font-mono text-xs">
-                        </td>
-                        <td class="px-4 py-3">
-                            @if($u->is_admin)
-                                <span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">Admin</span>
-                            @else
-                                <span class="text-slate-400">—</span>
-                            @endif
-                        </td>
-                        <td class="px-4 py-3 text-right">
-                            @if($u->id !== auth()->id())
-                                <button wire:click="toggleAdmin({{ $u->id }})"
-                                        class="font-medium text-indigo-600 hover:text-indigo-500">
+            </x-slot:head>
+
+            @foreach ($users as $u)
+                <x-ui.tr>
+                    <x-ui.td class="text-ink-2">{{ $u->name }}</x-ui.td>
+                    <x-ui.td mono muted>{{ $u->email }}</x-ui.td>
+                    <x-ui.td mono>{{ $u->teams_count }}</x-ui.td>
+                    <x-ui.td>
+                        <x-ui.input type="text" value="{{ $slackIds[$u->id] ?? '' }}" placeholder="U0123ABC"
+                                    wire:change="updateSlackId({{ $u->id }}, $event.target.value)"
+                                    class="h-[26px] font-mono text-[11.5px]" />
+                    </x-ui.td>
+                    <x-ui.td>
+                        @if ($u->is_admin)
+                            <x-ui.badge tone="pending">Admin</x-ui.badge>
+                        @else
+                            <span class="text-mute-4">—</span>
+                        @endif
+                    </x-ui.td>
+                    <x-ui.td align="right" nowrap>
+                        @if ($u->id !== auth()->id())
+                            <div class="flex items-center justify-end gap-2.5">
+                                <x-ui.action wire:click="toggleAdmin({{ $u->id }})" tone="accent">
                                     {{ $u->is_admin ? 'Revoke admin' : 'Make admin' }}
-                                </button>
-                                <button wire:click="resetPassword({{ $u->id }})"
-                                        wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately."
-                                        class="ml-3 font-medium text-slate-600 hover:text-slate-500">Reset password</button>
-                                <button wire:click="deleteUser({{ $u->id }})"
-                                        wire:confirm="Delete user {{ $u->email }}?"
-                                        class="ml-3 font-medium text-rose-600 hover:text-rose-500">Delete</button>
-                            @else
-                                <span class="text-xs text-slate-400">you</span>
-                            @endif
-                        </td>
-                    </tr>
-                @endforeach
-            </tbody>
-        </table>
-    </div>
+                                </x-ui.action>
+                                <x-ui.action wire:click="resetPassword({{ $u->id }})"
+                                             wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                <x-ui.action wire:click="deleteUser({{ $u->id }})" wire:confirm="Delete user {{ $u->email }}?" tone="danger">Delete</x-ui.action>
+                            </div>
+                        @else
+                            <span class="font-mono text-[11px] text-mute-4">you</span>
+                        @endif
+                    </x-ui.td>
+                </x-ui.tr>
+            @endforeach
+        </x-ui.table>
+    </x-ui.panel>
 </div>
