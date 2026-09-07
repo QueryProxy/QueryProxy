@@ -19,6 +19,12 @@
                 }
 
                 localStorage.setItem('qp-theme', next);
+
+                // The SQL editor cannot read a CSS variable change; it listens for this.
+                root.dispatchEvent(new CustomEvent('qp:theme-changed', {
+                    detail: { theme: next },
+                    bubbles: true,
+                }));
             },
         };
     })();

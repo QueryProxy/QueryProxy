@@ -1,6 +1,12 @@
-@import 'tailwindcss';
+/* Explicit sources, because automatic detection reaches directories the Docker
+   assets stage never copies (it takes only vite.config.js, resources/ and
+   public/). Pinning them keeps the local and image builds byte-identical, and
+   turns "a Tailwind class outside resources/" into a bug that fails locally
+   too — which is why no PHP file may emit a class name any more. */
+@import 'tailwindcss' source(none);
 
-@source '../../storage/framework/views/*.php';
+@source '../views';
+@source '../js';
 
 /*
 | Ops Console design tokens.
