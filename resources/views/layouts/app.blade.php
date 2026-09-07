@@ -109,6 +109,7 @@
                     <div x-show="open" x-transition.opacity x-cloak
                          class="absolute right-0 z-20 mt-1 w-44 overflow-hidden rounded-md border border-slate-200 bg-white py-1 text-sm text-slate-700 shadow-lg">
                         <div class="border-b border-slate-100 px-3 py-2 text-xs text-slate-400">{{ $user->email }}</div>
+                        <a href="{{ route('profile') }}" class="block px-3 py-2 hover:bg-slate-50">Profile</a>
                         <form method="POST" action="{{ route('logout') }}">
                             @csrf
                             <button type="submit" class="w-full px-3 py-2 text-left hover:bg-slate-50">Log out</button>

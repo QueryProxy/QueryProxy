@@ -74,6 +74,9 @@
                                         class="font-medium text-indigo-600 hover:text-indigo-500">
                                     {{ $u->is_admin ? 'Revoke admin' : 'Make admin' }}
                                 </button>
+                                <button wire:click="resetPassword({{ $u->id }})"
+                                        wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately."
+                                        class="ml-3 font-medium text-slate-600 hover:text-slate-500">Reset password</button>
                                 <button wire:click="deleteUser({{ $u->id }})"
                                         wire:confirm="Delete user {{ $u->email }}?"
                                         class="ml-3 font-medium text-rose-600 hover:text-rose-500">Delete</button>

@@ -40,10 +40,13 @@
                     <p class="mt-1 text-sm text-rose-600">{{ $message }}</p>
                 @enderror
             </div>
-            <label class="flex items-center gap-2 text-sm text-slate-600">
-                <input type="checkbox" name="remember" class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
-                Remember me
-            </label>
+            <div class="flex items-center justify-between">
+                <label class="flex items-center gap-2 text-sm text-slate-600">
+                    <input type="checkbox" name="remember" class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
+                    Remember me
+                </label>
+                <a href="{{ route('password.request') }}" class="text-sm font-medium text-indigo-600 hover:text-indigo-500">Forgot password?</a>
+            </div>
             <button type="submit"
                     class="w-full rounded-md bg-indigo-600 py-2 text-sm font-semibold text-white transition hover:bg-indigo-500">
                 Log in

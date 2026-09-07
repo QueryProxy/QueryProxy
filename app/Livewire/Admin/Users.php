@@ -67,6 +67,26 @@ class Users extends Component
         ]);
     }
 
+    /** Generate a fresh password for a locked-out user; shown once, like on creation. */
+    public function resetPassword(int $userId): void
+    {
+        $user = User::findOrFail($userId);
+
+        if ($user->id === auth()->id()) {
+            $this->addError('email', 'Change your own password from your profile page.');
+
+            return;
+        }
+
+        $password = Str::password(16);
+        $user->update(['password' => $password]);
+
+        audit()->record('user.password_reset', metadata: ['user' => $user->email]);
+
+        $this->generatedPassword = $password;
+        session()->flash('status', "New password generated for \"{$user->email}\".");
+    }
+
     public function deleteUser(int $userId): void
     {
         $user = User::findOrFail($userId);
