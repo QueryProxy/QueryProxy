@@ -4,6 +4,16 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Image bases moved to `php:8.5-fpm-alpine` and `node:26-alpine`. OPcache is no
+  longer installed explicitly: PHP 8.5 links it statically and enables it by
+  default, and `docker-php-ext-install opcache` fails there.
+- Release workflow actions updated to `docker/login-action@v4`,
+  `setup-buildx-action@v4`, `setup-qemu-action@v4` and `metadata-action@v6`.
+
 ## [0.1.2] — 2026-09-08
 
 ### Changed

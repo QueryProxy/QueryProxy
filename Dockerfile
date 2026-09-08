@@ -1,5 +1,5 @@
 # ---- Frontend assets ----
-FROM node:22-alpine AS assets
+FROM node:26-alpine AS assets
 
 WORKDIR /app
 
@@ -11,7 +11,7 @@ COPY public ./public
 RUN npm run build
 
 # ---- PHP application ----
-FROM php:8.4-fpm-alpine AS app
+FROM php:8.5-fpm-alpine AS app
 
 RUN apk add --no-cache \
         icu-dev \
@@ -30,8 +30,10 @@ RUN apk add --no-cache \
         intl \
         zip \
         bcmath \
-        pcntl \
-        opcache
+        pcntl
+# opcache is not in that list: PHP 8.5 links it statically and enables it by
+# default, so docker-php-ext-install has no module to install. The tuning in
+# docker/php.ini still applies.
 # SQL Server targets need the Microsoft ODBC driver + sqlsrv PECL extension;
 # see README ("SQL Server support") if you proxy MSSQL databases.
 
