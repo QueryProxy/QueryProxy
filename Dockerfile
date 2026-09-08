@@ -11,7 +11,7 @@ COPY public ./public
 RUN npm run build
 
 # ---- PHP application ----
-FROM php:8.4-fpm-alpine AS app
+FROM php:8.5-fpm-alpine AS app
 
 RUN apk add --no-cache \
         icu-dev \
