@@ -4,6 +4,31 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.1.2] — 2026-09-08
+
+### Changed
+
+- **One-container install.** The image now runs the queue worker and the
+  scheduler alongside the web tier, so `docker run -p 7432:7432 -v
+  queryproxy-data:/var/www/html/storage/app queryproxy/queryproxy` is a
+  complete instance. `QUERYPROXY_RUN_WORKER` / `QUERYPROXY_RUN_SCHEDULER` turn
+  them off for split deployments, and `QUERYPROXY_WORKER_PROCESSES` runs more
+  than one worker. `docker-compose.yml` collapsed to that single service.
+- **One volume.** The SQLite database and the generated `APP_KEY` moved next to
+  the result files under `/var/www/html/storage/app`. Volumes from earlier
+  versions keep working: an existing `/var/www/html/database/database.sqlite`
+  (or `.app_key`) is still used when present.
+- Releases publish to Docker Hub (`queryproxy/queryproxy`) as well as GHCR.
+
+### Added
+
+- `php artisan queryproxy:create-admin` creates the first administrator, and
+  `QUERYPROXY_ADMIN_EMAIL` / `QUERYPROXY_ADMIN_PASSWORD` / `QUERYPROXY_ADMIN_NAME`
+  create it on first boot — a fresh instance no longer needs demo seeding to
+  have an account to log in with.
+- Container `HEALTHCHECK` against `/up`, so `docker run` reports health without
+  a compose file.
+
 ## [0.1.1] — 2026-09-08
 
 ### Fixed
@@ -52,5 +77,6 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
+[0.1.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.2
 [0.1.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.1
 [0.1.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.0

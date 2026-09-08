@@ -54,25 +54,53 @@ asynchronously on a worker, and results come back **masked, limited and fully au
 ## Quick start (Docker)
 
 ```bash
-git clone https://github.com/QueryProxy/QueryProxy.git
-cd QueryProxy
-docker compose up
+docker run -d --name queryproxy \
+  -p 7432:7432 \
+  -v queryproxy-data:/var/www/html/storage/app \
+  -e QUERYPROXY_ADMIN_EMAIL=you@example.com \
+  -e QUERYPROXY_ADMIN_PASSWORD='choose-a-strong-password' \
+  queryproxy/queryproxy
 ```
 
-Prefer a prebuilt image? Every release is published to GitHub Container
-Registry as `ghcr.io/queryproxy/queryproxy` (`latest` and per-version tags) —
-point the compose services' `image:` at it instead of `build: .`.
+Open <http://localhost:7432> and log in with that address. One container runs
+the whole stack — nginx + php-fpm (as a non-root user), the queue worker that
+executes approved queries and the scheduler that prunes expired results — and
+the single volume holds the SQLite database, the generated `APP_KEY` and the
+result files.
 
-Open <http://localhost:7432>. Three containers start: the web app (nginx +
-php-fpm, running as a non-root user), a queue worker (executes approved queries)
-and the scheduler (result retention pruning).
+The admin variables only take effect while the instance has no users, so
+leaving them in place across restarts is harmless; you can also drop them and
+create the account by hand:
 
-The default compose file creates **no accounts**. To explore with demo data,
-set `QUERYPROXY_SEED_DEMO=true` (the seeder refuses to run while
-`APP_ENV=production` unless you also set `QUERYPROXY_SEED_DEMO_FORCE=true`).
-It creates `admin@example.com`, `dba@example.com`, `developer@example.com` and
-`auditor@example.com` sharing **one randomly generated password, printed once in
-the app container logs** (`docker compose logs app`).
+```bash
+docker exec -it queryproxy php artisan queryproxy:create-admin
+```
+
+Images are published on release to Docker Hub (`queryproxy/queryproxy`) and
+GitHub Container Registry (`ghcr.io/queryproxy/queryproxy`), as `latest` and
+per-version tags, for `linux/amd64` and `linux/arm64`.
+
+Prefer Compose? [`docker-compose.yml`](docker-compose.yml) in this repository is
+the same single service (`docker compose up -d`), with commented blocks for
+running the worker as its own container or using MySQL/PostgreSQL for the
+application database.
+
+To explore with demo data instead, set `QUERYPROXY_SEED_DEMO=true` (the seeder
+refuses to run while `APP_ENV=production` unless you also set
+`QUERYPROXY_SEED_DEMO_FORCE=true`). It creates `admin@example.com`,
+`dba@example.com`, `developer@example.com` and `auditor@example.com` sharing
+**one randomly generated password, printed once in the container logs**
+(`docker logs queryproxy`).
+
+### Container settings
+
+| Variable | Default | Meaning |
+| :-- | :-- | :-- |
+| `QUERYPROXY_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | — | First-boot administrator; ignored once any user exists |
+| `QUERYPROXY_RUN_WORKER` | `true` | Run the queue worker inside the container |
+| `QUERYPROXY_WORKER_PROCESSES` | `1` | Number of queue workers |
+| `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
+| `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
 
 > **Before exposing QueryProxy to a network, read [Production hardening](#production-hardening).**
 
@@ -86,6 +114,7 @@ cp .env.example .env
 php artisan key:generate
 touch database/database.sqlite
 php artisan migrate            # add --seed for the demo team
+php artisan queryproxy:create-admin   # first administrator (skip if seeding demo data)
 npm install && npm run build
 
 php artisan serve              # dev only — use nginx + php-fpm in production
@@ -141,14 +170,14 @@ instance itself as sensitive.
 
 - **Set `APP_KEY` explicitly** and keep it stable. It encrypts connection
   credentials and chat secrets; changing it makes every stored credential
-  unreadable. Generate one with `docker run --rm ghcr.io/queryproxy/queryproxy php artisan key:generate --show`
-  and put it in the compose `environment:` (all three services share it). When
-  rotating, move the old key into `APP_PREVIOUS_KEYS` so existing ciphertext
-  still decrypts. Without an explicit `APP_KEY`, the container generates one on
-  first boot and persists it to the database volume.
+  unreadable. Generate one with `docker run --rm queryproxy/queryproxy php artisan key:generate --show`
+  and pass it as `-e APP_KEY=...` (every container of the same instance must
+  share it). When rotating, move the old key into `APP_PREVIOUS_KEYS` so
+  existing ciphertext still decrypts. Without an explicit `APP_KEY`, the
+  container generates one on first boot and persists it to the data volume.
 - **Serve over HTTPS** behind a TLS-terminating reverse proxy (the container
   serves plain HTTP on `:7432`). Then set `SESSION_SECURE_COOKIE=true` and, if
-  your proxy is not on the compose network, narrow the trusted-proxy setting in
+  your proxy is not on the same Docker network, narrow the trusted-proxy setting in
   `bootstrap/app.php` from `*` to your proxy's address.
 - **Keep demo seeding off** (`QUERYPROXY_SEED_DEMO=false`, the default) on any
   reachable instance.

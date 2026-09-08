@@ -1,80 +1,67 @@
-# Zero-config: `docker compose up` boots the portal on http://localhost:7432
-# with a SQLite application database and a database-backed queue (ADR-002).
+# One container, one volume: `docker compose up -d` boots the portal on
+# http://localhost:7432 with a SQLite application database, a database-backed
+# queue (ADR-002), the queue worker and the scheduler — same as
+# `docker run` with the published image.
 #
-# APP_KEY: set one explicitly for production (`php artisan key:generate --show`).
-# Without it, a key is generated once and persisted on the database volume so
-# app/worker/scheduler always share the same key.
+# APP_KEY: set one explicitly for production (`docker compose run --rm app php
+# artisan key:generate --show`). Without it, a key is generated once on first
+# boot and persisted to the data volume.
 #
 # Demo data is OFF by default. To try the demo accounts on a non-production
 # instance, set QUERYPROXY_SEED_DEMO=true (and QUERYPROXY_SEED_DEMO_FORCE=true
 # if APP_ENV stays "production"); the generated demo password is printed once
-# in the app container logs.
+# in the container logs.
 
 services:
   app:
-    build: .
+    image: queryproxy/queryproxy:latest
+    # Contributors building from the source tree: swap the image line for this.
+    # build: .
     ports:
       - "7432:7432"
-    environment: &env
-      APP_ENV: production
-      APP_DEBUG: "false"
+    environment:
       APP_URL: http://localhost:7432
-      APP_KEY: ${APP_KEY:-}
-      DB_CONNECTION: sqlite
-      DB_DATABASE: /var/www/html/database/database.sqlite
-      QUEUE_CONNECTION: database
-      # Must stay above the worker --timeout (310s) so a slow query is never
-      # re-reserved and executed twice.
-      DB_QUEUE_RETRY_AFTER: "330"
+      # APP_KEY: base64:...
       QUERYPROXY_SEED_DEMO: "false"
       # Uncomment when serving over HTTPS (behind a TLS-terminating proxy):
       # SESSION_SECURE_COOKIE: "true"
     volumes:
-      - app-database:/var/www/html/database
-      - app-storage:/var/www/html/storage/app
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:7432/up"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-
-  worker:
-    build: .
-    command: php artisan queue:work --queue=queries,default --tries=1 --timeout=310
-    environment: *env
-    volumes:
-      - app-database:/var/www/html/database
-      - app-storage:/var/www/html/storage/app
-    depends_on:
-      app:
-        condition: service_healthy
-    restart: unless-stopped
-
-  scheduler:
-    build: .
-    command: php artisan schedule:work
-    environment: *env
-    volumes:
-      - app-database:/var/www/html/database
-      - app-storage:/var/www/html/storage/app
-    depends_on:
-      app:
-        condition: service_healthy
+      # SQLite database, generated APP_KEY and result files.
+      - queryproxy-data:/var/www/html/storage/app
     restart: unless-stopped
 
 volumes:
-  app-database:
-  app-storage:
+  queryproxy-data:
 
+# --- Scaling the worker out of the app container ---
+# The image runs the queue worker and scheduler alongside the web tier. For
+# heavier installs, turn them off here and run them as their own services:
+#
+#  app:
+#    environment:
+#      QUERYPROXY_RUN_WORKER: "false"
+#      QUERYPROXY_RUN_SCHEDULER: "false"
+#
+#  worker:
+#    image: queryproxy/queryproxy:latest
+#    command: php artisan queue:work --queue=queries,default --tries=1 --timeout=310
+#    environment: (same APP_KEY / DB_* as app — an explicit APP_KEY is required)
+#    volumes:
+#      - queryproxy-data:/var/www/html/storage/app
+#    depends_on: [app]
+#    restart: unless-stopped
+#
+# A single container can also run several workers: QUERYPROXY_WORKER_PROCESSES=4.
+#
 # --- Using MySQL or PostgreSQL for the application database instead ---
-# 1. Uncomment the service below and the depends_on entries you need.
-# 2. Point DB_* env vars at it, e.g.:
+# 1. Uncomment the service below and point the app's DB_* env vars at it:
 #      DB_CONNECTION: pgsql
 #      DB_HOST: db
 #      DB_PORT: 5432
 #      DB_DATABASE: queryproxy
 #      DB_USERNAME: queryproxy
 #      DB_PASSWORD: change-me
+# 2. Add `depends_on: [db]` to the app service.
 #
 #  db:
 #    image: postgres:17-alpine
