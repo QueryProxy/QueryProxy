@@ -60,7 +60,9 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        # Pinned to a v-prefixed tag: the unprefixed ones (0.28.0) were
+        # removed upstream and no longer resolve.
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: queryproxy-scan:candidate
           format: table
