@@ -106,7 +106,8 @@ refuses to run while `APP_ENV=production` unless you also set
 
 ## Manual installation
 
-Requirements: PHP ≥ 8.3 (pdo drivers for your target databases), Composer, Node 20+.
+Requirements: PHP ≥ 8.3 (pdo drivers for your target databases), Composer,
+Node 20.19+ or 22.12+ (what the pinned Vite 8 needs).
 
 ```bash
 composer install
