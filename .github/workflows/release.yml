@@ -82,7 +82,7 @@ jobs:
 
       # Keeps the Docker Hub overview in sync with the repository README.
       - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         continue-on-error: true
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
