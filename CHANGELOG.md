@@ -4,7 +4,7 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-09-18
 
 ### Security
 
@@ -163,6 +163,7 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
+[0.2.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.0
 [0.1.3]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.3
 [0.1.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.2
 [0.1.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.1
