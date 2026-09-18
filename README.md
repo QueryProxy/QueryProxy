@@ -36,9 +36,15 @@ asynchronously on a worker, and results come back **masked, limited and fully au
   - `UPDATE` / `DELETE` without `WHERE` are rejected at submission,
   - `SELECT` without `LIMIT` gets `LIMIT 1000` injected (hard cap `10000`),
   - multiple statements require an explicit `BEGIN; ...; COMMIT;` transaction,
-  - administrative and server-side file-IO statements are blocked (`GRANT`,
-    `DROP DATABASE`, `SET GLOBAL` and `SET @@GLOBAL`, `CREATE EXTENSION`,
-    `CREATE FUNCTION ... SONAME`, `INTO OUTFILE`, `pg_read_file()`, ...).
+  - statements that hand out server-level code execution or file access are
+    blocked outright (`GRANT`, `DROP DATABASE`, `CREATE FUNCTION ... SONAME`,
+    `INTO OUTFILE`, `LOAD_FILE()`, `pg_read_file()`, `COPY ... TO PROGRAM`, ...),
+  - and the ones where a dangerous use shares its syntax with an everyday one are
+    judged on the dangerous part, not the keyword: `CREATE EXTENSION` and `DO`
+    are refused only for untrusted procedural languages (`plpythonu`, `plperlu`,
+    anything matching the `pl…u` convention), and `SET GLOBAL` / `SET @@GLOBAL` /
+    `SET PERSIST` only for file-path, logging and plugin variables. A `DO` body
+    is scanned for the blocked statements above.
 - **Approval workflow** — pending requests wait indefinitely until a DBA decides;
   self-approval is blocked; every decision records who, when and through which channel.
 - **ChatOps** — Slack messages with interactive **Approve / Reject** buttons and
@@ -164,6 +170,9 @@ All knobs live in `.env` (see `.env.example` for the full list):
 | `QUERYPROXY_CONNECTION_HOST_DENYLIST` | — | Extra hosts blocked as connection targets |
 | `QUERYPROXY_SQLITE_ALLOWED_DIR` | — | Restrict SQLite connection files to this directory |
 | `TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs; empty means no proxy is trusted |
+| `TRUSTED_HOSTS` | — | Extra hostnames this install answers to, beyond `APP_URL`'s host |
+| `QUERYPROXY_EXTRA_UNTRUSTED_LANGUAGES` | — | Extra procedural languages the guard refuses |
+| `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` | — | Extra server variables refused in `SET GLOBAL` |
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL/PostgreSQL. The queue uses the database driver by default; set

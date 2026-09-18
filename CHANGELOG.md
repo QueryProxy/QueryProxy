@@ -29,8 +29,15 @@ All notable changes to QueryProxy are documented here. The format follows
   the result store unmasked. Content rules now see every scalar.
 - **The SQL guard's denylist had bypasses.** `SET @@GLOBAL.…` walked straight
   past the `SET GLOBAL` rule (arbitrary file write through the MySQL general
-  log), and `CREATE FUNCTION … SONAME`, `CREATE EXTENSION`, `DO`, `pg_read_file()`
-  and friends were not listed at all. All are blocked now.
+  log), and `CREATE FUNCTION … SONAME`, `pg_read_file()` and friends were not
+  listed at all. The guard now judges the dangerous part rather than the
+  keyword: `CREATE EXTENSION` and `DO` are refused for untrusted procedural
+  languages, `SET GLOBAL` / `SET PERSIST` for file-path, logging and plugin
+  variables, and a `DO` body is scanned for the unconditionally blocked
+  statements — so `DO $$ BEGIN DROP DATABASE prod; END $$` does not get through.
+  That scan is best-effort by nature: SQL a block assembles at run time
+  (`EXECUTE format(…)`) cannot be read statically, and the DBA approval remains
+  the real boundary.
 - **TOTP codes could be replayed** for the ~90 seconds their window stayed open;
   an accepted code is now burned via `two_factor_last_used_timestamp`.
 - **Chat webhook URLs leaked into the logs.** A connection error carried the full
@@ -64,6 +71,11 @@ All notable changes to QueryProxy are documented here. The format follows
   from the card's `queryproxy` envelope.
 - A TOTP code is now single-use, so signing in on a second device within the same
   30-second window requires waiting for the next code.
+- Removing a ChatOps integration is administrator-only, matching the bar for
+  setting its signing secret — a DBA could otherwise delete an integration and
+  then be unable to put it back. DBAs still untick **Enabled** to switch one off.
+- `TRUSTED_HOSTS` accepts extra hostnames for installations served under more
+  than one name, since `X-Forwarded-Host` is no longer honoured.
 - New content masking rules apply to new teams only. Run **Masking → Add
   defaults** per team to pick them up; it is idempotent and leaves existing rules
   untouched.
