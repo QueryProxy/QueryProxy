@@ -41,23 +41,46 @@ return Application::configure(basePath: dirname(__DIR__))
         // Second layer against host-header poisoning: only APP_URL's host (and its
         // www. sibling) may set the request host, so absolute URLs — signed routes,
         // password-reset mails — always point at this installation. The closure is
-        // evaluated per request, so it sees the loaded configuration. An empty or
-        // unparsable APP_URL yields an empty list, which Symfony reads as
-        // "no restriction", keeping a half-configured install bootable. Laravel
+        // evaluated per request by TrustHosts::hosts(), so — unlike the body of this
+        // callback — it sees the loaded configuration and environment. An empty or
+        // unparsable APP_URL with no TRUSTED_HOSTS yields an empty list, which Symfony
+        // reads as "no restriction", keeping a half-configured install bootable. Laravel
         // skips this middleware entirely in the local environment and under tests.
+        //
+        // An installation may legitimately answer to more than one name (a separate
+        // internal hostname, a second domain). TRUSTED_HOSTS is a comma-separated list
+        // of extra hostnames that are added to — never replace — APP_URL's host. It is
+        // empty by default, so the default posture is unchanged. This does not weaken
+        // the X-Forwarded-Host decision above: that header stays out of the trusted
+        // mask, and every name listed here still has to survive Symfony's own
+        // getHost() check against these patterns.
         $middleware->trustHosts(at: function (): array {
+            /** @var array<int, string> $hostnames */
+            $hostnames = [];
+
             $host = parse_url((string) config('app.url'), PHP_URL_HOST);
 
-            if (! is_string($host) || $host === '') {
-                return [];
+            if (is_string($host) && $host !== '') {
+                $bare = preg_replace('/^www\./i', '', $host);
+
+                $hostnames[] = $bare;
+                $hostnames[] = 'www.'.$bare;
             }
 
-            $bare = preg_replace('/^www\./i', '', $host);
+            foreach ((array) config('queryproxy.trusted_hosts', []) as $extra) {
+                // A stray comma or a typo must not take the installation down, so
+                // anything that is not a plausible hostname is dropped in silence.
+                $extra = trim($extra);
 
-            return [
-                '^'.preg_quote($bare).'$',
-                '^www\.'.preg_quote($bare).'$',
-            ];
+                if ($extra !== '' && preg_match('/^[A-Za-z0-9._-]+$/', $extra) === 1) {
+                    $hostnames[] = $extra;
+                }
+            }
+
+            return array_map(
+                static fn (string $hostname): string => '^'.preg_quote($hostname).'$',
+                array_values(array_unique($hostnames)),
+            );
         }, subdomains: false);
 
         // AuthenticateSession ends a user's other sessions when their

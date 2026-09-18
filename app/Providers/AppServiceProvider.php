@@ -69,15 +69,18 @@ class AppServiceProvider extends ServiceProvider
     }
 
     /**
-     * Read the comma-separated TRUSTED_PROXIES list of IPs/CIDRs.
+     * Reverse proxies allowed to set X-Forwarded-*, from configuration.
+     *
+     * Read through config() rather than env(): the container caches the
+     * configuration on boot, and a cached config means .env is never loaded.
      *
      * @return array<int, string>
      */
     private function trustedProxies(): array
     {
-        return array_values(array_filter(
-            array_map(trim(...), explode(',', (string) env('TRUSTED_PROXIES', ''))),
-            static fn (string $proxy): bool => $proxy !== '',
-        ));
+        /** @var array<int, string> $proxies */
+        $proxies = (array) config('queryproxy.trusted_proxies', []);
+
+        return array_values($proxies);
     }
 }
