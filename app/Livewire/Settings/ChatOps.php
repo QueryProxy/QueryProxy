@@ -16,11 +16,15 @@ class ChatOps extends Component
 
     public string $slackSigningSecret = '';
 
+    public string $slackCurrentSigningSecret = '';
+
     public bool $slackEnabled = true;
 
     public string $teamsWebhookUrl = '';
 
     public string $teamsSigningSecret = '';
+
+    public string $teamsCurrentSigningSecret = '';
 
     public bool $teamsEnabled = true;
 
@@ -58,15 +62,17 @@ class ChatOps extends Component
 
     public function saveSlack(): void
     {
-        $this->save(ChatProvider::Slack, $this->slackWebhookUrl, $this->slackSigningSecret, $this->slackEnabled, 'slackWebhookUrl');
+        $this->save(ChatProvider::Slack, $this->slackWebhookUrl, $this->slackSigningSecret, $this->slackCurrentSigningSecret, $this->slackEnabled);
         $this->slackSigningSecret = '';
+        $this->slackCurrentSigningSecret = '';
         $this->slackWebhookUrl = '';
     }
 
     public function saveTeams(): void
     {
-        $this->save(ChatProvider::Teams, $this->teamsWebhookUrl, $this->teamsSigningSecret, $this->teamsEnabled, 'teamsWebhookUrl');
+        $this->save(ChatProvider::Teams, $this->teamsWebhookUrl, $this->teamsSigningSecret, $this->teamsCurrentSigningSecret, $this->teamsEnabled);
         $this->teamsSigningSecret = '';
+        $this->teamsCurrentSigningSecret = '';
         $this->teamsWebhookUrl = '';
     }
 
@@ -82,22 +88,50 @@ class ChatOps extends Component
 
         audit()->record('chat_integration.removed', team: $this->team(), metadata: ['provider' => $provider->value]);
 
-        $this->reset(
-            $provider === ChatProvider::Slack ? 'slackWebhookUrl' : 'teamsWebhookUrl',
-            $provider === ChatProvider::Slack ? 'slackSigningSecret' : 'teamsSigningSecret',
-        );
+        $prefix = $this->fieldPrefix($provider);
+
+        $this->reset($prefix.'WebhookUrl', $prefix.'SigningSecret', $prefix.'CurrentSigningSecret');
 
         session()->flash('status', $provider->label().' integration removed.');
     }
 
-    private function save(ChatProvider $provider, string $url, string $secret, bool $enabled, string $urlField): void
+    /** The `slack` / `teams` prefix shared by this provider's public properties. */
+    private function fieldPrefix(ChatProvider $provider): string
+    {
+        return $provider === ChatProvider::Slack ? 'slack' : 'teams';
+    }
+
+    /**
+     * The signing secret is what tells the two webhook endpoints that a
+     * callback really came from the chat platform. Anyone who can *choose* it
+     * can sign their own callbacks, so it is held to a different standard than
+     * the rest of the form: only a system admin may write it, and replacing an
+     * existing one means proving you already hold it. Webhook URL and the
+     * enabled flag stay with the team's DBAs, who own day-to-day ChatOps.
+     */
+    private function save(ChatProvider $provider, string $url, string $secret, string $currentSecret, bool $enabled): void
     {
         $team = $this->team();
         $this->assertDba($team);
 
+        $user = auth()->user();
+
+        $prefix = $this->fieldPrefix($provider);
+        $urlField = $prefix.'WebhookUrl';
+        $secretField = $prefix.'SigningSecret';
+        $currentSecretField = $prefix.'CurrentSigningSecret';
+
         $this->resetErrorBag();
 
         $existing = ChatIntegration::where('team_id', $team->id)->where('provider', $provider)->first();
+
+        // Refuse loudly rather than dropping the field silently: a DBA who
+        // thinks they rotated the secret must not walk away believing it.
+        if ($secret !== '' && ! $user->isAdmin()) {
+            $this->addError($secretField, 'Only a system admin may set or rotate the signing secret.');
+
+            return;
+        }
 
         if ($url === '' && ! $existing) {
             $this->addError($urlField, 'A valid https:// webhook URL is required.');
@@ -132,6 +166,14 @@ class ChatOps extends Component
             return;
         }
 
+        // Rotation, not first setup: knowledge of the secret in place is the
+        // only thing separating a rotation from a takeover of the endpoint.
+        if ($secret !== '' && $existing && ! $existing->matchesSigningSecret($currentSecret)) {
+            $this->addError($currentSecretField, 'The current signing secret does not match.');
+
+            return;
+        }
+
         $attributes = ['enabled' => $enabled];
 
         if ($url !== '') {
@@ -151,6 +193,16 @@ class ChatOps extends Component
             'provider' => $provider->value, 'enabled' => $enabled,
         ]);
 
+        if ($secret !== '') {
+            // Its own action, because "the key to the webhook endpoint changed"
+            // is a different event to "the integration was edited" — and the
+            // secret itself never goes anywhere near the metadata.
+            audit()->record('chat_integration.secret_rotated', team: $team, metadata: [
+                'provider' => $provider->value,
+                'initial_setup' => $existing === null,
+            ]);
+        }
+
         session()->flash('status', $provider->label().' integration saved.');
     }
 
@@ -161,6 +213,7 @@ class ChatOps extends Component
         return view('livewire.settings.chat-ops', [
             'hasSlack' => $integrations->firstWhere('provider', ChatProvider::Slack) !== null,
             'hasTeams' => $integrations->firstWhere('provider', ChatProvider::Teams) !== null,
+            'canRotateSecret' => auth()->user()->isAdmin(),
         ]);
     }
 }

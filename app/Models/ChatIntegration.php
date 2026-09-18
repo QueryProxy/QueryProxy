@@ -30,4 +30,13 @@ class ChatIntegration extends Model
     {
         return $query->where('provider', $provider)->where('enabled', true);
     }
+
+    /**
+     * Constant-time check used when rotating the secret: whoever replaces it
+     * has to prove they already hold the one in place.
+     */
+    public function matchesSigningSecret(string $candidate): bool
+    {
+        return hash_equals((string) $this->signing_secret, $candidate);
+    }
 }
