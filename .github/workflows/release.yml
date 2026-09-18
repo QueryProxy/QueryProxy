@@ -10,6 +10,12 @@ name: Release image
 #
 # The Docker Hub overview text is not published here — see
 # dockerhub-description.yml, which needs a wider token scope than pushing does.
+#
+# Every third-party action is pinned to a commit SHA rather than a mutable tag:
+# these steps run in the same job as the registry logins, so a moved tag would
+# be able to read the credentials that login-action writes to the runner's
+# ~/.docker/config.json. Dependabot (github-actions ecosystem) keeps the SHAs
+# current. When bumping one, re-resolve the SHA — never edit the comment alone.
 
 on:
   push:
@@ -24,24 +30,47 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v4
+      # Build a local single-arch image first so it can be vulnerability-scanned
+      # before anything is published. Both this build and the scan run *before*
+      # the registry logins: nothing here needs a credential, so the runner has
+      # no push token on disk while they execute.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          load: true
+          tags: queryproxy-scan:candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        # Pinned to the commit behind v0.36.0: the unprefixed tags (0.28.0)
+        # were removed upstream and no longer resolve.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: queryproxy-scan:candidate
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v6
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
           images: |
@@ -52,28 +81,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      # Build a local single-arch image first so it can be vulnerability-scanned
-      # before anything is published.
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: queryproxy-scan:candidate
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Scan image for vulnerabilities
-        # Pinned to a v-prefixed tag: the unprefixed ones (0.28.0) were
-        # removed upstream and no longer resolve.
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: queryproxy-scan:candidate
-          format: table
-          exit-code: '1'
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64

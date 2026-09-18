@@ -7,6 +7,18 @@ name: Docker Hub description
 # Needs DOCKERHUB_USERNAME and a DOCKERHUB_TOKEN with *read/write/delete* scope.
 # A read/write token can push images but gets 403 Forbidden from the description
 # endpoint, and the account must have Admin permission on the repository.
+#
+# Operator note: give this workflow its own Docker Hub access token, separate
+# from the one release.yml pushes with, and scope that token to this repository
+# only. The token is handed to a third-party action as a plain input, so it is
+# readable by whatever code that action runs; a delete-capable token shared with
+# the release pipeline would turn one compromised action into image deletion.
+# Rotate it independently of the push token.
+#
+# The action is pinned to a commit SHA rather than a mutable tag so a moved tag
+# cannot silently replace the code that receives that token. Dependabot
+# (github-actions ecosystem) keeps the SHA current; when bumping it, re-resolve
+# the SHA — never edit the version comment alone.
 
 on:
   workflow_dispatch:
@@ -24,9 +36,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: peter-evans/dockerhub-description@v5
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
