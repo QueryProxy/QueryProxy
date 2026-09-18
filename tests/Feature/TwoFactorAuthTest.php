@@ -83,3 +83,81 @@ test('enrollment requires a valid code and issues recovery codes', function () {
     expect($user->fresh()->hasTwoFactorEnabled())->toBeTrue()
         ->and($user->fresh()->two_factor_recovery_codes)->toHaveCount(8);
 });
+
+test('a TOTP code cannot be replayed for a second session', function () {
+    $engine = new Google2FA;
+    $secret = $engine->generateSecretKey();
+
+    $user = User::factory()->create(['password' => 'secret-password']);
+    $user->forceFill([
+        'two_factor_secret' => $secret,
+        'two_factor_confirmed_at' => now(),
+    ])->save();
+
+    $otp = $engine->getCurrentOtp($secret);
+
+    // The account owner completes their own login with the code.
+    $this->post('/login', ['email' => $user->email, 'password' => 'secret-password']);
+    $this->post('/two-factor-challenge', ['code' => $otp])->assertRedirect(route('dashboard'));
+
+    expect(auth()->check())->toBeTrue()
+        ->and($user->fresh()->two_factor_last_used_timestamp)->not->toBeNull();
+
+    // Someone who observed that code replays it from a fresh session while it
+    // is still inside the verification window.
+    $this->post('/logout');
+    $this->flushSession();
+
+    $this->post('/login', ['email' => $user->email, 'password' => 'secret-password'])
+        ->assertRedirect(route('two-factor.challenge'));
+
+    $this->post('/two-factor-challenge', ['code' => $otp])->assertSessionHasErrors('code');
+
+    expect(auth()->check())->toBeFalse();
+});
+
+test('the service accepts a TOTP code once and burns it', function () {
+    $service = app(TwoFactorService::class);
+    $secret = $service->generateSecret();
+
+    $user = User::factory()->create();
+    $user->forceFill([
+        'two_factor_secret' => $secret,
+        'two_factor_confirmed_at' => now(),
+    ])->save();
+
+    $otp = (new Google2FA)->getCurrentOtp($secret);
+
+    expect($service->verify($user, $otp))->toBeTrue()
+        ->and($user->two_factor_last_used_timestamp)->toBeInt();
+
+    // The burnt timestamp is persisted, so a second attempt fails even on a
+    // freshly loaded model — a separate request cannot reuse the code.
+    expect($service->verify($user->fresh(), $otp))->toBeFalse();
+});
+
+test('a confirmation code cannot be reused to pass the login challenge', function () {
+    $user = User::factory()->create(['password' => 'secret-password']);
+
+    $component = Livewire::actingAs($user)
+        ->test(Profile::class)
+        ->call('startTwoFactorEnrollment');
+
+    $secret = session('two_factor_setup_secret');
+    $otp = (new Google2FA)->getCurrentOtp($secret);
+
+    $component->set('twoFactorCode', $otp)->call('confirmTwoFactor')->assertHasNoErrors();
+
+    expect($user->fresh()->hasTwoFactorEnabled())->toBeTrue()
+        ->and($user->fresh()->two_factor_last_used_timestamp)->not->toBeNull();
+
+    auth()->logout();
+    $this->flushSession();
+
+    $this->post('/login', ['email' => $user->email, 'password' => 'secret-password'])
+        ->assertRedirect(route('two-factor.challenge'));
+
+    $this->post('/two-factor-challenge', ['code' => $otp])->assertSessionHasErrors('code');
+
+    expect(auth()->check())->toBeFalse();
+});

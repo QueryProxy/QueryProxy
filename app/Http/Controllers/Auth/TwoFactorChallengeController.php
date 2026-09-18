@@ -55,7 +55,7 @@ class TwoFactorChallengeController extends Controller
         $code = (string) ($validated['code'] ?? '');
         $recoveryCode = (string) ($validated['recovery_code'] ?? '');
 
-        $valid = ($code !== '' && $twoFactor->verify((string) $user->two_factor_secret, $code))
+        $valid = ($code !== '' && $twoFactor->verify($user, $code))
             || ($recoveryCode !== '' && $twoFactor->consumeRecoveryCode($user, $recoveryCode));
 
         if (! $valid) {
