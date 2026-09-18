@@ -137,3 +137,33 @@ test('requests in a final state are not re-executed', function () {
 
     expect($request->fresh()->result_path)->toBeNull();
 });
+
+test('a publicly visible result disk is refused instead of publishing rows', function () {
+    [$request] = executionSetup('SELECT id, name FROM customers ORDER BY id LIMIT 10');
+
+    Storage::fake('public');
+    config()->set('queryproxy.result_disk', 'public');
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->result_path)->toBeNull()
+        ->and($request->error_message)->toContain('publicly visible')
+        ->and($request->error_message)->toContain('QUERYPROXY_RESULT_DISK')
+        ->and(Storage::disk('public')->allFiles())->toBe([]);
+});
+
+test('a custom disk declared public is refused as well', function () {
+    [$request] = executionSetup('SELECT id, name FROM customers ORDER BY id LIMIT 10');
+
+    Storage::fake('exports');
+    config()->set('filesystems.disks.exports.visibility', 'public');
+    config()->set('queryproxy.result_disk', 'exports');
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Failed)
+        ->and(Storage::disk('exports')->allFiles())->toBe([]);
+});

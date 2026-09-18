@@ -109,7 +109,7 @@ class QueryExecutor
 
     private function executeRead(QueryRequest $request, string $connectionName, string $sql): void
     {
-        $disk = config('queryproxy.result_disk', 'local');
+        $disk = $this->resultDisk();
         $path = sprintf('results/%d/%d.ndjson', $request->team_id, $request->id);
         $rules = $this->masker->rulesFor($request->connection);
 
@@ -159,6 +159,35 @@ class QueryExecutor
                 fclose($temp);
             }
         }
+    }
+
+    /**
+     * Resolve the result disk, refusing any disk the web server publishes.
+     *
+     * Result files are only ever meant to be reachable through
+     * ResultDownloadController, which enforces QueryRequestPolicy. A publicly
+     * visible disk (the shipped `public` disk, or any disk configured with
+     * `visibility => public`) serves `results/{team}/{id}.ndjson` over a
+     * guessable URL through `storage:link`, which bypasses that policy and
+     * exposes every team's masked-or-not rows by walking sequential ids.
+     * Refusing to write is the only safe option: the request fails loudly
+     * instead of silently publishing.
+     *
+     * @throws RuntimeException when the configured disk is publicly visible
+     */
+    private function resultDisk(): string
+    {
+        $disk = (string) config('queryproxy.result_disk', 'local');
+
+        if ($disk === 'public' || config("filesystems.disks.{$disk}.visibility") === 'public') {
+            throw new RuntimeException(sprintf(
+                'Refusing to store query results on the "%s" filesystem disk because it is publicly visible. '.
+                'Point QUERYPROXY_RESULT_DISK at a private disk (for example "local") and re-run the request.',
+                $disk,
+            ));
+        }
+
+        return $disk;
     }
 
     /**

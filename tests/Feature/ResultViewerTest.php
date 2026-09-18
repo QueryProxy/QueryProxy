@@ -114,3 +114,20 @@ test('results:prune keeps fresh files', function () {
 
     expect($request->fresh()->result_path)->not->toBeNull();
 });
+
+test('csv headers are guarded against spreadsheet formula injection', function () {
+    [$request, $requester] = completedRequest(3);
+
+    // Column names are attacker-controlled: they come from the target schema
+    // or from the requester's own aliases.
+    $request->update(['result_columns' => ['id', '=HYPERLINK("http://evil.example","click")']]);
+
+    $response = $this->actingAs($requester)->get(route('requests.download', $request));
+
+    $response->assertOk();
+
+    $header = strtok($response->streamedContent(), "\n");
+
+    expect($header)->toContain("'=HYPERLINK")
+        ->and($header)->not->toContain(',=HYPERLINK');
+});
