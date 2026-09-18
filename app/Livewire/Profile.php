@@ -91,7 +91,7 @@ class Profile extends Component
             return;
         }
 
-        if (! $twoFactor->verify($secret, $this->twoFactorCode)) {
+        if (! $twoFactor->verify($user, $this->twoFactorCode, $secret)) {
             $this->addError('twoFactorCode', 'That code does not match — check your authenticator app and try again.');
 
             return;

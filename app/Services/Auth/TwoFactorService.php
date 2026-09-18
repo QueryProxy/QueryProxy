@@ -36,11 +36,43 @@ class TwoFactorService
         return (new Writer($renderer))->writeString($this->otpauthUrl($user, $secret));
     }
 
-    public function verify(string $secret, string $code): bool
+    /**
+     * Verify a TOTP code and burn it.
+     *
+     * The code is checked against `two_factor_last_used_timestamp`, so a code
+     * observed once (shoulder surfing, a screenshot, a phishing proxy) cannot
+     * be replayed for a second session while its ~90s window is still open.
+     *
+     * @param  string|null  $secret  Enrollment secret to check against; defaults
+     *                               to the user's stored secret. During enrollment
+     *                               the secret is not persisted yet, but the
+     *                               accepted timestamp is still recorded.
+     */
+    public function verify(User $user, string $code, ?string $secret = null): bool
     {
         $code = (string) preg_replace('/\D+/', '', $code);
+        $secret ??= (string) $user->two_factor_secret;
 
-        return $code !== '' && $this->engine->verifyKey($secret, $code) !== false;
+        if ($code === '' || $secret === '') {
+            return false;
+        }
+
+        // A non-null $oldTimestamp makes the engine return the matched TOTP
+        // counter (an int) instead of `true`, and `false` when nothing matched
+        // at or after that counter — hence the strict comparison.
+        $timestamp = $this->engine->verifyKeyNewer(
+            $secret,
+            $code,
+            $user->two_factor_last_used_timestamp ?? 0,
+        );
+
+        if ($timestamp === false) {
+            return false;
+        }
+
+        $user->forceFill(['two_factor_last_used_timestamp' => (int) $timestamp])->save();
+
+        return true;
     }
 
     /**
@@ -86,6 +118,7 @@ class TwoFactorService
             'two_factor_secret' => null,
             'two_factor_recovery_codes' => null,
             'two_factor_confirmed_at' => null,
+            'two_factor_last_used_timestamp' => null,
         ])->save();
     }
 
