@@ -1,4 +1,4 @@
-<x-layouts::guest title="Log in" heading="Log in" subheading="Database access control &amp; query approval.">
+<x-layouts::guest title="Log in" heading="Log in" subheading="Database access control & query approval.">
     <form method="POST" action="{{ route('login') }}" class="flex flex-col gap-3.5">
         @csrf
 
