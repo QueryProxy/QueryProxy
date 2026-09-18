@@ -1,0 +1,40 @@
+name: Docker Hub description
+
+# Keeps the Docker Hub overview (docker.io/queryproxy/queryproxy) in sync with
+# README.md. Runs on demand and whenever the README changes on main, so the
+# overview no longer has to wait for the next release tag.
+#
+# Needs DOCKERHUB_USERNAME and a DOCKERHUB_TOKEN with *read/write/delete* scope.
+# A read/write token can push images but gets 403 Forbidden from the description
+# endpoint, and the account must have Admin permission on the repository.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - .github/workflows/dockerhub-description.yml
+
+permissions:
+  contents: read
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: queryproxy/queryproxy
+          # Docker Hub truncates this at 100 bytes, so it is written short
+          # rather than borrowed from the GitHub description (163 chars) and
+          # cut mid-sentence.
+          short-description: "Self-hosted DB access control: guarded SQL, DBA approvals from Slack, masked audited results"
+          # Rewrites the README's relative links and screenshot paths to
+          # absolute GitHub URLs; they 404 on Docker Hub otherwise.
+          enable-url-completion: true
