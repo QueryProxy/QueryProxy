@@ -76,17 +76,39 @@ class ChatOps extends Component
         $this->teamsWebhookUrl = '';
     }
 
+    /**
+     * Removal is held to the same bar as writing the signing secret. Setting a
+     * secret is admin-only, and configuring an integration from scratch requires
+     * one — so a DBA who deleted an integration could not put it back, and the
+     * delete button was a one-way door out of ChatOps for the whole team. The
+     * reversible day-to-day control is the `enabled` flag, which stays with the
+     * team's DBAs; only a system admin may tear the integration down.
+     */
     public function remove(string $provider): void
     {
-        $this->assertDba($this->team());
+        $team = $this->team();
+        $this->assertDba($team);
+
+        $this->resetErrorBag();
+
+        if (! auth()->user()->isAdmin()) {
+            $this->addError('remove', 'Only a system admin may remove a ChatOps integration, because setting the signing secret needed to configure it again is admin-only. Untick "Enabled" and save to disable it instead, or ask an admin to remove it.');
+
+            return;
+        }
 
         $provider = ChatProvider::from($provider);
 
-        ChatIntegration::where('team_id', $this->team()->id)
+        $removed = ChatIntegration::where('team_id', $team->id)
             ->where('provider', $provider)
             ->delete();
 
-        audit()->record('chat_integration.removed', team: $this->team(), metadata: ['provider' => $provider->value]);
+        // Its own action, kept distinct from `chat_integration.saved`: removal
+        // takes the signing secret with it and cannot be undone without an admin.
+        audit()->record('chat_integration.removed', team: $team, metadata: [
+            'provider' => $provider->value,
+            'existed' => $removed > 0,
+        ]);
 
         $prefix = $this->fieldPrefix($provider);
 
@@ -209,11 +231,13 @@ class ChatOps extends Component
     public function render()
     {
         $integrations = ChatIntegration::where('team_id', $this->team()->id)->get();
+        $isAdmin = auth()->user()->isAdmin();
 
         return view('livewire.settings.chat-ops', [
             'hasSlack' => $integrations->firstWhere('provider', ChatProvider::Slack) !== null,
             'hasTeams' => $integrations->firstWhere('provider', ChatProvider::Teams) !== null,
-            'canRotateSecret' => auth()->user()->isAdmin(),
+            'canRotateSecret' => $isAdmin,
+            'canRemove' => $isAdmin,
         ]);
     }
 }

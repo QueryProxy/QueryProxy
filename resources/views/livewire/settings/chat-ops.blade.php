@@ -7,13 +7,17 @@
         <x-ui.alert tone="ok" icon="check" class="mb-3.5">{{ session('status') }}</x-ui.alert>
     @endif
 
+    @if ($errors->has('remove'))
+        <x-ui.alert tone="danger" icon="lock" class="mb-3.5">{{ $errors->first('remove') }}</x-ui.alert>
+    @endif
+
     <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <x-ui.panel>
             <x-slot:header>
                 <x-ui.icon name="slack" :size="15" class="text-ink-4" />
                 <span class="font-display text-[12.5px] font-semibold text-ink">Slack</span>
-                @if ($hasSlack)
-                    <x-ui.action wire:click="remove('slack')" wire:confirm="Remove the Slack integration?" tone="danger" class="ml-auto">Remove</x-ui.action>
+                @if ($hasSlack && $canRemove)
+                    <x-ui.action wire:click="remove('slack')" wire:confirm="Remove the Slack integration? Only an admin can configure it again." tone="danger" class="ml-auto">Remove</x-ui.action>
                 @endif
             </x-slot:header>
 
@@ -37,7 +41,8 @@
                     @else
                         <x-ui.alert tone="neutral" icon="lock">
                             The signing secret is what proves an incoming Approve / Reject callback really came from Slack,
-                            so only a system admin can set or rotate it. You can still change the webhook URL and toggle the integration.
+                            so only a system admin can set or rotate it — or remove the integration, which would need a new secret to
+                            set up again. You can still change the webhook URL and untick Enabled to switch Slack off.
                         </x-ui.alert>
                     @endif
 
@@ -63,8 +68,8 @@
             <x-slot:header>
                 <x-ui.icon name="chat" :size="15" class="text-ink-4" />
                 <span class="font-display text-[12.5px] font-semibold text-ink">Microsoft Teams</span>
-                @if ($hasTeams)
-                    <x-ui.action wire:click="remove('teams')" wire:confirm="Remove the Teams integration?" tone="danger" class="ml-auto">Remove</x-ui.action>
+                @if ($hasTeams && $canRemove)
+                    <x-ui.action wire:click="remove('teams')" wire:confirm="Remove the Teams integration? Only an admin can configure it again." tone="danger" class="ml-auto">Remove</x-ui.action>
                 @endif
             </x-slot:header>
 
@@ -88,7 +93,8 @@
                     @else
                         <x-ui.alert tone="neutral" icon="lock">
                             The HMAC secret is what proves an incoming approve / reject call really came from your automation,
-                            so only a system admin can set or rotate it. You can still change the webhook URL and toggle the integration.
+                            so only a system admin can set or rotate it — or remove the integration, which would need a new secret to
+                            set up again. You can still change the webhook URL and untick Enabled to switch Teams off.
                         </x-ui.alert>
                     @endif
 
