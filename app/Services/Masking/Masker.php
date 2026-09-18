@@ -63,20 +63,28 @@ class Masker
             }
         }
 
-        if (is_string($value)) {
+        // Content rules must see every scalar, not just strings. PDO returns
+        // native int/float for BIGINT/DECIMAL columns (Laravel disables
+        // ATTR_STRINGIFY_FETCHES), so a `payments.pan BIGINT` that matches no
+        // column pattern used to skip the content rules entirely and land raw
+        // in the result store. Cast for matching only — an unmatched value is
+        // returned untouched below so its original type survives.
+        if (is_scalar($value)) {
+            $subject = (string) $value;
+
             foreach ($rules as $rule) {
                 if ($rule->match_type !== MaskMatchType::Regex) {
                     continue;
                 }
 
-                $matched = @preg_match($rule->pattern, $value);
+                $matched = @preg_match($rule->pattern, $subject);
 
                 // Fail closed: when PCRE cannot evaluate the pattern against
                 // this value (backtrack/recursion limit), treat it as a match —
                 // emitting the raw value on evaluation failure would silently
                 // bypass masking exactly when the data is most pathological.
                 if ($matched === 1 || $matched === false) {
-                    return $this->apply($rule->strategy, $value);
+                    return $this->apply($rule->strategy, $subject);
                 }
             }
         }

@@ -25,7 +25,14 @@ class ResultDownloadController extends Controller
         return response()->streamDownload(function () use ($queryRequest) {
             $out = fopen('php://output', 'w');
 
-            fputcsv($out, $queryRequest->result_columns ?? []);
+            // The header is as attacker-controlled as the data: column names
+            // come from the target schema or from the requester's own aliases
+            // (`SELECT id AS "=HYPERLINK(...)"`), and on the `SELECT *` path an
+            // approving DBA never sees the name at review time.
+            fputcsv($out, array_map(
+                fn ($column) => Csv::sanitize($column),
+                $queryRequest->result_columns ?? [],
+            ));
 
             $stream = Storage::disk($queryRequest->result_disk)
                 ->readStream($queryRequest->result_path);

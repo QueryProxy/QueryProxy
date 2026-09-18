@@ -18,6 +18,11 @@ return [
     |--------------------------------------------------------------------------
     | Execution
     |--------------------------------------------------------------------------
+    | `result_disk` must be a PRIVATE filesystem disk. Result files are only
+    | meant to be reachable through the download route, which enforces the
+    | request policy; a publicly visible disk would serve them over a guessable
+    | URL instead. QueryExecutor refuses to run a read request when this points
+    | at `public` or at any disk configured with `visibility => public`.
     */
 
     'execution_timeout' => (int) env('QUERYPROXY_EXECUTION_TIMEOUT', 300),
