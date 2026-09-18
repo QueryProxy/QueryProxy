@@ -4,6 +4,7 @@ namespace App\Services\Chat;
 
 use App\Enums\ChatProvider;
 use App\Enums\QueryRequestStatus;
+use App\Models\ChatApprovalToken;
 use App\Models\ChatIntegration;
 use App\Models\QueryRequest;
 use Illuminate\Support\Facades\Http;
@@ -19,9 +20,13 @@ class ChatNotifier
     public function requestSubmitted(QueryRequest $request): void
     {
         foreach ($this->integrations($request) as $integration) {
+            // One token per integration, so a decision taken in Slack does not
+            // silently invalidate the Teams card and vice versa.
+            $token = ChatApprovalToken::issueFor($request);
+
             $payload = $integration->provider === ChatProvider::Slack
-                ? $this->slackSubmittedMessage($request)
-                : $this->teamsSubmittedCard($request);
+                ? $this->slackSubmittedMessage($request, $token)
+                : $this->teamsSubmittedCard($request, $token);
 
             $this->post($integration, $payload);
         }
@@ -73,18 +78,37 @@ class ChatNotifier
             Log::warning('QueryProxy: chat notification failed', [
                 'team_id' => $integration->team_id,
                 'provider' => $integration->provider->value,
-                'error' => $e->getMessage(),
+                'error' => $this->redactWebhookUrl($e->getMessage(), $integration),
             ]);
         }
+    }
+
+    /**
+     * The webhook URL *is* the bearer credential — for a Slack incoming hook
+     * the secret is the path itself — which is why it is stored encrypted and
+     * never echoed back to the UI. Transport failures blow a hole in that:
+     * Guzzle wraps the cURL message including the full effective URL, and its
+     * own redaction only masks userinfo, never the path. So scrub the URL out
+     * of anything derived from the exception before it reaches the log, the
+     * same way DynamicConnectionFactory::redactError() scrubs DSN secrets.
+     */
+    private function redactWebhookUrl(string $message, ChatIntegration $integration): string
+    {
+        $url = (string) $integration->webhook_url;
+
+        return $url === '' ? $message : str_replace($url, '[redacted-webhook]', $message);
     }
 
     /**
      * Slack Block Kit message with interactive Approve / Reject buttons.
      * Button clicks arrive at /webhooks/slack/interactions (HMAC-verified).
      *
+     * The button values carry the single-use action token alongside the
+     * request id; the callback endpoint refuses any value without one.
+     *
      * @return array<string, mixed>
      */
-    private function slackSubmittedMessage(QueryRequest $request): array
+    private function slackSubmittedMessage(QueryRequest $request, string $token): array
     {
         $sqlPreview = $this->sqlPreview($request);
 
@@ -117,7 +141,7 @@ class ChatNotifier
                             'style' => 'primary',
                             'text' => ['type' => 'plain_text', 'text' => 'Approve'],
                             'action_id' => 'queryproxy_approve',
-                            'value' => "approve:{$request->id}",
+                            'value' => "approve:{$request->id}:{$token}",
                             'confirm' => [
                                 'title' => ['type' => 'plain_text', 'text' => 'Approve request?'],
                                 'text' => ['type' => 'plain_text', 'text' => "Request #{$request->id} will be executed."],
@@ -130,7 +154,7 @@ class ChatNotifier
                             'style' => 'danger',
                             'text' => ['type' => 'plain_text', 'text' => 'Reject'],
                             'action_id' => 'queryproxy_reject',
-                            'value' => "reject:{$request->id}",
+                            'value' => "reject:{$request->id}:{$token}",
                         ],
                         [
                             'type' => 'button',
@@ -159,11 +183,20 @@ class ChatNotifier
      * for Teams runs through the generic HMAC action endpoint, e.g. from a
      * Power Automate flow).
      *
+     * The single-use action token travels in a `queryproxy` envelope rather
+     * than a visible fact: MessageCard renderers ignore unknown top-level
+     * keys, so the automation reading the payload can pick it up without the
+     * token being splashed across the channel.
+     *
      * @return array<string, mixed>
      */
-    private function teamsSubmittedCard(QueryRequest $request): array
+    private function teamsSubmittedCard(QueryRequest $request, string $token): array
     {
         return [
+            'queryproxy' => [
+                'request_id' => $request->id,
+                'action_token' => $token,
+            ],
             'type' => 'MessageCard',
             '@context' => 'https://schema.org/extensions',
             'summary' => sprintf('New query request #%d', $request->id),
