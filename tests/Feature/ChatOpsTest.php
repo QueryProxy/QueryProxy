@@ -453,3 +453,75 @@ test('a failed chat notification never writes the webhook url to the log', funct
         })
         ->twice();
 });
+
+test('a dba cannot remove a chat integration and is told what to do instead', function () {
+    [$team, $dba] = chatSetup();
+    session(['current_team_id' => $team->id]);
+
+    // Removal is a one-way door for a DBA: reconfiguring needs a signing secret,
+    // and only an admin may set one. The refusal has to name the way out.
+    $component = Livewire\Livewire::actingAs($dba)
+        ->test(ChatOps::class)
+        ->call('remove', 'slack')
+        ->assertHasErrors('remove');
+
+    expect($component->errors()->first('remove'))->toContain('admin')
+        ->and($component->errors()->first('remove'))->toContain('Enabled')
+        ->and(ChatIntegration::where('team_id', $team->id)->where('provider', 'slack')->exists())->toBeTrue()
+        ->and(AuditLog::where('action', 'chat_integration.removed')->exists())->toBeFalse();
+});
+
+test('a dba can still disable a chat integration without touching the url or the secret', function () {
+    [$team, $dba] = chatSetup();
+    session(['current_team_id' => $team->id]);
+
+    // The day-to-day capability a DBA actually needs: switch ChatOps off, and
+    // back on again, with no admin involved and no credential re-entered.
+    Livewire\Livewire::actingAs($dba)
+        ->test(ChatOps::class)
+        ->set('slackEnabled', false)
+        ->call('saveSlack')
+        ->assertHasNoErrors()
+        ->set('slackEnabled', true)
+        ->call('saveSlack')
+        ->assertHasNoErrors();
+
+    $integration = ChatIntegration::where('team_id', $team->id)->where('provider', 'slack')->first();
+
+    expect($integration->enabled)->toBeTrue()
+        ->and($integration->webhook_url)->toBe('https://hooks.slack.com/services/T000/B000/XXX')
+        ->and($integration->signing_secret)->toBe(SLACK_SECRET);
+});
+
+test('an admin can remove a chat integration and the removal is audited', function () {
+    [$team] = chatSetup();
+    $admin = User::factory()->create(['is_admin' => true]);
+    session(['current_team_id' => $team->id]);
+
+    Livewire\Livewire::actingAs($admin)
+        ->test(ChatOps::class)
+        ->call('remove', 'slack')
+        ->assertHasNoErrors();
+
+    $removal = AuditLog::where('action', 'chat_integration.removed')->first();
+
+    expect(ChatIntegration::where('team_id', $team->id)->where('provider', 'slack')->exists())->toBeFalse()
+        // The other provider is untouched — removal is per integration.
+        ->and(ChatIntegration::where('team_id', $team->id)->where('provider', 'teams')->exists())->toBeTrue()
+        ->and($removal)->not->toBeNull()
+        ->and($removal->user_id)->toBe($admin->id)
+        ->and($removal->metadata)->toBe(['provider' => 'slack', 'existed' => true])
+        ->and(json_encode($removal->metadata))->not->toContain(SLACK_SECRET);
+});
+
+test('a developer cannot remove a chat integration at all', function () {
+    [$team, , $developer] = chatSetup();
+    session(['current_team_id' => $team->id]);
+
+    Livewire\Livewire::actingAs($developer)
+        ->test(ChatOps::class)
+        ->call('remove', 'slack')
+        ->assertForbidden();
+
+    expect(ChatIntegration::where('team_id', $team->id)->where('provider', 'slack')->exists())->toBeTrue();
+});
