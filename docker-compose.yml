@@ -23,6 +23,14 @@ services:
       APP_URL: http://localhost:7432
       # APP_KEY: base64:...
       QUERYPROXY_SEED_DEMO: "false"
+      # Port 7432 is published straight to the host, so nothing sits in front of
+      # the app and no proxy may be trusted: leaving TRUSTED_PROXIES unset keeps
+      # X-Forwarded-* ignored, so a client cannot forge its IP past the login/2FA
+      # throttles or into the audit trail.
+      # Put a TLS-terminating proxy in front (and drop the published port) and it
+      # becomes the opposite: set TRUSTED_PROXIES to that proxy's IP/CIDR — never
+      # "*" — and uncomment SESSION_SECURE_COOKIE below.
+      # TRUSTED_PROXIES: "172.18.0.5"
       # Uncomment when serving over HTTPS (behind a TLS-terminating proxy):
       # SESSION_SECURE_COOKIE: "true"
     volumes:
