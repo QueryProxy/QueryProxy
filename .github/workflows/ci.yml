@@ -1,5 +1,10 @@
 name: CI
 
+# Actions are pinned to commit SHAs rather than mutable tags: a moved tag would
+# get to run arbitrary code in a job that checks out the repository. Dependabot
+# (github-actions ecosystem) keeps the SHAs current; when bumping one,
+# re-resolve the SHA — never edit the version comment alone.
+
 on:
   push:
     branches: [main]
@@ -14,15 +19,15 @@ jobs:
         php: ['8.3', '8.4', '8.5']
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
           php-version: ${{ matrix.php }}
           extensions: pdo_sqlite, pdo_mysql, pdo_pgsql, intl, zip, bcmath
           coverage: none
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
