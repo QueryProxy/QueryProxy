@@ -32,6 +32,14 @@ use PhpMyAdmin\SqlParser\TokenType;
  * tricks like "DROP/**\/DATABASE" cannot smuggle a forbidden statement past
  * the anchored patterns.
  *
+ * The forbidden-statement denylist is structurally incomplete and always will
+ * be. It enumerates dangerous syntax that is known today across several
+ * dialects; a spelling it does not name yet — a vendor extension, a function
+ * alias, a future server feature — passes it. Treat it as one layer of
+ * defence in depth, never as the authorization boundary: the DBA approval
+ * workflow is what actually authorizes a statement, and the denylist only
+ * removes the most obviously abusive requests before they ever reach a human.
+ *
  * The parser is MySQL-dialect-first; statements it cannot fully parse are
  * guarded best-effort by keyword heuristics and classified as writes unless
  * they clearly read.
@@ -48,11 +56,22 @@ class SqlInspector
         '/^REVOKE\b/i' => 'REVOKE statements are not allowed through QueryProxy.',
         '/^(CREATE|ALTER|DROP)\s+(USER|ROLE|LOGIN)\b/i' => 'User / role management statements are not allowed through QueryProxy.',
         '/^SET\s+GLOBAL\b/i' => 'SET GLOBAL is not allowed through QueryProxy.',
+        // "SET @@GLOBAL.x = ..." is the same statement in variable syntax and
+        // sidesteps the keyword form above; the lexer glues "@@" to the scope
+        // but leaves the dot free-standing, hence the tolerant spacing.
+        '/^SET\s+@@\s*(GLOBAL|PERSIST(_ONLY)?)\s*\./i' => 'SET @@GLOBAL is not allowed through QueryProxy.',
+        '/^SET\s+PERSIST(_ONLY)?\b/i' => 'SET PERSIST is not allowed through QueryProxy.',
+        '/^CREATE\s+(AGGREGATE\s+)?FUNCTION\b.*\bSONAME\b/i' => 'CREATE FUNCTION ... SONAME is not allowed through QueryProxy (loadable UDF).',
+        '/^CREATE\s+EXTENSION\b/i' => 'CREATE EXTENSION is not allowed through QueryProxy.',
+        '/^DO\b/i' => 'Anonymous code blocks (DO) are not allowed through QueryProxy.',
         '/^SHUTDOWN\b/i' => 'SHUTDOWN is not allowed through QueryProxy.',
         '/^LOAD\s+DATA\b/i' => 'LOAD DATA is not allowed through QueryProxy.',
         '/^COPY\b/i' => 'COPY is not allowed through QueryProxy (server-side file / program IO).',
         '/\bINTO\s+(OUTFILE|DUMPFILE)\b/i' => 'SELECT ... INTO OUTFILE / DUMPFILE is not allowed through QueryProxy.',
         '/\bLOAD_FILE\s*\(/i' => 'LOAD_FILE() is not allowed through QueryProxy.',
+        // Call form only: literals are already blanked by normalize(), and an
+        // identifier that merely *looks* like one of these is not a call.
+        '/\b(PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|LO_IMPORT|LO_EXPORT)\s*\(/i' => 'Server-side file IO functions are not allowed through QueryProxy.',
     ];
 
     public function inspect(string $sql, ?DbDriver $driver = null): InspectionResult

@@ -243,6 +243,49 @@ test('FETCH FIRST n ROWS ONLY above the hard cap is clamped', function () {
         ->and($result->statements[0]->limitClamped)->toBeTrue();
 });
 
+// --- Regression: denylist gaps found in the 2026-09-18 security scan ---
+
+test('privilege-escalation and code-execution statements are rejected', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'SET @@GLOBAL variable syntax' => "SET @@GLOBAL.general_log_file = '/var/www/s.php'",
+    'SET @@global lowercase' => 'SET @@global.general_log = 1',
+    'SET @@GLOBAL with loose spacing' => 'SET @@ GLOBAL . general_log = 1',
+    'SET @@GLOBAL behind a comment' => 'SET/**/@@GLOBAL.general_log = 1',
+    'SET PERSIST' => 'SET PERSIST general_log = 1',
+    'SET @@PERSIST variable syntax' => 'SET @@PERSIST.general_log = 1',
+    'MySQL UDF via SONAME' => "CREATE FUNCTION sys_exec RETURNS INT SONAME 'udf.so'",
+    'MySQL aggregate UDF via SONAME' => "CREATE AGGREGATE FUNCTION agg RETURNS INT SONAME 'udf.so'",
+    'CREATE EXTENSION' => 'CREATE EXTENSION plpythonu',
+    'CREATE EXTENSION IF NOT EXISTS' => 'CREATE EXTENSION IF NOT EXISTS plpythonu',
+    'PostgreSQL anonymous code block' => 'DO $$ BEGIN PERFORM 1; END $$',
+]);
+
+test('postgresql file-IO functions are rejected even inside a read', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'pg_read_file' => "SELECT pg_read_file('/etc/passwd')",
+    'schema-qualified pg_read_file' => "SELECT pg_catalog.pg_read_file('/etc/passwd')",
+    'pg_read_binary_file' => "SELECT pg_read_binary_file('/etc/passwd')",
+    'pg_ls_dir' => "SELECT pg_ls_dir('/')",
+    'lo_import' => "SELECT lo_import('/etc/passwd')",
+    'lo_export' => "SELECT lo_export(1, '/tmp/x')",
+]);
+
+test('legitimate statements are not caught by the widened denylist', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeTrue();
+})->with([
+    'UPDATE ... SET' => 'UPDATE t SET x = 1 WHERE id = 1',
+    'SET NAMES' => 'SET NAMES utf8mb4',
+    'SET SESSION' => "SET SESSION time_zone = '+00:00'",
+    'SET @@SESSION variable syntax' => "SET @@SESSION.time_zone = '+00:00'",
+    'user variable' => 'SET @x = 1',
+    'file-IO name inside a string literal' => "SELECT * FROM logs WHERE action = 'pg_read_file'",
+    'file-IO name as a column' => 'SELECT pg_read_file AS x FROM t',
+    'file-IO name as a table prefix' => 'SELECT * FROM pg_ls_dir_audit',
+    'SQL-bodied CREATE FUNCTION' => 'CREATE FUNCTION f() RETURNS int RETURN 1',
+]);
+
 test('DROP TABLE and TRUNCATE pass as approval-gated writes flagged as DDL', function (string $sql) {
     $result = inspect($sql);
 
