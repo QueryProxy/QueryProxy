@@ -114,4 +114,34 @@ return [
 
     'require_two_factor' => env('QUERYPROXY_REQUIRE_2FA', 'none'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Network trust
+    |--------------------------------------------------------------------------
+    | Both lists live here rather than being read with env() at runtime: the
+    | container caches the configuration on every boot, and once a config cache
+    | exists Laravel never loads .env again, so a runtime env() call silently
+    | returns null for anything written to that file.
+    |
+    | `trusted_proxies` names the reverse proxies allowed to set X-Forwarded-*.
+    | Empty means no proxy is trusted, which is correct when the app is reached
+    | directly. Never use "*": any client could then forge X-Forwarded-For,
+    | which hands out unlimited login and 2FA attempts (both throttles are keyed
+    | per IP) and writes a false client IP into the audit trail.
+    |
+    | `trusted_hosts` adds hostnames this installation answers to, on top of
+    | APP_URL's host. It exists so a multi-domain deployment keeps working while
+    | a forged Host header still cannot rewrite password-reset links.
+    */
+
+    'trusted_proxies' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('TRUSTED_PROXIES', '')),
+    ))),
+
+    'trusted_hosts' => array_values(array_filter(array_map(
+        'trim',
+        explode(',', (string) env('TRUSTED_HOSTS', '')),
+    ))),
+
 ];

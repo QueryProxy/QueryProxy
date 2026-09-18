@@ -2,9 +2,11 @@
 
 use App\Models\User;
 use Illuminate\Auth\Notifications\ResetPassword;
+use Illuminate\Http\Middleware\TrustHosts;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\RateLimiter;
+use Symfony\Component\HttpFoundation\Exception\SuspiciousOperationException;
 
 test('no proxy is trusted and the header mask drops the forwarded host', function () {
     $this->get('/login')->assertOk();
@@ -86,4 +88,116 @@ test('a forged x-forwarded-host cannot poison the password reset link', function
 
         return true;
     });
+});
+
+/**
+ * Run the trustHosts closure registered in bootstrap/app.php and return the
+ * patterns it produces for the given trusted-host list.
+ *
+ * Laravel skips the TrustHosts middleware outright in the local environment and
+ * under tests (TrustHosts::shouldSpecifyTrustedHosts()), so an ordinary HTTP
+ * test can never observe it. Resolving the middleware and calling hosts()
+ * invokes the real closure — the one bootstrap/app.php registered — which is
+ * also proof that it reads configuration at request time, unlike the body of
+ * the withMiddleware callback that runs before the configuration is loaded.
+ *
+ * @param  list<string>|null  $trustedHosts
+ * @return array<int, string>
+ */
+function trustedHostPatterns(?array $trustedHosts): array
+{
+    $previous = config('queryproxy.trusted_hosts');
+
+    try {
+        config(['queryproxy.trusted_hosts' => $trustedHosts ?? []]);
+
+        return app(TrustHosts::class)->hosts();
+    } finally {
+        config(['queryproxy.trusted_hosts' => $previous]);
+    }
+}
+
+/**
+ * Feed the patterns to Symfony exactly as TrustHosts::handle() would, then ask a
+ * request carrying $host for its host. Symfony throws on an untrusted one, so
+ * this asserts the patterns' real effect rather than their spelling.
+ *
+ * @param  array<int, string>  $patterns
+ */
+function hostIsTrusted(array $patterns, string $host): bool
+{
+    try {
+        Request::setTrustedHosts($patterns);
+
+        $request = Request::create('http://placeholder.invalid/');
+        $request->headers->set('HOST', $host);
+
+        return $request->getHost() === strtolower($host);
+    } catch (SuspiciousOperationException) {
+        return false;
+    } finally {
+        Request::setTrustedHosts([]);
+    }
+}
+
+test('with TRUSTED_HOSTS empty only the APP_URL host is trusted', function () {
+    config(['app.url' => 'https://queryproxy.example.com']);
+
+    $patterns = trustedHostPatterns([]);
+
+    expect($patterns)->toBe([
+        '^queryproxy\.example\.com$',
+        '^www\.queryproxy\.example\.com$',
+    ])
+        ->and(hostIsTrusted($patterns, 'queryproxy.example.com'))->toBeTrue()
+        ->and(hostIsTrusted($patterns, 'www.queryproxy.example.com'))->toBeTrue()
+        ->and(hostIsTrusted($patterns, 'evil.tld'))->toBeFalse()
+        ->and(hostIsTrusted($patterns, 'queryproxy.example.com.evil.tld'))->toBeFalse();
+
+    // An unset variable must behave the same as an empty one.
+    expect(trustedHostPatterns(null))->toBe($patterns);
+});
+
+test('hostnames listed in TRUSTED_HOSTS are trusted alongside the APP_URL host', function () {
+    config(['app.url' => 'https://queryproxy.example.com']);
+
+    $patterns = trustedHostPatterns(['queryproxy.internal', 'queryproxy.example.net']);
+
+    expect($patterns)->toBe([
+        '^queryproxy\.example\.com$',
+        '^www\.queryproxy\.example\.com$',
+        '^queryproxy\.internal$',
+        '^queryproxy\.example\.net$',
+    ])
+        ->and(hostIsTrusted($patterns, 'queryproxy.internal'))->toBeTrue()
+        ->and(hostIsTrusted($patterns, 'queryproxy.example.net'))->toBeTrue()
+        // Adding a host must not widen the ones already trusted, nor trust
+        // anything that merely contains a listed name.
+        ->and(hostIsTrusted($patterns, 'queryproxy.example.com'))->toBeTrue()
+        ->and(hostIsTrusted($patterns, 'evil.tld'))->toBeFalse()
+        ->and(hostIsTrusted($patterns, 'notqueryproxy.internal'))->toBeFalse()
+        ->and(hostIsTrusted($patterns, 'queryproxy.internal.evil.tld'))->toBeFalse();
+});
+
+test('blank and malformed TRUSTED_HOSTS entries are dropped without breaking the install', function () {
+    config(['app.url' => 'https://queryproxy.example.com']);
+
+    // Stray commas, whitespace, a pasted URL and a regex metacharacter: each is
+    // skipped rather than becoming a pattern that matches more than its author meant.
+    $patterns = trustedHostPatterns([' ', 'queryproxy.internal', '', 'https://oops.example.com', '.*']);
+
+    expect($patterns)->toBe([
+        '^queryproxy\.example\.com$',
+        '^www\.queryproxy\.example\.com$',
+        '^queryproxy\.internal$',
+    ])
+        ->and(hostIsTrusted($patterns, 'queryproxy.internal'))->toBeTrue()
+        ->and(hostIsTrusted($patterns, 'oops.example.com'))->toBeFalse()
+        ->and(hostIsTrusted($patterns, 'anything.tld'))->toBeFalse();
+});
+
+test('a half-configured install with no APP_URL host and no TRUSTED_HOSTS stays bootable', function () {
+    config(['app.url' => '']);
+
+    expect(trustedHostPatterns([]))->toBe([]);
 });
