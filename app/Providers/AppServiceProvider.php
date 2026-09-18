@@ -7,6 +7,7 @@ use App\Http\Middleware\EnsureTeamRole;
 use App\Models\QueryRequest;
 use App\Models\User;
 use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Middleware\TrustProxies;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\RateLimiter;
@@ -24,6 +25,17 @@ class AppServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        // Trusted proxies live here rather than in bootstrap/app.php because that
+        // middleware callback runs before .env is loaded. Providers boot before the
+        // middleware pipeline, so TrustProxies still picks this up for every request.
+        // Empty (the default) means no proxy is trusted at all: X-Forwarded-For is
+        // ignored and $request->ip() stays the real peer address, which is what the
+        // login/2FA throttles and the audit trail key off. The header mask is set in
+        // bootstrap/app.php.
+        if ($proxies = $this->trustedProxies()) {
+            TrustProxies::at($proxies);
+        }
+
         // System admins pass every ability check up-front — except the ones about a
         // query request, because QueryRequestPolicy encodes the request state machine
         // alongside permission. Bypassing it let an admin approve, reject or cancel a
@@ -54,5 +66,18 @@ class AppServiceProvider extends ServiceProvider
             return Route::post(EndpointResolver::updatePath(), $handle)
                 ->middleware(['web', 'throttle:livewire']);
         });
+    }
+
+    /**
+     * Read the comma-separated TRUSTED_PROXIES list of IPs/CIDRs.
+     *
+     * @return array<int, string>
+     */
+    private function trustedProxies(): array
+    {
+        return array_values(array_filter(
+            array_map(trim(...), explode(',', (string) env('TRUSTED_PROXIES', ''))),
+            static fn (string $proxy): bool => $proxy !== '',
+        ));
     }
 }
