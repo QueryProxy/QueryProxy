@@ -4,6 +4,70 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **ChatOps approvals could be made in someone else's name.** The webhook HMAC
+  proves only that the caller knows the signing secret, but the approver's
+  identity was read straight out of the callback body — and any team DBA could
+  overwrite the signing secret without knowing the old one. Together that let a
+  DBA approve their own request as a colleague (or as an admin), defeating the
+  four-eyes rule and writing that colleague's name into the audit trail. Signing
+  secrets are now administrator-only and rotating one requires the current
+  secret; every Approve / Reject control carries a single-use action token bound
+  to one request; and the resolved approver must belong to the integration's team.
+- **Every proxy was trusted (`trustProxies(at: '*')`).** Any client could forge
+  `X-Forwarded-For` and get unlimited login and 2FA attempts (both throttles are
+  keyed per IP) and write a false client IP into the audit log, while a forged
+  `X-Forwarded-Host` rewrote the link in password-reset mail. Trust is now opt-in
+  through `TRUSTED_PROXIES`, `X-Forwarded-Host` is no longer honoured, and
+  `trustHosts` pins the request host to `APP_URL`.
+- **Content masking rules silently skipped non-string values.** PDO returns
+  native integers for `BIGINT`/`DECIMAL`, so a numeric column that matched no
+  column pattern — a card number or a national id stored as `BIGINT` — reached
+  the result store unmasked. Content rules now see every scalar.
+- **The SQL guard's denylist had bypasses.** `SET @@GLOBAL.…` walked straight
+  past the `SET GLOBAL` rule (arbitrary file write through the MySQL general
+  log), and `CREATE FUNCTION … SONAME`, `CREATE EXTENSION`, `DO`, `pg_read_file()`
+  and friends were not listed at all. All are blocked now.
+- **TOTP codes could be replayed** for the ~90 seconds their window stayed open;
+  an accepted code is now burned via `two_factor_last_used_timestamp`.
+- **Chat webhook URLs leaked into the logs.** A connection error carried the full
+  URL — and for Slack the secret *is* the URL path — into `laravel.log`.
+- **CSV exports did not guard the header row** against spreadsheet formula
+  injection, although the data rows did; column names come from the target schema
+  or the requester's own aliases.
+- **Query results could be published without authorization** if the operator
+  pointed `QUERYPROXY_RESULT_DISK` at a public disk: result paths are guessable,
+  so `storage:link` exposed every team's rows. Such a disk is now refused.
+- Default masking rules gained content patterns for vendor API keys, JWTs,
+  PEM private keys and high-entropy secrets, so a secret hidden behind a column
+  alias (`SELECT api_key AS k`) is still masked. The credit-card content rule was
+  narrowed to real IIN ranges so it no longer fires on epoch timestamps.
+- Third-party GitHub Actions are pinned to commit SHAs, and the release workflow
+  scans the image before any registry credential is on the runner.
+
+### Changed
+
+- **Breaking — set `TRUSTED_PROXIES` when running behind a reverse proxy.** It is
+  empty by default. Until it names your proxy, `X-Forwarded-Proto` is ignored, so
+  HTTPS is not detected and audit entries record the proxy's address rather than
+  the client's. Never use `*`.
+- **Breaking — a system administrator must set the ChatOps signing secret.** DBAs
+  keep control of the webhook URL and the enabled flag, but can no longer enter or
+  rotate the secret. Existing installations should rotate it once after upgrading:
+  any DBA who configured ChatOps already knows the current value.
+- **Breaking — Approve / Reject buttons in chat messages posted before this
+  version stop working**, because they carry no action token. Decide those
+  requests in the web UI. Teams automations must start sending the `token` field
+  from the card's `queryproxy` envelope.
+- A TOTP code is now single-use, so signing in on a second device within the same
+  30-second window requires waiting for the next code.
+- New content masking rules apply to new teams only. Run **Masking → Add
+  defaults** per team to pick them up; it is idempotent and leaves existing rules
+  untouched.
+
 ## [0.1.3] — 2026-09-08
 
 ### Changed

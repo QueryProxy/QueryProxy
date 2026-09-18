@@ -36,12 +36,15 @@ asynchronously on a worker, and results come back **masked, limited and fully au
   - `UPDATE` / `DELETE` without `WHERE` are rejected at submission,
   - `SELECT` without `LIMIT` gets `LIMIT 1000` injected (hard cap `10000`),
   - multiple statements require an explicit `BEGIN; ...; COMMIT;` transaction,
-  - administrative statements (`GRANT`, `DROP DATABASE`, `SET GLOBAL`, ...) are blocked.
+  - administrative and server-side file-IO statements are blocked (`GRANT`,
+    `DROP DATABASE`, `SET GLOBAL` and `SET @@GLOBAL`, `CREATE EXTENSION`,
+    `CREATE FUNCTION ... SONAME`, `INTO OUTFILE`, `pg_read_file()`, ...).
 - **Approval workflow** — pending requests wait indefinitely until a DBA decides;
   self-approval is blocked; every decision records who, when and through which channel.
-- **ChatOps** — Slack messages with interactive **Approve / Reject** buttons
-  (HMAC-SHA256 signature + replay-window verification on every callback) and
-  Microsoft Teams cards with an HMAC-verified action endpoint.
+- **ChatOps** — Slack messages with interactive **Approve / Reject** buttons and
+  Microsoft Teams cards with an HMAC-verified action endpoint. Every callback is
+  checked against the HMAC signature, a replay window, and a single-use action
+  token bound to that one request; signing secrets are administrator-only.
 - **Async execution** — approved queries run on a queue worker; reads stream
   through database cursors into NDJSON files with constant memory usage.
 - **Dynamic data masking** — column-pattern and content-regex rules
@@ -101,6 +104,7 @@ refuses to run while `APP_ENV=production` unless you also set
 | `QUERYPROXY_WORKER_PROCESSES` | `1` | Number of queue workers |
 | `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
 | `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
+| `TRUSTED_PROXIES` | — | Reverse proxy IPs/CIDRs allowed to set `X-Forwarded-*` |
 
 > **Before exposing QueryProxy to a network, read [Production hardening](#production-hardening).**
 
@@ -152,13 +156,14 @@ All knobs live in `.env` (see `.env.example` for the full list):
 | `QUERYPROXY_SELECT_DEFAULT_LIMIT` | `1000` | LIMIT injected into SELECTs without one |
 | `QUERYPROXY_SELECT_HARD_LIMIT` | `10000` | Larger LIMITs are clamped to this |
 | `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution |
-| `QUERYPROXY_RESULT_DISK` | `local` | Filesystem disk for result files (`s3` supported) |
+| `QUERYPROXY_RESULT_DISK` | `local` | Filesystem disk for result files (`s3` supported); a publicly visible disk is refused |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
 | `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none` / `admins` / `dba` / `all` |
 | `QUERYPROXY_CHAT_WEBHOOK_ALLOWED_HOSTS` | — | Extra allowed hosts for outbound chat webhooks |
 | `QUERYPROXY_CHAT_INCLUDE_SQL` | `true` | Embed a SQL preview in chat notifications |
 | `QUERYPROXY_CONNECTION_HOST_DENYLIST` | — | Extra hosts blocked as connection targets |
 | `QUERYPROXY_SQLITE_ALLOWED_DIR` | — | Restrict SQLite connection files to this directory |
+| `TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs; empty means no proxy is trusted |
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL/PostgreSQL. The queue uses the database driver by default; set
@@ -177,9 +182,14 @@ instance itself as sensitive.
   existing ciphertext still decrypts. Without an explicit `APP_KEY`, the
   container generates one on first boot and persists it to the data volume.
 - **Serve over HTTPS** behind a TLS-terminating reverse proxy (the container
-  serves plain HTTP on `:7432`). Then set `SESSION_SECURE_COOKIE=true` and, if
-  your proxy is not on the same Docker network, narrow the trusted-proxy setting in
-  `bootstrap/app.php` from `*` to your proxy's address.
+  serves plain HTTP on `:7432`). Then set `SESSION_SECURE_COOKIE=true`.
+- **Set `TRUSTED_PROXIES` to your proxy's IP or CIDR** whenever a proxy sits in
+  front of QueryProxy. No proxy is trusted by default, so until you set it the
+  app reads the connecting peer as the client: `X-Forwarded-Proto` is ignored
+  (HTTPS is not detected, so no HSTS header) and audit entries record the proxy's
+  address. Never set it to `*` — that lets any client forge `X-Forwarded-For`,
+  which both fakes the audit trail's client IP and hands out unlimited login and
+  2FA attempts, since those throttles are keyed per IP.
 - **Keep demo seeding off** (`QUERYPROXY_SEED_DEMO=false`, the default) on any
   reachable instance.
 - **Require 2FA** for privileged roles with `QUERYPROXY_REQUIRE_2FA=admins`
@@ -194,12 +204,19 @@ instance itself as sensitive.
 1. Create a Slack app → enable **Incoming Webhooks** (pick the approvals channel)
    and **Interactivity**, pointing the request URL to
    `https://your-host/webhooks/slack/interactions`.
-2. In QueryProxy: **ChatOps** (as DBA) → paste the webhook URL and the app's
-   **signing secret**.
+2. In QueryProxy: **ChatOps** → a DBA can set the webhook URL, but the app's
+   **signing secret** may only be entered or rotated by a system administrator,
+   and rotating it requires the current secret. That secret is what authenticates
+   every callback, so nobody who can submit or approve requests should be able to
+   choose it.
 3. In **Admin → Users**, fill each reviewer's **Slack member ID** (e.g. `U0123ABC`).
 
 Every callback is verified with Slack's `v0` HMAC-SHA256 signature scheme within a
-±5 minute replay window; forged or stale callbacks are rejected with `401`.
+±5 minute replay window; forged or stale callbacks are rejected with `401`. On top
+of the signature, each Approve / Reject button carries a single-use action token
+that is bound to that one request and expires after 24 hours, so a callback can
+only answer a message QueryProxy actually posted, and only once. Buttons from
+messages posted before this version no longer work — decide those in the web UI.
 
 ## Teams setup
 
@@ -215,12 +232,21 @@ Every callback is verified with Slack's `v0` HMAC-SHA256 signature scheme within
    ```
 
    ```json
-   { "action": "approve", "request_id": 123, "actor_id": "<AAD object id>" }
+   { "action": "approve", "request_id": 123, "actor_id": "<AAD object id>",
+     "token": "<action token>" }
    ```
 
+   `token` is required: QueryProxy puts a single-use, request-bound action token
+   in the `queryproxy` envelope of the card it sends, and the endpoint refuses any
+   call that does not echo a live one. It expires after 24 hours and is burned on
+   the first decision, so a captured call cannot be replayed.
+
    The approver is resolved through the admin-managed **Teams ID** mapping
-   (Admin → Users), never from a self-declared email — whoever holds the shared
-   secret must not be able to act as an arbitrary user.
+   (Admin → Users), never from a self-declared email, and must belong to the
+   integration's team. Note what the HMAC alone can and cannot prove: it shows the
+   caller knows the shared secret, not which person is acting. That is why the
+   secret is administrator-only and why the action token exists — keep the secret
+   out of the hands of anyone who submits or approves requests.
 
 ## SQL Server support
 
