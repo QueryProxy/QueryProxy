@@ -2,6 +2,8 @@
 
 **Self-hosted database access control & query approval portal.**
 
+[![Designed & Maintained with Tan](https://www.muhammetsafak.com.tr/badges/designed-maintained-with-tan.svg)](https://www.muhammetsafak.com.tr/en/tan/)
+
 QueryProxy sits between your developers and your databases. Instead of handing out
 production credentials, developers submit SQL through a guarded editor; DBAs approve
 or reject from the web UI or straight from Slack / Teams; approved queries run
