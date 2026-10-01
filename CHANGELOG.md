@@ -4,6 +4,14 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `.env.example` now sets `REDIS_QUEUE_RETRY_AFTER=330`. Laravel's fallback of
+  90 seconds is below the worker's 310-second timeout, so with
+  `QUEUE_CONNECTION=redis` a slow query could be re-reserved and executed twice.
+
 ## [0.2.0] — 2026-09-18
 
 ### Security
@@ -163,6 +171,7 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.0
 [0.1.3]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.3
 [0.1.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.2
