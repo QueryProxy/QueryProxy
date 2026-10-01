@@ -59,6 +59,21 @@ if [ "${DB_CONNECTION:-sqlite}" = "sqlite" ] && [ ! -f "$DB_DATABASE" ]; then
     touch "$DB_DATABASE"
 fi
 
+# Worker timings for supervisord.conf, derived from the single execution
+# timeout so they can never drift apart: the worker's --timeout leaves the
+# query 10s of headroom, supervisord waits another 10s before SIGKILL, and
+# the queue's retry_after (config/queue.php) adds 30s on top of the timeout.
+EXECUTION_TIMEOUT="${QUERYPROXY_EXECUTION_TIMEOUT:-300}"
+case "$EXECUTION_TIMEOUT" in
+    '' | *[!0-9]*)
+        echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' is not a whole number of seconds; using 300." >&2
+        EXECUTION_TIMEOUT=300
+        ;;
+esac
+QUERYPROXY_WORKER_TIMEOUT=$((10#$EXECUTION_TIMEOUT + 10))
+QUERYPROXY_WORKER_STOP_WAIT=$((10#$EXECUTION_TIMEOUT + 20))
+export QUERYPROXY_WORKER_TIMEOUT QUERYPROXY_WORKER_STOP_WAIT
+
 # Only the container that serves the app migrates, seeds and warms caches.
 # One-off commands (`docker run --rm <image> php artisan ...`) and split
 # worker/scheduler containers just inherit the environment resolved above.

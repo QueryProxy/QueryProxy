@@ -1,5 +1,21 @@
 <?php
 
+/*
+| Queue re-reservation window, derived from the query execution timeout.
+|
+| A job still running when `retry_after` elapses is handed to another worker
+| (or, with tries=1, marked failed) while the first one keeps going. The
+| window must therefore outlast the longest query plus the worker's own
+| --timeout margin: execution_timeout + 30 seconds. An explicit
+| *_QUEUE_RETRY_AFTER env value still wins. queryproxy.php may not be loaded
+| yet when this file is evaluated, so fall back to the same env variable.
+*/
+$executionTimeout = (int) (app()->bound('config') && config()->has('queryproxy.execution_timeout')
+    ? config('queryproxy.execution_timeout')
+    : env('QUERYPROXY_EXECUTION_TIMEOUT', 300));
+
+$retryAfter = $executionTimeout + 30;
+
 return [
 
     /*
@@ -40,7 +56,7 @@ return [
             'connection' => env('DB_QUEUE_CONNECTION'),
             'table' => env('DB_QUEUE_TABLE', 'jobs'),
             'queue' => env('DB_QUEUE', 'default'),
-            'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', 90),
+            'retry_after' => (int) env('DB_QUEUE_RETRY_AFTER', $retryAfter),
             'after_commit' => false,
         ],
 
@@ -48,7 +64,7 @@ return [
             'driver' => 'beanstalkd',
             'host' => env('BEANSTALKD_QUEUE_HOST', 'localhost'),
             'queue' => env('BEANSTALKD_QUEUE', 'default'),
-            'retry_after' => (int) env('BEANSTALKD_QUEUE_RETRY_AFTER', 90),
+            'retry_after' => (int) env('BEANSTALKD_QUEUE_RETRY_AFTER', $retryAfter),
             'block_for' => 0,
             'after_commit' => false,
         ],
@@ -68,7 +84,7 @@ return [
             'driver' => 'redis',
             'connection' => env('REDIS_QUEUE_CONNECTION', 'default'),
             'queue' => env('REDIS_QUEUE', 'default'),
-            'retry_after' => (int) env('REDIS_QUEUE_RETRY_AFTER', 90),
+            'retry_after' => (int) env('REDIS_QUEUE_RETRY_AFTER', $retryAfter),
             'block_for' => null,
             'after_commit' => false,
         ],

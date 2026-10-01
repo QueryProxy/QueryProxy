@@ -56,6 +56,7 @@ class QueryExecutor
 
         $connectionName = $this->factory->configure($connection);
         $start = hrtime(true);
+        $settled = false;
 
         try {
             $statements = $this->inspector->splitStatements($request->sql_prepared);
@@ -64,16 +65,37 @@ class QueryExecutor
                 throw new RuntimeException('No executable statements in prepared SQL.');
             }
 
-            if ($request->type === StatementType::Read && count($statements) === 1) {
-                $this->executeRead($request, $connectionName, $statements[0]);
-            } else {
-                $this->executeWrite($request, $connectionName, $statements);
+            $isRead = $request->type === StatementType::Read && count($statements) === 1;
+
+            $outcome = $isRead
+                ? $this->executeRead($request, $connectionName, $statements[0])
+                : $this->executeWrite($request, $connectionName, $statements);
+
+            $durationMs = intdiv(hrtime(true) - $start, 1_000_000);
+
+            // Conditional transition: if the query outlived the queue's
+            // retry_after window, the job's failed() handler (or another
+            // worker) may already have moved the request on. Never overwrite
+            // that verdict — the results land only while we still own the run.
+            $completed = QueryRequest::whereKey($request->id)
+                ->where('status', QueryRequestStatus::Running)
+                ->update([
+                    ...$outcome,
+                    'status' => QueryRequestStatus::Completed,
+                    'duration_ms' => $durationMs,
+                ]);
+
+            // From here on the request's state is final either way; anything
+            // that throws below is bookkeeping, not a query failure.
+            $settled = true;
+
+            if ($completed === 0) {
+                $this->discardLateCompletion($request, $outcome, $durationMs, $isRead);
+
+                return;
             }
 
-            $request->update([
-                'status' => QueryRequestStatus::Completed,
-                'duration_ms' => intdiv(hrtime(true) - $start, 1_000_000),
-            ]);
+            $request->refresh();
 
             audit()->record('request.execution_completed', actor: $request->reviewer, request: $request, metadata: [
                 'duration_ms' => $request->duration_ms,
@@ -86,17 +108,42 @@ class QueryExecutor
             // user- or auditor-visible; the full exception goes to the log.
             $safeMessage = $this->factory->redactError($e->getMessage(), $connection);
 
+            if ($settled) {
+                Log::error('Query execution finished, but recording its outcome failed.', [
+                    'query_request_id' => $request->id,
+                    'exception' => $e::class,
+                    'message' => $e->getMessage(),
+                ]);
+
+                return;
+            }
+
             Log::warning('Query execution failed.', [
                 'query_request_id' => $request->id,
                 'exception' => $e::class,
                 'message' => $e->getMessage(),
             ]);
 
-            $request->update([
-                'status' => QueryRequestStatus::Failed,
-                'duration_ms' => intdiv(hrtime(true) - $start, 1_000_000),
-                'error_message' => $safeMessage,
-            ]);
+            $durationMs = intdiv(hrtime(true) - $start, 1_000_000);
+
+            // Same ownership rule as the success path: a late driver error must
+            // not overwrite the verdict (and error message) of whoever moved
+            // the request out of Running first, e.g. the job's failed() handler.
+            $failed = QueryRequest::whereKey($request->id)
+                ->where('status', QueryRequestStatus::Running)
+                ->update([
+                    'status' => QueryRequestStatus::Failed,
+                    'duration_ms' => $durationMs,
+                    'error_message' => $safeMessage,
+                ]);
+
+            if ($failed === 0) {
+                $this->recordLateFailure($request, $durationMs, $safeMessage);
+
+                return;
+            }
+
+            $request->refresh();
 
             audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
                 'error' => $safeMessage,
@@ -107,7 +154,91 @@ class QueryExecutor
         }
     }
 
-    private function executeRead(QueryRequest $request, string $connectionName, string $sql): void
+    /**
+     * The run finished after the request left the Running state: drop what
+     * it produced and leave an audit trace instead of a completion record.
+     *
+     * A write may already be committed on the target database; rolling it
+     * back is not possible from here, so the audit entry says so explicitly.
+     *
+     * @param  array<string, mixed>  $outcome
+     */
+    private function discardLateCompletion(QueryRequest $request, array $outcome, int $durationMs, bool $isRead): void
+    {
+        $resultDiscarded = $isRead;
+
+        if (isset($outcome['result_disk'], $outcome['result_path'])) {
+            // A storage failure must not cost the audit trail; the leftover
+            // file is unreachable (no result_path) and expires via results:prune.
+            // Disks configured with 'throw' => false report a failed delete
+            // by returning false; the others throw.
+            $exception = null;
+
+            try {
+                $resultDiscarded = Storage::disk($outcome['result_disk'])->delete($outcome['result_path']) === true;
+            } catch (Throwable $e) {
+                $resultDiscarded = false;
+                $exception = $e::class;
+            }
+
+            if (! $resultDiscarded) {
+                Log::warning('Late query result could not be deleted from the result store.', array_filter([
+                    'query_request_id' => $request->id,
+                    'result_path' => $outcome['result_path'],
+                    'exception' => $exception,
+                ], fn ($value) => $value !== null));
+            }
+        }
+
+        $currentStatus = $this->currentStatus($request);
+
+        Log::warning('Query execution finished after the request left the running state; outcome not recorded.', [
+            'query_request_id' => $request->id,
+            'result_discarded' => $isRead ? $resultDiscarded : null,
+            'status' => $currentStatus,
+            'duration_ms' => $durationMs,
+        ]);
+
+        audit()->record('execution.late_completion', actor: $request->reviewer, request: $request, metadata: array_filter([
+            'duration_ms' => $durationMs,
+            'status' => $currentStatus,
+            'result_discarded' => $isRead ? $resultDiscarded : null,
+            'write_committed' => $isRead ? null : true,
+            'affected_rows' => $outcome['affected_rows'] ?? null,
+        ], fn ($value) => $value !== null));
+    }
+
+    /**
+     * The run errored after the request left the Running state: keep the
+     * existing verdict and record the late error as a late completion.
+     */
+    private function recordLateFailure(QueryRequest $request, int $durationMs, string $safeMessage): void
+    {
+        audit()->record('execution.late_completion', actor: $request->reviewer, request: $request, metadata: [
+            'duration_ms' => $durationMs,
+            'status' => $this->currentStatus($request),
+            'failed' => true,
+            'error' => $safeMessage,
+        ]);
+    }
+
+    /**
+     * The request's status as stored right now, as its raw string value.
+     */
+    private function currentStatus(QueryRequest $request): ?string
+    {
+        $status = QueryRequest::whereKey($request->id)->value('status');
+
+        return $status instanceof QueryRequestStatus ? $status->value : $status;
+    }
+
+    /**
+     * Stream a read query into the result store.
+     *
+     * @return array<string, mixed> result attributes for the request row,
+     *                              persisted only if the run still owns it
+     */
+    private function executeRead(QueryRequest $request, string $connectionName, string $sql): array
     {
         $disk = $this->resultDisk();
         $path = sprintf('results/%d/%d.ndjson', $request->team_id, $request->id);
@@ -147,13 +278,13 @@ class QueryExecutor
             rewind($temp);
             Storage::disk($disk)->put($path, $temp);
 
-            $request->update([
+            return [
                 'result_disk' => $disk,
                 'result_path' => $path,
                 'result_row_count' => $rowCount,
                 'result_truncated' => $truncated,
-                'result_columns' => $columns,
-            ]);
+                'result_columns' => json_encode($columns),
+            ];
         } finally {
             if (is_resource($temp)) {
                 fclose($temp);
@@ -192,8 +323,9 @@ class QueryExecutor
 
     /**
      * @param  list<string>  $statements
+     * @return array<string, mixed> result attributes for the request row
      */
-    private function executeWrite(QueryRequest $request, string $connectionName, array $statements): void
+    private function executeWrite(QueryRequest $request, string $connectionName, array $statements): array
     {
         $connection = DB::connection($connectionName);
 
@@ -212,6 +344,6 @@ class QueryExecutor
             ? $connection->transaction($run)
             : $run();
 
-        $request->update(['affected_rows' => $affected]);
+        return ['affected_rows' => $affected];
     }
 }
