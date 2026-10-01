@@ -120,6 +120,8 @@ class QueryStudio extends Component
     {
         return view('livewire.studio.query-studio', [
             'connections' => $this->usableConnections(),
+            'hasNoEnabledMaskingRules' => ! $this->team()->hasEnabledMaskingRules(),
+            'hasNoMaskingRules' => ! $this->team()->maskingRules()->exists(),
         ]);
     }
 }

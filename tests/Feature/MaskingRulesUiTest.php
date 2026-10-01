@@ -41,7 +41,7 @@ test('a dba can create a column rule', function () {
 });
 
 test('invalid regex patterns are rejected', function () {
-    [, $dba] = maskingSetup();
+    [$team, $dba] = maskingSetup();
 
     Livewire::actingAs($dba)
         ->test(Index::class)
@@ -53,7 +53,9 @@ test('invalid regex patterns are rejected', function () {
         ->call('save')
         ->assertHasErrors('pattern');
 
-    expect(MaskingRule::count())->toBe(0);
+    // New teams start with the defaults; the rejected rule must not be added.
+    expect(MaskingRule::where('team_id', $team->id)->count())->toBe(count(MaskingRule::defaults()))
+        ->and(MaskingRule::where('name', 'Broken')->exists())->toBeFalse();
 });
 
 test('defaults can be added idempotently', function () {

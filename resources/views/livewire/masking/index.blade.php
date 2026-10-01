@@ -8,6 +8,18 @@
         </x-slot:actions>
     </x-ui.page-header>
 
+    @if ($hasNoEnabledRules)
+        <x-ui.alert tone="danger" icon="alert" class="mb-3.5">
+            @if ($hasNoRules)
+                This team has no masking rules — query results are returned unmasked.
+                <x-ui.action wire:click="addDefaults" tone="accent" class="ml-1">Add default rules</x-ui.action>
+            @else
+                This team has no enabled masking rules — query results are returned unmasked.
+                Every rule below is disabled; enable the ones you need.
+            @endif
+        </x-ui.alert>
+    @endif
+
     @if ($showForm)
         <x-ui.panel padded class="mb-3.5 border-accent-line">
             <h2 class="mb-3.5 font-display text-[13px] font-semibold text-ink">{{ $editingId ? 'Edit rule' : 'New rule' }}</h2>

@@ -4,6 +4,7 @@ namespace App\Livewire\Admin;
 
 use App\Models\QueryRequest;
 use App\Models\Team;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Title;
@@ -40,9 +41,15 @@ class Teams extends Component
             $slug = $base.'-'.++$i;
         }
 
-        $team = Team::create(['name' => $this->name, 'slug' => $slug]);
+        // The team row, its default masking rules (Team's `created` hook) and
+        // the audit entry land together or not at all.
+        $team = DB::transaction(function () use ($slug) {
+            $team = Team::create(['name' => $this->name, 'slug' => $slug]);
 
-        audit()->record('team.created', team: $team, metadata: ['name' => $team->name]);
+            audit()->record('team.created', team: $team, metadata: ['name' => $team->name]);
+
+            return $team;
+        });
 
         $this->reset('name');
         session()->flash('status', "Team \"{$team->name}\" created.");

@@ -10,6 +10,16 @@
         </x-slot:actions>
     </x-ui.page-header>
 
+    @if ($hasNoEnabledMaskingRules)
+        <x-ui.alert tone="danger" icon="alert" class="mb-3.5">
+            @if ($hasNoMaskingRules)
+                This team has no masking rules — query results are returned unmasked. Ask a DBA to add masking rules.
+            @else
+                This team has no enabled masking rules — query results are returned unmasked. Ask a DBA to enable masking rules.
+            @endif
+        </x-ui.alert>
+    @endif
+
     @if ($connections->isEmpty())
         <x-ui.alert tone="pending" icon="lock">
             You don't have access to any connection in this team yet. Ask a DBA to grant you one.

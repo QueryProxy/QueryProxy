@@ -154,12 +154,7 @@ class Index extends Component
         $team = $this->team();
         $this->assertDba($team);
 
-        foreach (MaskingRule::defaults() as $default) {
-            MaskingRule::firstOrCreate(
-                ['team_id' => $team->id, 'pattern' => $default['pattern'], 'match_type' => $default['match_type']],
-                $default,
-            );
-        }
+        $team->installDefaultMaskingRules();
 
         audit()->record('masking_rule.defaults_added', team: $team);
     }
@@ -176,9 +171,12 @@ class Index extends Component
     public function render()
     {
         $team = $this->team();
+        $rules = MaskingRule::forTeam($team)->with('connection')->orderBy('name')->get();
 
         return view('livewire.masking.index', [
-            'rules' => MaskingRule::forTeam($team)->with('connection')->orderBy('name')->get(),
+            'rules' => $rules,
+            'hasNoRules' => $rules->isEmpty(),
+            'hasNoEnabledRules' => $rules->where('enabled', true)->isEmpty(),
             'connections' => Connection::forTeam($team)->orderBy('name')->get(),
             'matchTypes' => MaskMatchType::cases(),
             'strategies' => MaskStrategy::cases(),

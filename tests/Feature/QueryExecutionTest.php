@@ -58,12 +58,15 @@ test('a read request streams results to ndjson storage', function () {
     $lines = array_filter(explode("\n", Storage::disk('local')->get($request->result_path)));
 
     expect($lines)->toHaveCount(3)
-        ->and(json_decode($lines[0], true))->toBe([1, 'Ada Lovelace', 'ada@example.com']);
+        // New teams start with the default masking rules, so `email` is masked.
+        ->and(json_decode($lines[0], true))->toBe([1, 'Ada Lovelace', 'a***@***.com']);
 });
 
 test('masking rules are applied before results hit storage', function () {
     [$request, , $team] = executionSetup('SELECT name, email FROM customers ORDER BY id LIMIT 10');
 
+    // Start from an empty rule set so only the rule below can do the masking.
+    $team->maskingRules()->delete();
     MaskingRule::factory()->create(['team_id' => $team->id]);
 
     app(QueryExecutor::class)->execute($request);

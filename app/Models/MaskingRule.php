@@ -42,14 +42,19 @@ class MaskingRule extends Model
     }
 
     /**
-     * Sensible defaults every team starts from.
+     * The default rule set.
+     *
+     * Installed automatically for every team created from now on (Team's
+     * `created` hook calls Team::installDefaultMaskingRules()). Teams that
+     * already existed are not backfilled; a DBA adds the set from the masking
+     * page ("Add default rules"), which runs the same idempotent install.
      *
      * Column rules only ever see the *output* column name of the result set,
      * which the query author controls: `SELECT api_key AS k` defeats every
      * `*api_key*` pattern. The secret-shaped content rules below are the
      * backstop for exactly that — they match on the value, so an aliased (or
      * expression-wrapped) secret is still caught. They are deliberately
-     * narrow: this set is applied to every new team, and an over-broad pattern
+     * narrow: this set is installed for every new team, and an over-broad pattern
      * would mask ordinary rows and make results useless.
      *
      * @return list<array{name: string, match_type: string, pattern: string, strategy: string}>

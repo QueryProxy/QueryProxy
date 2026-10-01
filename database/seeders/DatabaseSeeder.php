@@ -3,7 +3,6 @@
 namespace Database\Seeders;
 
 use App\Enums\TeamRole;
-use App\Models\MaskingRule;
 use App\Models\Team;
 use App\Models\User;
 use Illuminate\Database\Seeder;
@@ -53,9 +52,7 @@ class DatabaseSeeder extends Seeder
             );
         }
 
-        foreach (MaskingRule::defaults() as $default) {
-            MaskingRule::create($default + ['team_id' => $team->id]);
-        }
+        // The default masking rules are installed by Team's `created` hook.
 
         $this->command?->warn('Demo accounts created (admin@example.com, dba@example.com, developer@example.com, auditor@example.com).');
         $this->command?->warn("Demo password (shown only once): {$password}");
