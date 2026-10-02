@@ -1538,3 +1538,114 @@ test('multibyte text does not move statement boundaries', function (DbDriver $dr
     'pgsql' => DbDriver::Pgsql,
     'sqlsrv' => DbDriver::Sqlsrv,
 ]);
+
+// --- Dynamic SQL and CTE bodies ---
+
+test('a statement held in dynamic SQL or a CTE is judged like a top-level one', function (string $sql, DbDriver $driver, string $violation) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toContain($violation);
+})->with([
+    'sqlsrv, EXEC literal' => ["EXEC('DELETE FROM t')", DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'sqlsrv, sp_executesql' => ["EXEC sp_executesql N'UPDATE t SET a = 1'", DbDriver::Sqlsrv, 'Statement 1: UPDATE without a WHERE clause is not allowed.'],
+    'sqlsrv, sp_executesql with a named @stmt' => ["EXEC sp_executesql @stmt = N'DELETE FROM t'", DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'sqlsrv, EXEC of an N literal' => ["EXEC(N'DELETE FROM t')", DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'sqlsrv, sp_executesql without EXEC' => ["sp_executesql N'DELETE FROM t'", DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'sqlsrv, INSERT ... EXEC literal' => ["INSERT INTO t EXEC('DELETE FROM x')", DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'sqlsrv, procedure in an EXEC literal' => ["EXEC('EXEC xp_cmdshell ''dir''')", DbDriver::Sqlsrv, 'Statement 1: xp_cmdshell is not allowed through QueryProxy: it runs operating-system commands, changes the server configuration or reaches another server.'],
+    'sqlsrv, WITH ... DELETE' => ['WITH a AS (SELECT 1 AS x) DELETE FROM t', DbDriver::Sqlsrv, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'mysql, WITH ... DELETE' => ['WITH a AS (SELECT 1 AS x) DELETE FROM t', DbDriver::Mysql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'pgsql, WITH ... UPDATE' => ['WITH a AS (SELECT 1) UPDATE t SET x = 1', DbDriver::Pgsql, 'Statement 1: UPDATE without a WHERE clause is not allowed.'],
+    'pgsql, DELETE in a CTE' => ['WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d', DbDriver::Pgsql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'pgsql, UPDATE in a second CTE' => ['WITH a AS (SELECT 1), b AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM b', DbDriver::Pgsql, 'Statement 1: UPDATE without a WHERE clause is not allowed.'],
+    'pgsql, DELETE in a CTE with its own WITH' => ['WITH d AS (WITH x AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM d', DbDriver::Pgsql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'pgsql, UPDATE in a CTE with its own WITH' => ['WITH d AS (WITH x AS (SELECT 1) UPDATE t SET a = 1 RETURNING *) SELECT * FROM d', DbDriver::Pgsql, 'Statement 1: UPDATE without a WHERE clause is not allowed.'],
+    'pgsql, DELETE two WITH levels down' => ['WITH d AS (WITH e AS (WITH f AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM e) SELECT * FROM d', DbDriver::Pgsql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'pgsql, WITH RECURSIVE ... DELETE' => ['WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) DELETE FROM t', DbDriver::Pgsql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'mysql, WITH RECURSIVE ... DELETE' => ['WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) DELETE FROM t', DbDriver::Mysql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'pgsql, PREPARE ... AS' => ['PREPARE s AS DELETE FROM t', DbDriver::Pgsql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'mysql, PREPARE ... FROM' => ["BEGIN; PREPARE s FROM 'DELETE FROM t'; EXECUTE s; COMMIT;", DbDriver::Mysql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+    'mysql, EXECUTE IMMEDIATE' => ["EXECUTE IMMEDIATE 'DELETE FROM t'", DbDriver::Mysql, 'Statement 1: DELETE without a WHERE clause is not allowed.'],
+]);
+
+test('dynamic SQL QueryProxy cannot read is rejected', function (string $sql, DbDriver $driver, string $reason) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($reason);
+})->with([
+    'sqlsrv, EXEC of a variable' => ['EXEC(@sql)', DbDriver::Sqlsrv, 'EXEC (...) with a statement QueryProxy cannot read'],
+    'sqlsrv, sp_executesql of a variable' => ['EXEC sp_executesql @stmt', DbDriver::Sqlsrv, 'sp_executesql with a statement QueryProxy cannot read'],
+    'sqlsrv, EXEC of a concatenation' => ["EXEC('SELECT 1' + 'x')", DbDriver::Sqlsrv, 'EXEC (...) with a statement QueryProxy cannot read'],
+    'sqlsrv, EXEC on a linked server' => ["EXEC('SELECT 1') AT srv", DbDriver::Sqlsrv, 'EXEC (...) with a statement QueryProxy cannot read'],
+    'sqlsrv, EXEC as another user' => ["EXEC('SELECT 1') AS USER = 'x'", DbDriver::Sqlsrv, 'EXEC (...) with a statement QueryProxy cannot read'],
+    'sqlsrv, backslash in the literal' => ["EXEC('SELECT ''a\\b''')", DbDriver::Sqlsrv, 'EXEC (...) with a statement QueryProxy cannot read'],
+    'sqlsrv, sp_msforeachtable' => ["EXEC sp_msforeachtable 'DELETE FROM ?'", DbDriver::Sqlsrv, 'sp_msforeachtable is not allowed through QueryProxy'],
+    'sqlsrv, sp_send_dbmail' => ["EXEC msdb.dbo.sp_send_dbmail @query = 'SELECT 1'", DbDriver::Sqlsrv, 'sp_send_dbmail is not allowed through QueryProxy'],
+    'sqlsrv, sp_send_dbmail without a query' => ["EXEC msdb.dbo.sp_send_dbmail @recipients = 'a@b.c', @body = 'x'", DbDriver::Sqlsrv, 'sp_send_dbmail is not allowed through QueryProxy'],
+    'sqlsrv, sp_prepexec' => ["EXEC sp_prepexec @h OUTPUT, NULL, N'DELETE FROM t'", DbDriver::Sqlsrv, 'sp_prepexec is not allowed through QueryProxy'],
+    'sqlsrv, transaction control in EXEC' => ["EXEC('BEGIN TRAN; DELETE FROM t WHERE id = 1; COMMIT TRAN')", DbDriver::Sqlsrv, 'Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch'],
+    'sqlsrv, COMMIT TRANSACTION in EXEC' => ["EXEC('DELETE FROM t WHERE id = 1; COMMIT TRANSACTION')", DbDriver::Sqlsrv, 'Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch'],
+    'mysql, PREPARE from a variable' => ['BEGIN; PREPARE s FROM @q; EXECUTE s; COMMIT;', DbDriver::Mysql, 'a PREPARE QueryProxy cannot read'],
+    'mysql, EXECUTE IMMEDIATE of an expression' => ["EXECUTE IMMEDIATE CONCAT('DELETE', ' FROM t')", DbDriver::Mysql, 'EXECUTE IMMEDIATE with a statement QueryProxy cannot read'],
+    'mysql, transaction control in EXECUTE IMMEDIATE' => ["EXECUTE IMMEDIATE 'COMMIT'", DbDriver::Mysql, 'transaction control inside dynamic SQL is not allowed'],
+    'pgsql, WITH clause without a body' => ['WITH a AS SELECT 1', DbDriver::Pgsql, 'a WITH clause QueryProxy cannot read'],
+]);
+
+test('transaction control in SQL Server dynamic SQL is reported once', function () {
+    expect(inspect("EXEC('ROLLBACK')", DbDriver::Sqlsrv)->violations)->toBe([
+        'Statement 1: Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch is not allowed: QueryProxy runs the request in its own transaction.',
+    ]);
+});
+
+test('readable dynamic SQL and CTEs that follow the rules pass as writes', function (string $sql, DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'sqlsrv, EXEC literal' => ["EXEC('DELETE FROM t WHERE id = 1')", DbDriver::Sqlsrv],
+    'sqlsrv, sp_executesql with parameters' => ["EXEC sp_executesql N'UPDATE t SET a = 1 WHERE id = @id', N'@id int', @id = 1", DbDriver::Sqlsrv],
+    'sqlsrv, sp_executesql with a named @stmt and WHERE' => ["EXEC sp_executesql @stmt = N'DELETE FROM t WHERE id = 1'", DbDriver::Sqlsrv],
+    'sqlsrv, EXEC of an N literal with WHERE' => ["EXEC(N'DELETE FROM t WHERE id = 1')", DbDriver::Sqlsrv],
+    'pgsql, DELETE in a CTE with its own WITH and WHERE' => ['WITH d AS (WITH x AS (SELECT 1) DELETE FROM t WHERE id = 1 RETURNING *) SELECT * FROM d', DbDriver::Pgsql],
+    'sqlsrv, module call' => ['EXEC dbo.my_proc 1', DbDriver::Sqlsrv],
+    'sqlsrv, read through EXEC' => ["EXEC('SELECT 1')", DbDriver::Sqlsrv],
+    'sqlsrv, WITH ... DELETE with WHERE' => ['WITH a AS (SELECT 1 AS x) DELETE FROM t WHERE id = 1', DbDriver::Sqlsrv],
+    'pgsql, DELETE in a CTE with WHERE' => ['WITH d AS (DELETE FROM t WHERE id = 1 RETURNING *) SELECT * FROM d', DbDriver::Pgsql],
+    'pgsql, PREPARE ... AS with WHERE' => ['PREPARE s (int) AS DELETE FROM t WHERE id = $1', DbDriver::Pgsql],
+    'mysql, PREPARE ... FROM with WHERE' => ["BEGIN; PREPARE s FROM 'DELETE FROM t WHERE id = 1'; EXECUTE s; COMMIT;", DbDriver::Mysql],
+    'mysql, EXECUTE IMMEDIATE with WHERE' => ["EXECUTE IMMEDIATE 'DELETE FROM t WHERE id = ?' USING 1", DbDriver::Mysql],
+]);
+
+test('dynamic SQL nests up to the depth limit', function () {
+    $atLimit = inspect("EXEC('EXEC(''EXEC(''''SELECT 1'''')'')')", DbDriver::Sqlsrv);
+    $pastLimit = inspect("EXEC('EXEC(''EXEC(''''EXEC(''''''''SELECT 1'''''''')'''')'')')", DbDriver::Sqlsrv);
+
+    expect($atLimit->violations)->toBe([])
+        ->and($pastLimit->violations)->toContain('Statement 1: statements nested more than 3 levels deep are not allowed.');
+});
+
+test('WITH clauses inside CTE bodies nest up to the depth limit', function () {
+    $atLimit = inspect('WITH a AS (WITH b AS (WITH c AS (WITH e AS (SELECT 1) SELECT 1) SELECT 1) SELECT 1) SELECT * FROM a', DbDriver::Pgsql);
+    $pastLimit = inspect('WITH a AS (WITH b AS (WITH c AS (WITH e AS (WITH f AS (SELECT 1) SELECT 1) SELECT 1) SELECT 1) SELECT 1) SELECT * FROM a', DbDriver::Pgsql);
+
+    expect($atLimit->violations)->toBe([])
+        ->and($atLimit->type())->toBe(StatementType::Read)
+        ->and($pastLimit->violations)->toContain('Statement 1: statements nested more than 3 levels deep are not allowed.');
+});
+
+test('read-only WITH clauses and exec as a name keep passing as reads', function (string $sql, DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'sqlsrv, XMLNAMESPACES' => ["WITH XMLNAMESPACES ('uri' AS ns) SELECT 1", DbDriver::Sqlsrv],
+    'sqlsrv, bracketed CTE name' => ['WITH [a] AS (SELECT 1) SELECT * FROM a', DbDriver::Sqlsrv],
+    'pgsql, NOT MATERIALIZED' => ['WITH a AS NOT MATERIALIZED (SELECT 1) SELECT * FROM a', DbDriver::Pgsql],
+    'pgsql, SEARCH and CYCLE' => ['WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET is_cycle USING path SELECT * FROM r', DbDriver::Pgsql],
+    'pgsql, CTE with its own read-only WITH' => ['WITH d AS (WITH x AS (SELECT 1) SELECT * FROM x) SELECT * FROM d', DbDriver::Pgsql],
+    'pgsql, exec as a function name' => ['SELECT exec(a) FROM t', DbDriver::Pgsql],
+]);

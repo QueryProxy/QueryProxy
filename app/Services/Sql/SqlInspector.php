@@ -140,6 +140,43 @@ class SqlInspector
     private const MAX_NESTING_DEPTH = 3;
 
     /**
+     * What SQL Server's batch reader reports for BEGIN TRAN, COMMIT, ROLLBACK
+     * or SAVE TRAN inside a batch.
+     */
+    private const SQLSRV_TRANSACTION_CONTROL_VIOLATION = 'Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch is not allowed: QueryProxy runs the request in its own transaction.';
+
+    /**
+     * SQL Server procedures that run, schedule or send a statement passed to
+     * them as text, in a form the guard does not read: prepared and cursor
+     * handles, the per-table / per-database loops, the legacy sp_sqlexec, a
+     * mail with a query attached and a SQL Agent job step. Invoking one is
+     * rejected. sp_executesql is not listed: its statement argument is read
+     * and inspected (see dynamicSqlViolations()).
+     *
+     * This list is an exception to D-13 (b), which keeps "EXEC procedure"
+     * a Write: by user decision (2026-10-02, phase 03 review round 1) every
+     * procedure here is refused regardless of its arguments — including
+     * sp_send_dbmail and the job step procedures called without a query or
+     * command — because the SQL they can run is not visible to the guard.
+     */
+    private const DYNAMIC_SQL_PROCEDURES = [
+        'sp_prepare',
+        'sp_prepexec',
+        'sp_prepexecrpc',
+        'sp_execute',
+        'sp_cursoropen',
+        'sp_cursorprepare',
+        'sp_cursorprepexec',
+        'sp_msforeachtable',
+        'sp_msforeachdb',
+        'sp_msforeach_worker',
+        'sp_sqlexec',
+        'sp_send_dbmail',
+        'sp_add_jobstep',
+        'sp_update_jobstep',
+    ];
+
+    /**
      * Stands in for a SQL Server "#" (temporary table marker) while the
      * statement is inspected; see maskTemporaryTableMarkers().
      */
@@ -351,20 +388,7 @@ class SqlInspector
     {
         $violations = [];
 
-        [$sql, $lexicalViolation] = $this->resolveComments($sql, $driver);
-        $lexicalViolation ??= $this->unicodeEscapeClauseViolation($sql, $driver);
-        $lexicalViolation ??= $this->dollarQuoteDialectViolation($sql, $driver);
-        $dialectRanges = null;
-
-        if ($lexicalViolation === null && ($driver === DbDriver::Sqlsrv || $driver === DbDriver::Sqlite)) {
-            [$sql, $dialectRanges, $lexicalViolation] = $this->maskTemporaryTableMarkers($sql, $driver);
-        }
-
-        $lexicalViolation ??= $this->dialectCommentViolation($sql, $driver);
-
-        if ($lexicalViolation === null && $dialectRanges !== null && $driver !== null) {
-            $lexicalViolation = $this->dialectLexicalViolation($sql, $dialectRanges, $driver);
-        }
+        [$sql, $lexicalViolation] = $this->lexicalView($sql, $driver);
 
         if ($lexicalViolation !== null) {
             return new InspectionResult([], false, [$this->unmaskTemporaryTableMarkers($lexicalViolation)]);
@@ -411,6 +435,36 @@ class SqlInspector
         }
 
         return new InspectionResult($infos, $isTransaction, array_values(array_unique($violations)));
+    }
+
+    /**
+     * The lexical checks every piece of SQL text goes through before it is
+     * split and judged — the top-level request and every statement held in
+     * a string that a dynamic-SQL command runs: comments resolved the way
+     * the server reads them, U& escapes, dollar quoting and the SQL Server /
+     * SQLite quoting rules. Returns the text the guard reads (comments
+     * resolved, SQL Server "#" masked) and the first lexical violation.
+     *
+     * @return array{0: string, 1: ?string}
+     */
+    private function lexicalView(string $sql, ?DbDriver $driver): array
+    {
+        [$sql, $lexicalViolation] = $this->resolveComments($sql, $driver);
+        $lexicalViolation ??= $this->unicodeEscapeClauseViolation($sql, $driver);
+        $lexicalViolation ??= $this->dollarQuoteDialectViolation($sql, $driver);
+        $dialectRanges = null;
+
+        if ($lexicalViolation === null && ($driver === DbDriver::Sqlsrv || $driver === DbDriver::Sqlite)) {
+            [$sql, $dialectRanges, $lexicalViolation] = $this->maskTemporaryTableMarkers($sql, $driver);
+        }
+
+        $lexicalViolation ??= $this->dialectCommentViolation($sql, $driver);
+
+        if ($lexicalViolation === null && $dialectRanges !== null && $driver !== null) {
+            $lexicalViolation = $this->dialectLexicalViolation($sql, $dialectRanges, $driver);
+        }
+
+        return [$sql, $lexicalViolation];
     }
 
     /**
@@ -580,6 +634,17 @@ class SqlInspector
         // start with a keyword that a split on spaces would not see.
         [$keyword, $wrappingParens] = $this->leadingKeyword($tokens);
 
+        // A statement held in a string (EXEC('...'), sp_executesql,
+        // PREPARE, EXECUTE IMMEDIATE) or in a CTE body is judged with the
+        // rules a top-level statement gets; a statement the guard cannot
+        // read that way is rejected.
+        [$dynamicViolations, $runsDynamicSql] = $this->dynamicSqlViolations($sql, $tokens, $position, $driver, $depth);
+        array_push($violations, ...$dynamicViolations);
+
+        if ($keyword === 'WITH') {
+            array_push($violations, ...$this->commonTableExpressionViolations($sql, $tokens, $wrappingParens, $position, $driver, $depth));
+        }
+
         // Only a statement that runs has function-call effects; a plain
         // EXPLAIN plans its statement without running it. EXPLAIN ANALYZE
         // returns early and its inner statement is judged on its own.
@@ -636,7 +701,7 @@ class SqlInspector
             $type = StatementType::Read;
         }
 
-        if ($functionWrites) {
+        if ($functionWrites || $runsDynamicSql) {
             $type = StatementType::Write;
         }
 
@@ -685,7 +750,7 @@ class SqlInspector
      *
      * @return array{0: StatementInfo, 1: list<string>}
      */
-    private function analyzeSqlsrvBatch(string $sql, int $position): array
+    private function analyzeSqlsrvBatch(string $sql, int $position, int $depth = 0): array
     {
         $label = "Statement {$position}";
         $parts = $this->sqlsrvBatchParts($sql);
@@ -695,7 +760,7 @@ class SqlInspector
         }
 
         if (count($parts) === 1 && ! $parts[0][1]) {
-            return $this->analyzeStatement($sql, $position, DbDriver::Sqlsrv);
+            return $this->analyzeStatement($sql, $position, DbDriver::Sqlsrv, $depth);
         }
 
         $violations = [];
@@ -716,7 +781,7 @@ class SqlInspector
                 [$partType, $partViolations] = $this->analyzeSqlsrvControl($text, $label);
                 $preparedSql .= $slice;
             } else {
-                [$info, $partViolations] = $this->analyzeStatement($text, $position, DbDriver::Sqlsrv);
+                [$info, $partViolations] = $this->analyzeStatement($text, $position, DbDriver::Sqlsrv, $depth);
                 $partType = $info->type;
                 $isDdl = $isDdl || $info->isDdl;
                 $limitInjected = $limitInjected || $info->limitInjected;
@@ -1227,7 +1292,7 @@ class SqlInspector
 
             if (in_array($word, ['COMMIT', 'ROLLBACK', 'SAVE'], true)
                 || ($word === 'BEGIN' && in_array($nextWord, ['TRAN', 'TRANSACTION', 'DISTRIBUTED'], true))) {
-                return 'Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch is not allowed: QueryProxy runs the request in its own transaction.';
+                return self::SQLSRV_TRANSACTION_CONTROL_VIOLATION;
             }
 
             $statement = null;
@@ -2033,6 +2098,461 @@ class SqlInspector
         }
 
         return $this->analyzeStatement($sql, $position, $driver, $depth + 1);
+    }
+
+    /**
+     * The statements a statement runs from text — the rules a top-level
+     * statement gets, applied to each of them — and whether it runs one:
+     *
+     *  - SQL Server (and an unknown driver): EXEC ('...') / EXEC (N'...'),
+     *    sp_executesql with a literal statement (bare, after EXEC, or named
+     *
+     *    @stmt = ...), and the procedures in
+     *    {@see self::DYNAMIC_SQL_PROCEDURES}, which are refused outright;
+     *  - every driver: EXECUTE IMMEDIATE '...' (MariaDB) and PREPARE ...
+     *    FROM '...' (MySQL) / PREPARE ... AS <statement> (PostgreSQL).
+     *
+     * Only a single, plain string literal is read. A variable, an
+     * expression, a concatenation, a literal the dialects read differently
+     * (a backslash) and anything after the literal that changes where or as
+     * whom it runs (EXEC (...) AT server, EXEC (...) AS USER) is refused:
+     * QueryProxy cannot see the statement that would run.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: list<string>, 1: bool}
+     */
+    private function dynamicSqlViolations(string $sql, array $tokens, int $position, ?DbDriver $driver, int $depth): array
+    {
+        $label = "Statement {$position}";
+        $sqlsrv = $driver === null || $driver === DbDriver::Sqlsrv;
+        $violations = [];
+        $runsDynamicSql = false;
+
+        if ($this->isWordAt($tokens, 0, 'PREPARE')) {
+            $runsDynamicSql = true;
+            array_push($violations, ...$this->prepareViolations($sql, $tokens, $position, $driver, $depth));
+        }
+
+        for ($index = 0, $count = count($tokens); $index < $count; $index++) {
+            $exec = $this->isWordAt($tokens, $index, 'EXEC') || $this->isWordAt($tokens, $index, 'EXECUTE');
+
+            if ($exec && $this->isWordAt($tokens, $index + 1, 'IMMEDIATE')) {
+                $runsDynamicSql = true;
+                [$text, $end] = $this->stringLiteralAt($tokens, $index + 2);
+
+                if ($text === null || (isset($tokens[$end + 1]) && ! $this->isWordAt($tokens, $end + 1, 'USING'))) {
+                    $violations[] = "{$label}: EXECUTE IMMEDIATE with a statement QueryProxy cannot read (a variable, an expression or a concatenation) is not allowed.";
+                } else {
+                    array_push($violations, ...$this->analyzeDynamicSql($text, $position, $driver, $depth));
+                }
+
+                continue;
+            }
+
+            if (! $sqlsrv) {
+                continue;
+            }
+
+            $start = $exec ? $this->execTargetAt($tokens, $index) : ($index === 0 ? 0 : null);
+
+            if ($start === null || ! isset($tokens[$start])) {
+                continue;
+            }
+
+            if ($exec && $this->isOperator($tokens[$start], '(')) {
+                $runsDynamicSql = true;
+                [$text, $end] = $this->stringLiteralAt($tokens, $start + 1);
+                $close = $tokens[$end + 1] ?? null;
+
+                if ($text === null || $close === null || ! $this->isOperator($close, ')') || isset($tokens[$end + 2])) {
+                    $violations[] = "{$label}: EXEC (...) with a statement QueryProxy cannot read (a variable, an expression, a concatenation or a remote / impersonated run) is not allowed.";
+                } else {
+                    array_push($violations, ...$this->analyzeDynamicSql($text, $position, $driver, $depth));
+                }
+
+                continue;
+            }
+
+            [$procedure, $nameEnd] = $this->multipartNameAt($tokens, $start);
+
+            if ($procedure === 'sp_executesql') {
+                $runsDynamicSql = true;
+                $argument = $nameEnd + 1;
+                $parameter = $tokens[$argument] ?? null;
+
+                if ($parameter !== null && $parameter->type === TokenType::Symbol
+                    && strtolower((string) $parameter->token) === '@stmt'
+                    && isset($tokens[$argument + 1]) && $this->isOperator($tokens[$argument + 1], '=')) {
+                    $argument += 2;
+                }
+
+                [$text, $end] = $this->stringLiteralAt($tokens, $argument);
+                $next = $tokens[$end + 1] ?? null;
+
+                if ($text === null || ($next !== null && ! $this->isOperator($next, ','))) {
+                    $violations[] = "{$label}: sp_executesql with a statement QueryProxy cannot read (a variable, an expression or a concatenation) is not allowed.";
+                } else {
+                    array_push($violations, ...$this->analyzeDynamicSql($text, $position, $driver, $depth));
+                }
+            } elseif ($procedure !== null && $this->matchesFunctionList($procedure, self::DYNAMIC_SQL_PROCEDURES)) {
+                $runsDynamicSql = true;
+                $violations[] = "{$label}: {$procedure} is not allowed through QueryProxy: it runs a statement QueryProxy cannot read.";
+            }
+        }
+
+        return [array_values(array_unique($violations)), $runsDynamicSql];
+    }
+
+    /**
+     * The statement a PREPARE stores, judged as if it ran: PostgreSQL's
+     * "PREPARE name [(types)] AS <statement>" and MySQL's "PREPARE name FROM
+     * '<statement>'". A statement held in a variable (FROM @q) or built by an
+     * expression cannot be read and is refused.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function prepareViolations(string $sql, array $tokens, int $position, ?DbDriver $driver, int $depth): array
+    {
+        $unreadable = ["Statement {$position}: a PREPARE QueryProxy cannot read (a statement held in a variable, an expression or a concatenation) is not allowed."];
+
+        if (! isset($tokens[1])) {
+            return $unreadable;
+        }
+
+        [$name, $index] = $this->namePartAt($tokens, 1);
+
+        if ($name === null) {
+            return $unreadable;
+        }
+
+        $index++;
+
+        if (isset($tokens[$index]) && $this->isOperator($tokens[$index], '(')) {
+            $close = $this->matchingParenthesisAt($tokens, $index);
+
+            if ($close === null) {
+                return $unreadable;
+            }
+
+            $index = $close + 1;
+        }
+
+        if ($this->isWordAt($tokens, $index, 'AS') && isset($tokens[$index + 1])) {
+            $statement = trim(mb_substr($this->maskDollarQuoted($sql), (int) $tokens[$index + 1]->position));
+
+            return $this->analyzeNestedStatement($statement, $position, $driver, $depth)[1];
+        }
+
+        if ($this->isWordAt($tokens, $index, 'FROM')) {
+            [$text, $end] = $this->stringLiteralAt($tokens, $index + 1);
+
+            if ($text === null || isset($tokens[$end + 1])) {
+                return $unreadable;
+            }
+
+            return $this->analyzeDynamicSql($text, $position, $driver, $depth);
+        }
+
+        return $unreadable;
+    }
+
+    /**
+     * Judge SQL text that a statement runs (EXEC ('...'), sp_executesql,
+     * EXECUTE IMMEDIATE, PREPARE ... FROM) exactly as a top-level request:
+     * the same lexical checks, the same statement split and — for SQL
+     * Server — the same batch reader, one nesting level deeper. Transaction
+     * control is refused inside it: QueryProxy owns the transaction the
+     * request runs in.
+     *
+     * @return list<string>
+     */
+    private function analyzeDynamicSql(string $text, int $position, ?DbDriver $driver, int $depth): array
+    {
+        $label = "Statement {$position}";
+
+        if ($depth + 1 > self::MAX_NESTING_DEPTH) {
+            return ["{$label}: statements nested more than ".self::MAX_NESTING_DEPTH.' levels deep are not allowed.'];
+        }
+
+        [$text, $lexicalViolation] = $this->lexicalView($text, $driver);
+
+        if ($lexicalViolation !== null) {
+            return ["{$label}: {$lexicalViolation}"];
+        }
+
+        $statements = $this->splitStatements($text);
+
+        if ($statements === []) {
+            return [];
+        }
+
+        [$executables, $isTransaction, $transactionViolations] = $this->extractTransaction($statements);
+        $violations = [];
+
+        foreach ($executables as $statement) {
+            [, $statementViolations] = $driver === DbDriver::Sqlsrv
+                ? $this->analyzeSqlsrvBatch($statement, $position, $depth + 1)
+                : $this->analyzeStatement($statement, $position, $driver, $depth + 1);
+            array_push($violations, ...$statementViolations);
+        }
+
+        // SQL Server's batch reader refuses transaction control it sees
+        // (BEGIN TRAN, ROLLBACK, ...) itself; the message is only added when
+        // it has not already said so.
+        $readerRefusedTransactionControl = in_array("{$label}: ".self::SQLSRV_TRANSACTION_CONTROL_VIOLATION, $violations, true);
+
+        if (($isTransaction || $transactionViolations !== [] || count($executables) !== count($statements))
+            && ! $readerRefusedTransactionControl) {
+            array_unshift($violations, "{$label}: transaction control inside dynamic SQL is not allowed: QueryProxy runs the request in its own transaction.");
+        }
+
+        return $violations;
+    }
+
+    /**
+     * The statements a WITH clause runs, judged with the rules a top-level
+     * statement gets: a data-modifying CTE body (PostgreSQL's
+     * "WITH d AS (DELETE ... RETURNING *)") and the main statement after the
+     * clause ("WITH a AS (...) DELETE FROM t"). Each CTE is read as
+     * name [(columns)] AS [[NOT] MATERIALIZED] (body) [SEARCH ...] [CYCLE ...];
+     * SQL Server's XMLNAMESPACES (...) is skipped. A clause that does not
+     * read that way is refused.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function commonTableExpressionViolations(string $sql, array $tokens, int $withIndex, int $position, ?DbDriver $driver, int $depth): array
+    {
+        $unreadable = ["Statement {$position}: a WITH clause QueryProxy cannot read is not allowed."];
+        $masked = $this->maskDollarQuoted($sql);
+        $violations = [];
+        $index = $withIndex + 1;
+
+        if ($this->isWordAt($tokens, $index, 'RECURSIVE')) {
+            $index++;
+        }
+
+        while (true) {
+            if (! isset($tokens[$index])) {
+                return $unreadable;
+            }
+
+            if ($this->isWordAt($tokens, $index, 'XMLNAMESPACES') && isset($tokens[$index + 1]) && $this->isOperator($tokens[$index + 1], '(')) {
+                $close = $this->matchingParenthesisAt($tokens, $index + 1);
+
+                if ($close === null) {
+                    return $unreadable;
+                }
+
+                $index = $close + 1;
+            } else {
+                $body = $this->commonTableExpressionBodyAt($tokens, $index);
+
+                if ($body === null) {
+                    return $unreadable;
+                }
+
+                [$open, $close] = $body;
+                $bodySql = trim(mb_substr(
+                    $masked,
+                    (int) $tokens[$open]->position + 1,
+                    (int) $tokens[$close]->position - (int) $tokens[$open]->position - 1,
+                ));
+
+                if ($this->needsNestedInspection($bodySql)) {
+                    array_push($violations, ...$this->analyzeNestedStatement($bodySql, $position, $driver, $depth)[1]);
+                }
+
+                $index = $this->skipCommonTableExpressionTail($tokens, $close + 1);
+
+                if ($index === null) {
+                    return $unreadable;
+                }
+            }
+
+            if (isset($tokens[$index]) && $this->isOperator($tokens[$index], ',')) {
+                $index++;
+
+                continue;
+            }
+
+            break;
+        }
+
+        if (! isset($tokens[$index])) {
+            return $unreadable;
+        }
+
+        $mainSql = trim(mb_substr($masked, (int) $tokens[$index]->position));
+
+        if ($this->needsNestedInspection($mainSql)) {
+            array_push($violations, ...$this->analyzeNestedStatement($mainSql, $position, $driver, $depth)[1]);
+        }
+
+        return $violations;
+    }
+
+    /**
+     * The opening and closing parenthesis of the body of the CTE whose name
+     * starts at $index — name [(columns)] AS [[NOT] MATERIALIZED] (body) —
+     * or null when the CTE does not read that way.
+     *
+     * @param  list<Token>  $tokens
+     * @return ?array{0: int, 1: int}
+     */
+    private function commonTableExpressionBodyAt(array $tokens, int $index): ?array
+    {
+        [$name, $end] = $this->namePartAt($tokens, $index);
+
+        if ($name === null) {
+            return null;
+        }
+
+        $index = $end + 1;
+
+        if (isset($tokens[$index]) && $this->isOperator($tokens[$index], '(')) {
+            $close = $this->matchingParenthesisAt($tokens, $index);
+
+            if ($close === null) {
+                return null;
+            }
+
+            $index = $close + 1;
+        }
+
+        if (! $this->isWordAt($tokens, $index, 'AS')) {
+            return null;
+        }
+
+        $index++;
+
+        if ($this->isWordAt($tokens, $index, 'NOT')) {
+            $index++;
+
+            if (! $this->isWordAt($tokens, $index, 'MATERIALIZED')) {
+                return null;
+            }
+        }
+
+        if ($this->isWordAt($tokens, $index, 'MATERIALIZED')) {
+            $index++;
+        }
+
+        if (! isset($tokens[$index]) || ! $this->isOperator($tokens[$index], '(')) {
+            return null;
+        }
+
+        $close = $this->matchingParenthesisAt($tokens, $index);
+
+        return $close === null ? null : [$index, $close];
+    }
+
+    /**
+     * The index after PostgreSQL's optional SEARCH ... SET <column> and
+     * CYCLE ... USING <column> clauses of a recursive CTE, or null when one
+     * of them is never finished.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function skipCommonTableExpressionTail(array $tokens, int $index): ?int
+    {
+        foreach (['SEARCH' => 'SET', 'CYCLE' => 'USING'] as $clause => $terminator) {
+            if (! $this->isWordAt($tokens, $index, $clause)) {
+                continue;
+            }
+
+            do {
+                $index++;
+
+                if (! isset($tokens[$index])) {
+                    return null;
+                }
+            } while (! $this->isWordAt($tokens, $index, $terminator));
+
+            $index += 2;
+
+            if (! isset($tokens[$index - 1])) {
+                return null;
+            }
+        }
+
+        return $index;
+    }
+
+    /**
+     * Whether a statement read out of a CTE has to be judged as a statement
+     * of its own: one that starts with UPDATE or DELETE — the statements
+     * whose WHERE guard a WITH clause would otherwise hide — or with a WITH
+     * clause of its own (PostgreSQL's "WITH d AS (WITH x AS (...) DELETE
+     * FROM t RETURNING *)"). The inner WITH is resolved recursively through
+     * analyzeNestedStatement(), so every level is read; past
+     * MAX_NESTING_DEPTH the statement is rejected.
+     */
+    private function needsNestedInspection(string $sql): bool
+    {
+        [$keyword] = $this->leadingKeyword($this->significantTokens($sql));
+
+        return in_array($keyword, ['UPDATE', 'DELETE', 'WITH'], true);
+    }
+
+    /**
+     * The text of the single-quoted string literal at $index (N'...'
+     * included) and the index of its last token. The text is null when no
+     * such literal starts there or when the dialects would read it
+     * differently (see unquoteRaw()); a "double-quoted" token is a name in
+     * SQL Server and PostgreSQL, never a statement.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: ?string, 1: int}
+     */
+    private function stringLiteralAt(array $tokens, int $index): array
+    {
+        $token = $tokens[$index] ?? null;
+
+        if ($token !== null && $token->type === TokenType::None && strtoupper((string) $token->token) === 'N') {
+            $literal = $tokens[$index + 1] ?? null;
+
+            if ($literal === null || $token->position === null || $literal->position !== $token->position + 1) {
+                return [null, $index];
+            }
+
+            $index++;
+            $token = $literal;
+        }
+
+        if ($token === null || $token->type !== TokenType::String
+            || ($token->flags & Token::FLAG_STRING_DOUBLE_QUOTES) !== 0
+            || ! str_starts_with((string) $token->token, "'")) {
+            return [null, $index];
+        }
+
+        return [$this->unquoteRaw((string) $token->token), $index];
+    }
+
+    /**
+     * The index of the parenthesis that closes the one at $open, or null
+     * when it is never closed.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function matchingParenthesisAt(array $tokens, int $open): ?int
+    {
+        $level = 0;
+
+        for ($index = $open, $count = count($tokens); $index < $count; $index++) {
+            if ($this->isOperator($tokens[$index], '(')) {
+                $level++;
+            } elseif ($this->isOperator($tokens[$index], ')')) {
+                $level--;
+
+                if ($level === 0) {
+                    return $index;
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
