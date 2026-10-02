@@ -6,7 +6,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.1] — YYYY-MM-DD
+## [0.2.1] — 2026-10-02
 
 ### Security
 
