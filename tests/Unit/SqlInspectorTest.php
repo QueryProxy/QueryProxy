@@ -1,12 +1,13 @@
 <?php
 
+use App\Enums\DbDriver;
 use App\Enums\StatementType;
 use App\Services\Sql\InspectionResult;
 use App\Services\Sql\SqlInspector;
 
-function inspect(string $sql): InspectionResult
+function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
 {
-    return app(SqlInspector::class)->inspect($sql);
+    return app(SqlInspector::class)->inspect($sql, $driver);
 }
 
 test('select without limit gets the default limit injected', function () {
@@ -432,4 +433,441 @@ test('trusted procedural languages are not caught by the convention', function (
     'CREATE EXTENSION plperl',
     'CREATE EXTENSION plv8',
     'CREATE EXTENSION pllua',
+]);
+
+test('EXPLAIN ANALYZE is judged by the statement it executes', function () {
+    $delete = inspect('EXPLAIN ANALYZE DELETE FROM t', DbDriver::Pgsql);
+    $update = inspect('EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET a=1 WHERE id=1', DbDriver::Pgsql);
+    $select = inspect('EXPLAIN ANALYZE SELECT 1', DbDriver::Pgsql);
+
+    expect($delete->passes())->toBeFalse()
+        ->and($delete->type())->toBe(StatementType::Write)
+        ->and($update->passes())->toBeTrue()
+        ->and($update->type())->toBe(StatementType::Write)
+        ->and($select->passes())->toBeTrue()
+        ->and($select->type())->toBe(StatementType::Read);
+});
+
+test('EXPLAIN without ANALYZE stays a read', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read)
+        ->and($result->preparedSql())->toBe($sql);
+})->with([
+    'plain' => 'EXPLAIN DELETE FROM t WHERE id=1',
+    'ANALYZE switched off' => 'EXPLAIN (ANALYZE false) DELETE FROM t',
+    'ANALYZE off among other options' => 'EXPLAIN (ANALYZE off, COSTS) UPDATE t SET a = 1',
+    'VERBOSE only' => 'EXPLAIN VERBOSE DELETE FROM t',
+]);
+
+test('EXPLAIN ANALYZE spellings all run the inner statement', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->type())->toBe(StatementType::Write);
+})->with([
+    'legacy with VERBOSE' => 'EXPLAIN ANALYZE VERBOSE UPDATE t SET a=1 WHERE id=1',
+    'British spelling' => 'EXPLAIN ANALYSE UPDATE t SET a=1 WHERE id=1',
+    'option list, true' => 'EXPLAIN (ANALYZE true, BUFFERS) UPDATE t SET a=1 WHERE id=1',
+    'option list, on' => 'EXPLAIN (FORMAT JSON, ANALYZE on) UPDATE t SET a=1 WHERE id=1',
+    'option list, 1' => 'EXPLAIN (ANALYZE 1) UPDATE t SET a=1 WHERE id=1',
+    'lower case' => 'explain (analyze) update t set a=1 where id=1',
+    'mysql' => 'EXPLAIN ANALYZE UPDATE t SET a=1 WHERE id=1',
+]);
+
+test('an EXPLAIN option block that cannot be read is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'unclosed option list' => 'EXPLAIN (ANALYZE',
+    'unclosed with a statement' => 'EXPLAIN (ANALYZE SELECT 1',
+    'ANALYZE value that is not a boolean' => 'EXPLAIN (ANALYZE maybe) SELECT 1',
+    'empty option' => 'EXPLAIN (ANALYZE,, BUFFERS) SELECT 1',
+    'ANALYZE without a statement' => 'EXPLAIN ANALYZE',
+]);
+
+test('EXPLAIN ANALYZE carries the inner denylist and limit without touching the option block', function () {
+    $forbidden = inspect('EXPLAIN ANALYZE DROP DATABASE prod', DbDriver::Pgsql);
+    $select = inspect('EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t', DbDriver::Pgsql);
+
+    expect($forbidden->passes())->toBeFalse()
+        ->and($select->type())->toBe(StatementType::Read)
+        ->and($select->preparedSql())->toStartWith('EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t')
+        ->and($select->preparedSql())->toContain('LIMIT');
+});
+
+test('EXPLAIN ANALYZE nested past the depth limit is rejected', function () {
+    expect(inspect('EXPLAIN ANALYZE EXPLAIN ANALYZE SELECT 1', DbDriver::Pgsql)->passes())->toBeTrue()
+        ->and(inspect('EXPLAIN ANALYZE EXPLAIN ANALYZE EXPLAIN ANALYZE EXPLAIN ANALYZE SELECT 1', DbDriver::Pgsql)->passes())->toBeFalse();
+});
+
+test('SELECT INTO a table is a DDL write without a limit', function (DbDriver $driver) {
+    $result = inspect('SELECT * INTO t2 FROM t', $driver);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->hasDdl())->toBeTrue()
+        ->and($result->preparedSql())->toBe('SELECT * INTO t2 FROM t');
+})->with([
+    'pgsql' => DbDriver::Pgsql,
+    'sqlsrv' => DbDriver::Sqlsrv,
+]);
+
+test('SELECT INTO a temporary table is a DDL write', function () {
+    $result = inspect('SELECT * INTO TEMP t2 FROM t', DbDriver::Pgsql);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->hasDdl())->toBeTrue();
+});
+
+test('SELECT INTO a MySQL user variable stays a read', function () {
+    $result = inspect('SELECT a INTO @x FROM t LIMIT 1', DbDriver::Mysql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read)
+        ->and($result->hasDdl())->toBeFalse();
+});
+
+test('INTO inside a subquery or a literal does not make a SELECT a write', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->type())->toBe(StatementType::Read);
+})->with([
+    "SELECT 'INTO t2' FROM t",
+    'SELECT * FROM t -- INTO t2',
+]);
+
+test('server control and remote channel functions are rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'terminate backend' => 'SELECT pg_terminate_backend(123)',
+    'cancel backend' => 'SELECT pg_cancel_backend(pid) FROM pg_stat_activity',
+    'reload conf' => 'SELECT pg_reload_conf()',
+    'promote' => 'SELECT pg_promote()',
+    'dblink' => "SELECT * FROM dblink('host=x', 'SELECT 1') AS t(a int)",
+    'dblink exec' => "SELECT dblink_exec('host=x', 'DROP TABLE t')",
+    'upper case' => 'SELECT PG_TERMINATE_BACKEND(1)',
+    'double-quoted name' => 'SELECT "pg_terminate_backend"(1)',
+    'space before the parenthesis' => 'SELECT pg_reload_conf ()',
+    'schema-qualified' => 'SELECT pg_catalog.pg_terminate_backend(1)',
+]);
+
+test('set_config is judged like SET', function (string $sql, bool $passes) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBe($passes)
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'dangerous literal name' => ["SELECT set_config('LOCAL_INFILE', 'on', false)", false],
+    'harmless literal name' => ["SELECT set_config('application_name', 'x', false)", true],
+    'name from a column' => ['SELECT set_config(name, setting, false) FROM pg_settings', false],
+    'concatenated name' => ["SELECT set_config('local_' || 'infile', 'on', false)", false],
+]);
+
+test('state-changing functions make a SELECT a write', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write)
+        ->and($result->preparedSql())->toBe($sql);
+})->with([
+    'nextval' => "SELECT nextval('seq')",
+    'setval' => "SELECT setval('seq', 10)",
+    'advisory lock' => 'SELECT pg_advisory_lock(1)',
+    'advisory lock, shared variant' => 'SELECT pg_advisory_lock_shared(1)',
+    'transaction advisory lock' => 'SELECT pg_advisory_xact_lock(1)',
+    'mysql named lock' => "SELECT GET_LOCK('x', 10)",
+    'mysql named lock release' => "SELECT RELEASE_LOCK('x')",
+]);
+
+test('resource-consuming functions make a SELECT a write', function (string $sql) {
+    $result = inspect($sql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'pg_sleep' => 'SELECT pg_sleep(10)',
+    'pg_sleep_for' => "SELECT pg_sleep_for('5 minutes')",
+    'mysql sleep' => 'SELECT SLEEP(10)',
+    'mysql backtick sleep' => 'SELECT `sleep`(10)',
+    'mysql benchmark' => "SELECT BENCHMARK(1000000, MD5('x'))",
+]);
+
+test('a function name that is not called does not trigger a rule', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'inside a string literal' => "SELECT 'pg_sleep(1)'",
+    'inside a line comment' => 'SELECT 1 -- dblink(',
+    'inside a block comment' => 'SELECT 1 /* pg_terminate_backend(1) */',
+    'inside a dollar-quoted body' => 'SELECT $$pg_terminate_backend(1)$$',
+    'inside a tagged dollar-quoted body' => 'SELECT $q$ nextval(1) $q$',
+    'as a column name' => 'SELECT sleep FROM t',
+    'as a longer function name' => 'SELECT my_pg_sleep(1)',
+]);
+
+test('configured function lists extend the built-in lists', function () {
+    config([
+        'queryproxy.blocked_functions' => ['lo_unlink'],
+        'queryproxy.state_changing_functions' => ['audit_touch'],
+        'queryproxy.resource_consuming_functions' => [],
+    ]);
+
+    expect(inspect('SELECT lo_unlink(1)')->passes())->toBeFalse()
+        ->and(inspect('SELECT audit_touch(1)')->type())->toBe(StatementType::Write)
+        ->and(inspect('SELECT pg_sleep(1)')->type())->toBe(StatementType::Write)
+        ->and(inspect('SELECT pg_terminate_backend(1)')->passes())->toBeFalse();
+});
+
+test('EXPLAIN ANALYZE is recognised however it is spaced', function (string $sql, bool $passes) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->passes())->toBe($passes);
+})->with([
+    'no space after EXPLAIN' => ['EXPLAIN(ANALYZE) DELETE FROM t', false],
+    'no space anywhere' => ['EXPLAIN(ANALYZE)DELETE FROM t', false],
+    'two options, no space' => ['EXPLAIN(ANALYZE,BUFFERS)UPDATE t SET a=1 WHERE id=1', true],
+    'two options' => ['EXPLAIN(ANALYZE, BUFFERS) UPDATE t SET a=1 WHERE id=1', true],
+    'comment as separator' => ['EXPLAIN/**/ANALYZE/**/DELETE FROM t', false],
+]);
+
+test('an EXPLAIN option the guard does not know is rejected', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'quoted ANALYZE' => 'EXPLAIN ("analyze") DELETE FROM t WHERE id=1',
+    'quoted ANALYZE with a value' => 'EXPLAIN ("analyze" true) DELETE FROM t WHERE id=1',
+    'U& escaped ANALYZE' => 'EXPLAIN (U&"\0061nalyze") DELETE FROM t WHERE id=1',
+    'backticked ANALYZE' => 'EXPLAIN (`analyze`) DELETE FROM t WHERE id=1',
+    'unknown option' => 'EXPLAIN (FROBNICATE) DELETE FROM t WHERE id=1',
+    'option with an expression value' => 'EXPLAIN (COSTS (true)) DELETE FROM t WHERE id=1',
+    'ANALYZE yes, not a defGetBoolean value' => 'EXPLAIN (ANALYZE yes) DELETE FROM t WHERE id=1',
+    'ANALYZE with an escaped string value' => "EXPLAIN (ANALYZE 'o\\ff') DELETE FROM t WHERE id=1",
+    'wrapped in parentheses' => '(EXPLAIN ANALYZE DELETE FROM t WHERE id=1)',
+]);
+
+test('EXPLAIN boolean values follow PostgreSQL', function (string $sql, StatementType $type) {
+    expect(inspect($sql, DbDriver::Pgsql)->type())->toBe($type);
+})->with([
+    'quoted true' => ["EXPLAIN (ANALYZE 'true') UPDATE t SET a=1 WHERE id=1", StatementType::Write],
+    'upper-case ON' => ['EXPLAIN (ANALYZE ON) UPDATE t SET a=1 WHERE id=1', StatementType::Write],
+    'zero' => ['EXPLAIN (ANALYZE 0) UPDATE t SET a=1 WHERE id=1', StatementType::Read],
+    'quoted off' => ["EXPLAIN (ANALYZE 'off') UPDATE t SET a=1 WHERE id=1", StatementType::Read],
+]);
+
+test('EXPLAIN of a parenthesised statement is read as the statement', function () {
+    $result = inspect('EXPLAIN (SELECT * FROM t)', DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+});
+
+test('SELECT INTO a table is caught however it is spaced or wrapped', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->hasDdl())->toBeTrue()
+        ->and($result->preparedSql())->toBe($sql);
+})->with([
+    'no space around the star' => 'SELECT*INTO t2 FROM t',
+    'comment as separator' => 'SELECT/**/*/**/INTO/**/t2/**/FROM t',
+    'wrapped in parentheses' => '(SELECT * INTO t2 FROM t)',
+    'wrapped and unioned' => '(SELECT * INTO t2 FROM t) UNION SELECT * FROM t3',
+    'inside a CTE body' => 'WITH x AS (SELECT * FROM t) SELECT * INTO t2 FROM x',
+    'quoted target' => 'SELECT * INTO "t2" FROM t',
+]);
+
+test('INSERT INTO inside a CTE body is a write but not a SELECT INTO', function () {
+    $result = inspect('WITH x AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM x', DbDriver::Pgsql);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->hasDdl())->toBeFalse();
+});
+
+test('a blocked function hidden in U& escapes is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'escaped blocked function' => 'SELECT U&"pg\005fterminate\005fbackend"(123)',
+    'custom UESCAPE' => "SELECT U&\"pg!005fterminate!005fbackend\" UESCAPE '!'(123)",
+    'schema-qualified' => 'SELECT pg_catalog.U&"pg\005fcancel\005fbackend"(1)',
+    'escaped file IO function' => 'SELECT U&"pg\005fread\005ffile"(\'/etc/passwd\')',
+]);
+
+test('a resource function hidden in U& escapes makes the statement a write', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'four-digit escape' => 'SELECT U&"pg\005fsleep"(10)',
+    'six-digit escape' => 'SELECT U&"pg\+00005fsleep"(10)',
+    'lower-case u' => 'SELECT u&"pg\005fsleep"(10)',
+]);
+
+test('a called U& name the guard cannot decode is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'truncated escape' => 'SELECT U&"pg\005"(1)',
+    'surrogate code point' => 'SELECT U&"\D800x"(1)',
+    'invalid UESCAPE character' => "SELECT U&\"pg+005fsleep\" UESCAPE '+'(1)",
+]);
+
+test('a quoted function name is read from its raw spelling', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'double-quoted' => 'SELECT "pg_terminate_backend"(1)',
+    'double-quoted file IO' => 'SELECT "pg_read_file"(\'/etc/passwd\')',
+    'backticked file IO' => 'SELECT `load_file`(\'/etc/passwd\')',
+]);
+
+test('every dblink function is blocked', function (string $function) {
+    expect(inspect("SELECT {$function}('conn', 'SELECT 1')", DbDriver::Pgsql)->passes())->toBeFalse();
+})->with(['dblink_connect_u', 'dblink_open', 'dblink_fetch', 'dblink_get_result']);
+
+test('a PostgreSQL EXPLAIN without ANALYZE does not judge the calls it only plans', function () {
+    $sleep = inspect('EXPLAIN SELECT pg_sleep(10)', DbDriver::Pgsql);
+    $terminate = inspect('EXPLAIN SELECT pg_terminate_backend(1)', DbDriver::Pgsql);
+    $analyzed = inspect('EXPLAIN ANALYZE SELECT pg_terminate_backend(1)', DbDriver::Pgsql);
+
+    expect($sleep->passes())->toBeTrue()
+        ->and($sleep->type())->toBe(StatementType::Read)
+        ->and($terminate->passes())->toBeTrue()
+        ->and($terminate->type())->toBe(StatementType::Read)
+        ->and($analyzed->passes())->toBeFalse();
+});
+
+test('a MySQL or unknown-driver EXPLAIN still judges its calls', function (?DbDriver $driver) {
+    expect(inspect('EXPLAIN SELECT SLEEP(10)', $driver)->type())->toBe(StatementType::Write);
+})->with([
+    'mysql' => DbDriver::Mysql,
+    'unknown driver' => null,
+]);
+
+// --- Review round 2: comments read per dialect, EXPLAIN EXECUTE, UESCAPE '\' ---
+
+dataset('comment bypasses', [
+    'nested comment hides EXPLAIN option value' => "EXPLAIN (ANALYZE /* /* */ false -- */\n) DELETE FROM t",
+    'nested comment hides EXPLAIN option block' => 'EXPLAIN /* /* */ SELECT 1 -- */ (ANALYZE) DELETE FROM t',
+    'nested comment hides INTO' => 'SELECT * /* /* */ -- */ INTO t2 FROM t',
+    'nested comment hides a blocked call' => 'SELECT 1 /* /* */ -- */, pg_terminate_backend(1)',
+    'nested comment hides the leading keyword' => "/* /* */ EXPLAIN -- */\nDELETE FROM t",
+    'nested comment hides a second statement' => 'SELECT 1 /* /* */ -- */ ; DELETE FROM t WHERE id = 1',
+    'dash comment without a space' => "SELECT 1 --x /*\n, pg_terminate_backend(1) -- */",
+]);
+
+test('a PostgreSQL comment cannot hide code from the guard', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes() && $result->type() === StatementType::Read)->toBeFalse();
+})->with('comment bypasses');
+
+test('a comment the dialects read differently is rejected when the driver is unknown', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with('comment bypasses');
+
+test('a block comment that is never closed is rejected', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with([
+    'mysql' => ['SELECT 1 /* open', DbDriver::Mysql],
+    'pgsql' => ['SELECT 1 /* open', DbDriver::Pgsql],
+    'unknown driver' => ['SELECT 1 /* open', null],
+    'pgsql, closed only for a flat reading' => ['SELECT 1 /* /* */', DbDriver::Pgsql],
+]);
+
+test('a nested PostgreSQL comment is read as one comment', function () {
+    $result = inspect('SELECT /* outer /* inner */ still outer */ 1 FROM t', DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read)
+        ->and($result->preparedSql())->not->toContain('still outer');
+});
+
+test('a PostgreSQL comment both readings agree on is kept', function () {
+    $result = inspect("SELECT 1 /* trace */ FROM t -- note\n", DbDriver::Pgsql);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->preparedSql())->toContain('/* trace */')
+        ->and($result->preparedSql())->toContain('-- note');
+});
+
+test('a comment opener inside a dollar-quoted string is not a comment', function () {
+    expect(inspect('SELECT $$/*$$ FROM t', DbDriver::Pgsql)->passes())->toBeTrue();
+});
+
+test('a MySQL block comment ends at its first closing marker', function () {
+    expect(inspect('SELECT 1 /* /* */, SLEEP(1)', DbDriver::Mysql)->type())->toBe(StatementType::Write);
+});
+
+test('a nested comment in a DO block body cannot hide a forbidden statement', function () {
+    expect(inspect('DO $$ BEGIN /* /* */ -- */ DROP DATABASE prod; END $$', DbDriver::Pgsql)->passes())->toBeFalse();
+});
+
+test('EXPLAIN EXECUTE judges the calls in its parameters', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'plain' => 'EXPLAIN EXECUTE p(pg_terminate_backend(123))',
+    'with an option list' => 'EXPLAIN (FORMAT JSON) EXECUTE p(pg_terminate_backend(123))',
+    'in a transaction' => 'BEGIN; PREPARE p(int) AS SELECT $1; EXPLAIN EXECUTE p(pg_terminate_backend(123)); COMMIT;',
+]);
+
+test('EXPLAIN EXECUTE with a state-changing parameter is a write', function () {
+    expect(inspect("EXPLAIN EXECUTE p(nextval('s'))", DbDriver::Pgsql)->type())->toBe(StatementType::Write);
+});
+
+test('a U& name escaped with UESCAPE backslash is rejected', function () {
+    expect(inspect("SELECT U&\"pg\\005fterminate\\005fbackend\" UESCAPE '\\' (1)", DbDriver::Pgsql)->passes())->toBeFalse();
+});
+
+// --- Review round 3: EXECUTE anywhere under EXPLAIN, any UESCAPE, "$" in identifiers ---
+
+test('EXPLAIN of CREATE TABLE AS EXECUTE judges the calls in its parameters', function () {
+    expect(inspect('EXPLAIN CREATE TABLE x AS EXECUTE p(pg_terminate_backend(1))', DbDriver::Pgsql)->passes())->toBeFalse()
+        ->and(inspect("EXPLAIN CREATE TEMP TABLE x AS EXECUTE p(nextval('s'))", DbDriver::Pgsql)->type())->toBe(StatementType::Write);
+});
+
+test('any UESCAPE clause is rejected', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with([
+    'E-string escape' => ["SELECT U&\"pg!005fterminate!005fbackend\" UESCAPE E'!' (1)", DbDriver::Pgsql],
+    'E-string backslash' => ["SELECT U&\"pg\\005fterminate\\005fbackend\" UESCAPE E'\\\\' (1)", DbDriver::Pgsql],
+    'dollar-quoted escape' => ['SELECT U&"pg!005fterminate!005fbackend" UESCAPE $$!$$ (1)', DbDriver::Pgsql],
+    'tagged dollar-quoted escape' => ['SELECT U&"pg!005fterminate!005fbackend" UESCAPE $q$!$q$ (1)', DbDriver::Pgsql],
+    'plain escape' => ["SELECT U&\"pg!005fterminate!005fbackend\" UESCAPE '!' (1)", DbDriver::Pgsql],
+    'on a column, not a call' => ["SELECT U&\"col\" UESCAPE '\\' FROM t", DbDriver::Pgsql],
+    'resource call' => ["SELECT U&\"pg!005fsleep\" UESCAPE '!' (10)", DbDriver::Pgsql],
+    'unknown driver' => ["SELECT U&\"pg!005fterminate!005fbackend\" UESCAPE '!' (1)", null],
+]);
+
+test('a UESCAPE rejection names the clause, not a function', function () {
+    expect(inspect("SELECT U&\"col\" UESCAPE '\\' FROM t", DbDriver::Pgsql)->violations)
+        ->toBe(['A UESCAPE clause is not allowed through QueryProxy; write Unicode escapes with the default backslash escape.']);
+});
+
+test('a "$" that continues an identifier does not open a dollar quote', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes() && $result->type() === StatementType::Read)->toBeFalse();
+})->with([
+    'hides a blocked call' => 'SELECT 1 AS a$$, pg_terminate_backend(1) -- $$',
+    'hides a resource-consuming call' => 'SELECT 1 AS a$$, pg_sleep(10) -- $$',
+    'hides INTO' => 'SELECT 1 AS a$$ INTO t2 -- $$',
+    'hides INTO under EXPLAIN ANALYZE' => 'EXPLAIN ANALYZE SELECT 1 AS a$$ INTO t2 -- $$',
+]);
+
+test('a dollar quote the guard cannot delimit like PostgreSQL is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'never closed' => 'SELECT $q$ open, pg_terminate_backend(1)',
+    'after a backslash-ended string' => "SELECT 'a\\', \$\$ x \$\$ FROM t",
+]);
+
+test('an identifier with a "$" and a real dollar quote still read', function () {
+    expect(inspect('SELECT a$b, $$text$$ FROM t', DbDriver::Pgsql)->passes())->toBeTrue();
+});
+
+test('CREATE TABLE AS EXECUTE judges the calls in its parameters in every form', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'plain' => 'CREATE TABLE x AS EXECUTE p(pg_terminate_backend(1))',
+    'under EXPLAIN ANALYZE' => 'EXPLAIN ANALYZE CREATE TABLE x AS EXECUTE p(pg_terminate_backend(1))',
+    'under an EXPLAIN option list' => 'EXPLAIN (VERBOSE) CREATE TEMP TABLE x AS EXECUTE p(pg_terminate_backend(1))',
 ]);

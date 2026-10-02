@@ -53,7 +53,15 @@ return [
     | no wildcard, so related variables (`general_log`, `general_log_file`)
     | are listed one by one.
     |
-    | Both lists are the class constants of App\Services\Sql\SqlInspector plus
+    | The three function lists judge a call by its effect. A call to one of
+    | `blocked_functions` (server control, dblink) is refused. A call to one
+    | of `state_changing_functions` (sequences, advisory and named locks) or
+    | `resource_consuming_functions` (sleep, benchmark) makes the statement a
+    | write, so it goes through approval instead of passing as a read. Names
+    | match case-insensitively; an entry ending in "*" matches every name with
+    | that prefix. set_config() is judged against `dangerous_variables`.
+    |
+    | Every list is the class constant of App\Services\Sql\SqlInspector plus
     | whatever the environment adds. The env values can only EXTEND a list:
     | they are merged in, never substituted, and SqlInspector merges its own
     | constants back on top, so a shortened list here cannot disarm the guard.
@@ -67,6 +75,21 @@ return [
     'dangerous_variables' => array_values(array_unique(array_filter(array_merge(
         SqlInspector::DANGEROUS_VARIABLES,
         array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_DANGEROUS_VARIABLES', ''))),
+    )))),
+
+    'blocked_functions' => array_values(array_unique(array_filter(array_merge(
+        SqlInspector::BLOCKED_FUNCTIONS,
+        array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_BLOCKED_FUNCTIONS', ''))),
+    )))),
+
+    'state_changing_functions' => array_values(array_unique(array_filter(array_merge(
+        SqlInspector::STATE_CHANGING_FUNCTIONS,
+        array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_STATE_CHANGING_FUNCTIONS', ''))),
+    )))),
+
+    'resource_consuming_functions' => array_values(array_unique(array_filter(array_merge(
+        SqlInspector::RESOURCE_CONSUMING_FUNCTIONS,
+        array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_RESOURCE_CONSUMING_FUNCTIONS', ''))),
     )))),
 
     /*
