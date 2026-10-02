@@ -36,6 +36,12 @@
 
                 <div></div>
 
+                @if ($driver === 'sqlite' && $sqliteDirUnrestricted)
+                    <x-ui.alert tone="pending" icon="alert" class="sm:col-span-3">
+                        <code class="font-mono">QUERYPROXY_SQLITE_ALLOWED_DIR</code> is not set, so this connection may point at any SQLite file the application can read. Set it to pin SQLite connections to one directory.
+                    </x-ui.alert>
+                @endif
+
                 @if ($driver !== 'sqlite')
                     <x-ui.field label="Host" :error="$errors->first('host')">
                         <x-ui.input type="text" wire:model="host" />

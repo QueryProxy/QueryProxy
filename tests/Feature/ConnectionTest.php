@@ -132,3 +132,35 @@ test('test() reports failures instead of throwing', function () {
     expect($result['ok'])->toBeFalse()
         ->and($result['error'])->not->toBeNull();
 });
+
+test('the SQLite form warns when no allowed directory is set, without blocking the save', function () {
+    config(['queryproxy.sqlite_allowed_dir' => null]);
+    [$team, $dba] = makeTeamUser('dba');
+    $dbFile = tempnam(sys_get_temp_dir(), 'qp_sqlite_');
+
+    Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openCreate')
+        ->assertDontSee('QUERYPROXY_SQLITE_ALLOWED_DIR')
+        ->set('driver', 'sqlite')
+        ->assertSee('QUERYPROXY_SQLITE_ALLOWED_DIR')
+        ->set('name', 'Local SQLite')
+        ->set('database', $dbFile)
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect(Connection::where('team_id', $team->id)->where('name', 'Local SQLite')->exists())->toBeTrue();
+
+    @unlink($dbFile);
+});
+
+test('the SQLite form shows no warning once an allowed directory is set', function () {
+    config(['queryproxy.sqlite_allowed_dir' => sys_get_temp_dir()]);
+    [, $dba] = makeTeamUser('dba');
+
+    Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openCreate')
+        ->set('driver', 'sqlite')
+        ->assertDontSee('QUERYPROXY_SQLITE_ALLOWED_DIR');
+});

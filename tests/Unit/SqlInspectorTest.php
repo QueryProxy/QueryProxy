@@ -129,6 +129,7 @@ test('forbidden administrative statements are rejected', function (string $sql) 
     'DROP DATABASE prod',
     'GRANT ALL ON *.* TO joe',
     'REVOKE SELECT ON db.t FROM joe',
+    'DENY SELECT ON t TO joe',
     'CREATE USER hacker IDENTIFIED BY "x"',
     'SET GLOBAL general_log = 1',
 ]);
@@ -870,4 +871,670 @@ test('CREATE TABLE AS EXECUTE judges the calls in its parameters in every form',
     'plain' => 'CREATE TABLE x AS EXECUTE p(pg_terminate_backend(1))',
     'under EXPLAIN ANALYZE' => 'EXPLAIN ANALYZE CREATE TABLE x AS EXECUTE p(pg_terminate_backend(1))',
     'under an EXPLAIN option list' => 'EXPLAIN (VERBOSE) CREATE TEMP TABLE x AS EXECUTE p(pg_terminate_backend(1))',
+]);
+
+// --- SQL Server and SQLite dialect guards ---
+
+test('SQL Server system procedures, remote rowsets and BULK INSERT are rejected', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->not->toBeEmpty();
+})->with([
+    'xp_cmdshell' => "EXEC xp_cmdshell 'dir'",
+    'xp_cmdshell, EXECUTE' => "EXECUTE xp_cmdshell 'dir'",
+    'xp_cmdshell, lower case' => "exec XP_CMDSHELL 'dir'",
+    'xp_cmdshell, without EXEC' => "xp_cmdshell 'dir'",
+    'xp_cmdshell, schema-qualified' => "EXEC master..xp_cmdshell 'dir'",
+    'xp_cmdshell, bracketed' => "EXEC [master].[dbo].[xp_cmdshell] 'dir'",
+    'xp_cmdshell, bracketed without a space' => "EXEC[xp_cmdshell] 'dir'",
+    'xp_cmdshell, return value captured' => "EXEC @rc = xp_cmdshell 'dir'",
+    'xp_cmdshell, after a comment' => "EXEC /* c */ xp_cmdshell 'dir'",
+    'xp_regread' => "EXEC xp_regread 'HKEY_LOCAL_MACHINE', 'x'",
+    'sp_configure' => "EXEC sp_configure 'show advanced options', 1",
+    'sp_OACreate' => "EXEC sp_OACreate 'WScript.Shell', @o OUT",
+    'sp_addlinkedserver' => "EXEC sp_addlinkedserver 'remote'",
+    'OPENROWSET' => "SELECT * FROM OPENROWSET('SQLNCLI', 'Server=x;Trusted_Connection=yes;', 'SELECT 1')",
+    'OPENROWSET, lower case' => "select * from openrowset(BULK 'c:\\x.csv', SINGLE_CLOB) AS t",
+    'OPENDATASOURCE' => "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Data Source=x').db.dbo.t",
+    'OPENQUERY' => "SELECT * FROM OPENQUERY(remote, 'SELECT 1')",
+    'BULK INSERT' => "BULK INSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT, lower case' => "bulk insert t from 'c:\\x.csv'",
+    'sp_addlinkedsrvlogin' => "EXEC sp_addlinkedsrvlogin 'remote', 'false', NULL, 'sa', 'x'",
+    'sp_execute_external_script' => "EXEC sp_execute_external_script @language = N'Python', @script = N'x'",
+]);
+
+test('the SQL Server rules hold anywhere in the statement, not just at its head', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlsrv)->passes())->toBeFalse();
+})->with([
+    'BULK INSERT inside IF' => "IF 1 = 1 BULK INSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT inside BEGIN TRY' => "BEGIN TRY BULK INSERT t FROM 'c:\\x.csv' END TRY BEGIN CATCH END CATCH",
+    'BULK INSERT after a SELECT without a semicolon' => "SELECT 1 BULK INSERT t FROM 'c:\\x.csv'",
+    'procedure after a SELECT without a semicolon' => "SELECT 1 EXEC xp_cmdshell 'dir'",
+    'procedure inside IF' => "IF 1 = 1 EXEC xp_cmdshell 'dir'",
+]);
+
+test('an EXEC whose module cannot be read is rejected', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->not->toBeEmpty();
+})->with([
+    'module in a variable' => "DECLARE @p sysname = N'xp_cmdshell' EXEC @p 'dir'",
+    'module in a variable, return value captured' => "EXEC @rc = @p 'dir'",
+    'incomplete name' => "EXEC ..xp_cmdshell 'dir'",
+    'nothing to execute' => 'SELECT 1 EXEC',
+    'N-prefixed string' => "EXEC N'xp_cmdshell'",
+    'N, a space and a string' => "EXEC N 'xp_cmdshell'",
+    'string literal' => "EXEC 'xp_cmdshell'",
+    'quoted name' => 'EXEC "xp_cmdshell"',
+    'name glued to a string' => "EXEC sp_who'active'",
+    'expression' => 'EXEC 1 + 1',
+]);
+
+test('an EXEC of a plain or dotted module name is readable', function (string $sql) {
+    expect(implode("\n", inspect($sql, DbDriver::Sqlsrv)->violations))->not->toContain('EXEC with a module');
+})->with([
+    'bare name with an argument' => "EXEC sp_who 'active'",
+    'dotted name with an N string argument' => "EXEC dbo.report N'2026'",
+    'bracketed parts' => 'EXEC [dbo].[report]',
+    'return value captured' => 'EXEC @rc = dbo.report',
+]);
+
+test('EXECUTE as a granted privilege is not an unreadable EXEC', function () {
+    expect(inspect('GRANT SELECT, EXECUTE ON SCHEMA::dbo TO app', DbDriver::Sqlsrv)->violations)
+        ->each->not->toStartWith('EXEC with a module QueryProxy cannot read');
+});
+
+test('the SQL Server rules apply whatever the driver', function (?DbDriver $driver) {
+    expect(inspect("EXEC xp_cmdshell 'dir'", $driver)->passes())->toBeFalse()
+        ->and(inspect("SELECT * FROM OPENQUERY(remote, 'SELECT 1')", $driver)->passes())->toBeFalse();
+})->with([
+    'no driver' => null,
+    'mysql' => DbDriver::Mysql,
+    'pgsql' => DbDriver::Pgsql,
+    'sqlite' => DbDriver::Sqlite,
+]);
+
+test('a dangerous SQL Server name in a literal, a comment or a column is not a call', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'string literal' => "SELECT 'xp_cmdshell'",
+    'string literal naming a rowset' => "SELECT 'OPENROWSET(x)' AS note",
+    'comment' => 'SELECT 1 /* EXEC xp_cmdshell */',
+    'column with the prefix' => 'SELECT xp_points FROM players',
+]);
+
+test('the blocked procedure list can be extended from configuration', function () {
+    config(['queryproxy.blocked_procedures' => ['sp_who2']]);
+
+    expect(inspect('EXEC sp_who2', DbDriver::Sqlsrv)->passes())->toBeFalse()
+        // The floor stays even when configuration leaves it out.
+        ->and(inspect("EXEC xp_cmdshell 'dir'", DbDriver::Sqlsrv)->passes())->toBeFalse();
+});
+
+test('a top-level SQL Server SELECT without TOP gets the default TOP', function (string $sql, string $prepared) {
+    $statement = inspect($sql, DbDriver::Sqlsrv)->statements[0];
+
+    expect($statement->preparedSql)->toBe($prepared)
+        ->and($statement->limitInjected)->toBeTrue()
+        ->and($statement->limitClamped)->toBeFalse();
+})->with([
+    'plain' => ['SELECT * FROM t', 'SELECT TOP (1000) * FROM t'],
+    'DISTINCT' => ['SELECT DISTINCT a FROM t', 'SELECT DISTINCT TOP (1000) a FROM t'],
+    'ALL' => ['SELECT ALL a FROM t', 'SELECT ALL TOP (1000) a FROM t'],
+    'lower case' => ['select a from t', 'select TOP (1000) a from t'],
+    'TOP only in a subquery' => [
+        'SELECT * FROM (SELECT TOP 5 a FROM t) x',
+        'SELECT TOP (1000) * FROM (SELECT TOP 5 a FROM t) x',
+    ],
+    'bracketed [top] column' => ['SELECT [top] FROM t', 'SELECT TOP (1000) [top] FROM t'],
+    'bracketed [offset] column' => ['SELECT [offset] FROM t', 'SELECT TOP (1000) [offset] FROM t'],
+    'bracketed [fetch] column' => ['SELECT [fetch] FROM t', 'SELECT TOP (1000) [fetch] FROM t'],
+    'bracketed [union] column' => ['SELECT [union] FROM t', 'SELECT TOP (1000) [union] FROM t'],
+    'bracketed [except] column' => ['SELECT [except] FROM t', 'SELECT TOP (1000) [except] FROM t'],
+    'TOP only in a comment' => ['SELECT a /* TOP 5 */ FROM t', 'SELECT TOP (1000) a /* TOP 5 */ FROM t'],
+]);
+
+test('SQL Server statements the default TOP cannot bound are left alone', function (string $sql) {
+    $statement = inspect($sql, DbDriver::Sqlsrv)->statements[0];
+
+    expect($statement->preparedSql)->toBe($sql)
+        ->and($statement->limitInjected)->toBeFalse();
+})->with([
+    'OFFSET ... FETCH' => 'SELECT a FROM t ORDER BY a OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY',
+    'OFFSET without FETCH' => 'SELECT a FROM t ORDER BY a OFFSET 10 ROWS',
+    'UNION' => 'SELECT a FROM t UNION ALL SELECT a FROM u',
+    'EXCEPT' => 'SELECT a FROM t EXCEPT SELECT a FROM u',
+    'INTERSECT' => 'SELECT a FROM t INTERSECT SELECT a FROM u',
+    'lower case except' => 'select a from t except select a from u',
+    'CTE' => 'WITH x AS (SELECT a FROM t) SELECT a FROM x',
+]);
+
+test('SELECT INTO on SQL Server is a write and gets no TOP', function () {
+    $result = inspect('SELECT * INTO t2 FROM t', DbDriver::Sqlsrv);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->statements[0]->limitInjected)->toBeFalse();
+});
+
+test('a SQL Server TOP within the hard cap is untouched', function (string $sql) {
+    $statement = inspect($sql, DbDriver::Sqlsrv)->statements[0];
+
+    expect($statement->preparedSql)->toBe($sql)
+        ->and($statement->limitInjected)->toBeFalse()
+        ->and($statement->limitClamped)->toBeFalse();
+})->with([
+    'bare' => 'SELECT TOP 50 * FROM t',
+    'parenthesised' => 'SELECT TOP (50) * FROM t',
+    'DISTINCT' => 'SELECT DISTINCT TOP 50 a FROM t',
+]);
+
+test('a SQL Server TOP above the hard cap is clamped', function (string $sql, string $prepared) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->statements[0]->preparedSql)->toBe($prepared)
+        ->and($result->statements[0]->limitClamped)->toBeTrue();
+})->with([
+    'bare' => ['SELECT TOP 50000 * FROM t', 'SELECT TOP 10000 * FROM t'],
+    'parenthesised' => ['SELECT TOP (50000) * FROM t', 'SELECT TOP (10000) * FROM t'],
+    'after a comment naming TOP' => [
+        'SELECT /* TOP 5 */ TOP 50000 * FROM t',
+        'SELECT /* TOP 5 */ TOP 10000 * FROM t',
+    ],
+]);
+
+test('a SQL Server TOP the guard cannot read is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlsrv)->passes())->toBeFalse();
+})->with([
+    'PERCENT' => 'SELECT TOP 10 PERCENT * FROM t',
+    'PERCENT, parenthesised' => 'SELECT TOP (10) PERCENT * FROM t',
+    'variable' => 'SELECT TOP (@n) * FROM t',
+    'expression' => 'SELECT TOP (5 + 5) * FROM t',
+    'decimal' => 'SELECT TOP (1.5) * FROM t',
+]);
+
+test('SQLite constructs that reach another file or native code are rejected', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlite);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->not->toBeEmpty();
+})->with([
+    'ATTACH' => "ATTACH DATABASE '/etc/x' AS x",
+    'ATTACH, lower case' => "attach '/etc/x' as x",
+    'DETACH' => 'DETACH DATABASE x',
+    'load_extension' => "SELECT load_extension('x')",
+    'load_extension, upper case' => "SELECT LOAD_EXTENSION('x', 'entry')",
+    'VACUUM INTO' => "VACUUM INTO '/tmp/x'",
+    'VACUUM schema INTO' => "VACUUM main INTO '/tmp/x'",
+    'PRAGMA assignment' => 'PRAGMA writable_schema = 1',
+    'PRAGMA assignment, allowed name' => 'PRAGMA table_info = 1',
+    'PRAGMA not on the list' => 'PRAGMA journal_mode',
+    'PRAGMA not on the list, call form' => 'PRAGMA wal_checkpoint(TRUNCATE)',
+    'EXPLAIN PRAGMA assignment' => 'EXPLAIN PRAGMA writable_schema = 1',
+    'EXPLAIN QUERY PLAN PRAGMA assignment' => 'EXPLAIN QUERY PLAN PRAGMA writable_schema = 1',
+    'EXPLAIN PRAGMA not on the list' => 'EXPLAIN PRAGMA journal_mode',
+    'EXPLAIN ATTACH' => "EXPLAIN ATTACH DATABASE '/etc/x' AS x",
+    'EXPLAIN QUERY PLAN ATTACH' => "EXPLAIN QUERY PLAN ATTACH '/etc/x' AS x",
+    'EXPLAIN DETACH' => 'EXPLAIN DETACH x',
+    'EXPLAIN VACUUM INTO' => "EXPLAIN VACUUM INTO '/tmp/x'",
+]);
+
+test('SQLite command words used as column names are not commands', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlite);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'attach column' => 'SELECT attach FROM t',
+    'attach column with an alias' => 'SELECT attach AS a, detach FROM t',
+    'pragma column in a condition' => 'SELECT a FROM t WHERE pragma = 1',
+]);
+
+test('a SQLite command word in a command position is rejected whatever follows it', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlite)->passes())->toBeFalse();
+})->with([
+    'ATTACH, unary plus' => "ATTACH +'/tmp/e.db' AS x",
+    'ATTACH, unary minus' => "ATTACH -'/tmp/e.db' AS x",
+    'ATTACH, bitwise not' => "ATTACH ~'/tmp/e.db' AS x",
+    'ATTACH, NOT' => "ATTACH NOT '/tmp/e.db' AS x",
+    'ATTACH, comment then unary plus' => "ATTACH -- c\n+'/tmp/e.db' AS x",
+    'ATTACH, parenthesised file' => "ATTACH ('/tmp/e.db') AS x",
+    'DETACH, bracketed schema' => 'DETACH [x]',
+    'VACUUM, bracketed schema' => "VACUUM [main] INTO '/tmp/v.db'",
+    'VACUUM, bracketed temp schema' => "VACUUM [temp] INTO '/tmp/v.db'",
+    'VACUUM, quoted schema' => "VACUUM \"main\" INTO '/tmp/v.db'",
+    'VACUUM, backticked schema' => "VACUUM `main` INTO '/tmp/v.db'",
+    'PRAGMA after a value' => 'SELECT 1 PRAGMA writable_schema = 1',
+]);
+
+/*
+ * Every input the anchored patterns this phase replaced —
+ * /^(ATTACH|DETACH)\b/i, /^VACUUM\b.*\bINTO\b/i and /^BULK\s+INSERT\b/i over
+ * the normalized statement — rejected must stay rejected.
+ */
+dataset('former sqlite command patterns', [
+    'ATTACH DATABASE' => "ATTACH DATABASE '/tmp/e.db' AS x",
+    'ATTACH' => "ATTACH '/tmp/e.db' AS x",
+    'ATTACH, lower case' => "attach '/tmp/e.db' as x",
+    'ATTACH, unary plus' => "ATTACH +'/tmp/e.db' AS x",
+    'ATTACH, unary minus' => "ATTACH -'/tmp/e.db' AS x",
+    'ATTACH, bitwise not' => "ATTACH ~'/tmp/e.db' AS x",
+    'ATTACH, NOT' => "ATTACH NOT '/tmp/e.db' AS x",
+    'ATTACH, comment inside' => "ATTACH /* c */ '/tmp/e.db' AS x",
+    'ATTACH, line comment inside' => "ATTACH -- c\n+'/tmp/e.db' AS x",
+    'ATTACH, parenthesised file' => "ATTACH('/tmp/e.db') AS x",
+    'ATTACH, quoted file' => 'ATTACH "/tmp/e.db" AS x',
+    'ATTACH, concatenated file' => "ATTACH '/tmp/' || 'e.db' AS x",
+    'ATTACH, identifier file' => 'ATTACH x AS y',
+    'ATTACH, dot after it' => 'ATTACH.x',
+    'ATTACH alone' => 'ATTACH',
+    'DETACH' => 'DETACH x',
+    'DETACH DATABASE' => 'DETACH DATABASE x',
+    'DETACH, quoted schema' => 'DETACH "x"',
+    'DETACH, bracketed schema' => 'DETACH [x]',
+    'DETACH, lower case' => 'detach x',
+    'DETACH alone' => 'DETACH',
+    'VACUUM INTO' => "VACUUM INTO '/tmp/v.db'",
+    'VACUUM INTO, lower case' => "vacuum into '/tmp/v.db'",
+    'VACUUM schema INTO' => "VACUUM main INTO '/tmp/v.db'",
+    'VACUUM bracketed schema INTO' => "VACUUM [main] INTO '/tmp/v.db'",
+    'VACUUM bracketed temp schema INTO' => "VACUUM [temp] INTO '/tmp/v.db'",
+    'VACUUM quoted schema INTO' => "VACUUM \"main\" INTO '/tmp/v.db'",
+    'VACUUM backticked schema INTO' => "VACUUM `main` INTO '/tmp/v.db'",
+    'VACUUM, comment before INTO' => "VACUUM /* c */ INTO '/tmp/v.db'",
+    'VACUUM, line break before INTO' => "VACUUM\nINTO '/tmp/v.db'",
+    'VACUUM INTO, unary plus' => "VACUUM INTO +'/tmp/v.db'",
+    'VACUUM INTO, parenthesised file' => "VACUUM INTO('/tmp/v.db')",
+    'VACUUM INTO, concatenated file' => "VACUUM main INTO '/tmp/' || 'v.db'",
+]);
+
+dataset('former bulk insert patterns', [
+    'BULK INSERT' => "BULK INSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT, lower case' => "bulk insert t from 'c:\\x.csv'",
+    'BULK INSERT, several spaces' => "BULK    INSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT, line break' => "BULK\nINSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT, comment between' => "BULK /* c */ INSERT t FROM 'c:\\x.csv'",
+    'BULK INSERT, bracketed table' => "BULK INSERT [dbo].[t] FROM 'c:\\x.csv'",
+    'BULK INSERT, quoted table' => "BULK INSERT \"t\" FROM 'c:\\x.csv'",
+]);
+
+test('what the former SQLite command patterns rejected stays rejected', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with('former sqlite command patterns')->with([
+    'sqlite' => DbDriver::Sqlite,
+    'no driver' => null,
+]);
+
+test('what the former BULK INSERT pattern rejected stays rejected', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with('former bulk insert patterns')->with([
+    'sqlsrv' => DbDriver::Sqlsrv,
+    'no driver' => null,
+]);
+
+test('the SQLite command words are ordinary identifiers in other dialects', function (string $sql, DbDriver $driver) {
+    $violations = implode("\n", inspect($sql, $driver)->violations);
+
+    expect($violations)->not->toContain('ATTACH')
+        ->and($violations)->not->toContain('VACUUM')
+        ->and($violations)->not->toContain('PRAGMA');
+})->with([
+    'table named attach' => 'SELECT * FROM attach a',
+    'column named attach with an alias' => 'SELECT attach x FROM t',
+    'joined table named detach' => 'SELECT a FROM t JOIN detach d ON 1=1',
+    'column named vacuum selected into a variable' => 'SELECT vacuum INTO @v FROM t',
+    'leading command word' => 'SELECT 1 FROM t WHERE 1 = 1 ORDER BY attach',
+])->with([
+    'mysql' => DbDriver::Mysql,
+    'pgsql' => DbDriver::Pgsql,
+]);
+
+test('SQLite command words in an identifier position are not commands', function (string $sql) {
+    $violations = implode("\n", inspect($sql, DbDriver::Sqlite)->violations);
+
+    expect($violations)->not->toContain('ATTACH')
+        ->and($violations)->not->toContain('VACUUM')
+        ->and($violations)->not->toContain('PRAGMA');
+})->with([
+    'table and columns named after commands' => 'CREATE TABLE attach (pragma int, vacuum int)',
+    'insert into a table named attach' => 'INSERT INTO attach VALUES (1)',
+    'update of command-named columns' => 'UPDATE t SET vacuum = 1 WHERE pragma = 2',
+    'join of command-named tables' => 'SELECT * FROM attach a LEFT JOIN detach d ON a.id = d.id',
+]);
+
+test('a comment SQLite or SQL Server reads differently from the guard is rejected', function (string $sql, DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with([
+    'sqlite, -- without a space hides a SELECT' => ["--x SELECT\nATTACH '/tmp/e.db' AS x", DbDriver::Sqlite],
+    'sqlite, -- without a space' => ["--x\nATTACH '/tmp/e.db' AS x", DbDriver::Sqlite],
+    'sqlite, # is not a comment' => ["SELECT 1 # x\n", DbDriver::Sqlite],
+    'sqlsrv, -- without a space hides a SELECT' => ["--x SELECT\nEXEC xp_cmdshell 'dir'", DbDriver::Sqlsrv],
+    'sqlsrv, -- glued to a number' => ['SELECT 1--1', DbDriver::Sqlsrv],
+    'sqlsrv, nested block comment' => ["/* /* */ SELECT ' */ EXEC xp_cmdshell ''dir'' --'", DbDriver::Sqlsrv],
+]);
+
+test('comments both readings agree on still pass', function (string $sql, DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeTrue();
+})->with([
+    'sqlite, line comment' => ["SELECT 1 -- note\n", DbDriver::Sqlite],
+    'sqlite, double minus with a space' => ['SELECT 1 - -1', DbDriver::Sqlite],
+    'sqlsrv, block comment' => ['SELECT 1 /* note */', DbDriver::Sqlsrv],
+    'sqlsrv, temporary table ending its line' => ["SELECT * FROM #orders\nWHERE id = 1", DbDriver::Sqlsrv],
+    'sqlsrv, global temporary table ending the statement' => ['SELECT * FROM ##orders', DbDriver::Sqlsrv],
+]);
+
+test('a SQLite name in a literal or a comment is not a call', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlite);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'string literal' => "SELECT 'load_extension(x)'",
+    'comment' => 'SELECT 1 -- ATTACH DATABASE x',
+]);
+
+test('read-only SQLite pragmas pass as reads', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlite);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'table_info' => 'PRAGMA table_info(users)',
+    'schema-qualified' => 'PRAGMA main.table_info(users)',
+    'lower case keyword' => 'pragma INDEX_LIST(users)',
+    'no argument' => 'PRAGMA compile_options',
+    'database_list' => 'PRAGMA database_list',
+]);
+
+test('VACUUM without INTO is not mistaken for VACUUM INTO', function () {
+    expect(inspect('VACUUM', DbDriver::Sqlite)->violations)->toBeEmpty();
+});
+
+test('the SQLite pragma allowlist can be extended from configuration', function () {
+    config(['queryproxy.sqlite_allowed_pragmas' => ['user_version']]);
+
+    expect(inspect('PRAGMA user_version', DbDriver::Sqlite)->passes())->toBeTrue()
+        ->and(inspect('PRAGMA user_version = 3', DbDriver::Sqlite)->passes())->toBeFalse()
+        // The call form of an added pragma sets it, just like "= v".
+        ->and(inspect('PRAGMA user_version(3)', DbDriver::Sqlite)->passes())->toBeFalse()
+        // The floor stays even when configuration leaves it out.
+        ->and(inspect('PRAGMA table_info(users)', DbDriver::Sqlite)->passes())->toBeTrue();
+});
+
+test('a SQL Server batch without semicolons is judged statement by statement', function (string $sql, string $violation) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($violation);
+})->with([
+    'DELETE after a SELECT' => ['SELECT 1 DELETE FROM t', 'DELETE without a WHERE clause'],
+    'UPDATE after a SELECT' => ['SELECT 1 UPDATE t SET a = 1', 'UPDATE without a WHERE clause'],
+    'DELETE after IF' => ['IF 1 = 1 DELETE FROM t', 'DELETE without a WHERE clause'],
+    'DELETE after IF ... ELSE' => ['IF 1 = 1 SELECT 1 ELSE DELETE FROM t', 'DELETE without a WHERE clause'],
+    'DELETE inside BEGIN ... END' => ['IF 1 = 1 BEGIN SELECT 1 DELETE FROM t END', 'DELETE without a WHERE clause'],
+    'DELETE inside TRY ... CATCH' => ['BEGIN TRY DELETE FROM t END TRY BEGIN CATCH SELECT 1 END CATCH', 'DELETE without a WHERE clause'],
+    'DELETE after WHILE' => ['WHILE 1 = 1 DELETE FROM t', 'DELETE without a WHERE clause'],
+    'DELETE after DECLARE' => ['DECLARE @x int = 1 DELETE FROM t', 'DELETE without a WHERE clause'],
+    'DELETE after SET ... ON' => ['SET NOCOUNT ON DELETE FROM t', 'DELETE without a WHERE clause'],
+    'DELETE after a CTE query' => ['WITH c AS (SELECT 1 a) SELECT * FROM c DELETE FROM t', 'DELETE without a WHERE clause'],
+    'EXEC after a temporary table' => ["SELECT 1 FROM #t EXEC xp_cmdshell 'dir'", 'xp_cmdshell'],
+    'blocked function after a SELECT' => ['SELECT 1 SELECT 2 FROM t WHERE 1 = 1 UPDATE t SET a = 1', 'UPDATE without a WHERE clause'],
+]);
+
+test('a statement after a SELECT in a SQL Server batch decides its class', function () {
+    $drop = inspect('SELECT 1 DROP DATABASE x', DbDriver::Sqlsrv);
+    $merge = inspect('MERGE t USING s ON t.id = s.id WHEN MATCHED THEN DELETE DROP TABLE x', DbDriver::Sqlsrv);
+    $delete = inspect('SELECT 1 DELETE FROM t WHERE id = 1', DbDriver::Sqlsrv);
+
+    expect($drop->passes())->toBeFalse()
+        ->and($drop->hasDdl())->toBeTrue()
+        ->and($merge->hasDdl())->toBeTrue()
+        ->and($merge->type())->toBe(StatementType::Write)
+        ->and($delete->passes())->toBeTrue()
+        ->and($delete->type())->toBe(StatementType::Write)
+        // A write batch runs as written: no TOP is added to its SELECT.
+        ->and($delete->statements[0]->preparedSql)->toBe('SELECT 1 DELETE FROM t WHERE id = 1');
+});
+
+test('a SQL Server batch whose statement boundaries are unclear is rejected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlsrv)->passes())->toBeFalse();
+})->with([
+    'DML inside parentheses' => 'SELECT * FROM (DELETE FROM t) x',
+    'BEGIN without END' => 'BEGIN SELECT 1',
+    'END without BEGIN' => 'SELECT 1 END',
+    'END TRY closing a plain BEGIN' => 'BEGIN SELECT 1 END TRY',
+    'ELSE without IF' => 'ELSE SELECT 1',
+    'unbalanced parentheses' => 'SELECT (1',
+    'embedded transaction' => 'BEGIN TRAN DELETE FROM t WHERE id = 1 COMMIT',
+    'embedded rollback' => 'SELECT 1 ROLLBACK',
+    'BEGIN DIALOG' => 'BEGIN DIALOG @h FROM SERVICE s TO SERVICE \'t\'',
+    'statement inside CASE' => 'SELECT CASE WHEN 1 = 1 THEN 1 DELETE FROM t END',
+    'a word where a statement is expected' => 'IF 1 = 1 BEGIN x END',
+]);
+
+test('ordinary SQL Server batches and statements still pass', function (string $sql, StatementType $type) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe($type);
+})->with([
+    'IF ... ELSE of reads' => ['IF @x = 1 SELECT 1 ELSE SELECT 2', StatementType::Read],
+    'two reads' => ['SELECT 1 SELECT 2', StatementType::Read],
+    'CTE with a leading semicolon' => [';WITH c AS (SELECT 1 a) SELECT * FROM c', StatementType::Read],
+    'CTE feeding a DELETE' => ['WITH c AS (SELECT id FROM s) DELETE FROM t WHERE id IN (SELECT id FROM c)', StatementType::Write],
+    'full MERGE' => ['MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.a = s.a WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a);', StatementType::Write],
+    'EXISTS subquery' => ['SELECT * FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)', StatementType::Read],
+    'IN subquery' => ['DELETE FROM t WHERE id IN (SELECT id FROM s)', StatementType::Write],
+    'INSERT ... SELECT' => ['INSERT INTO t SELECT * FROM s', StatementType::Write],
+    'INSERT ... VALUES' => ['INSERT INTO t (a) VALUES (1)', StatementType::Write],
+    'UPDATE ... FROM' => ['UPDATE t SET a = s.a FROM t JOIN s ON s.id = t.id WHERE t.id = 1', StatementType::Write],
+    'UNION' => ['SELECT 1 UNION ALL SELECT 2', StatementType::Read],
+    'OFFSET ... FETCH' => ['SELECT * FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY', StatementType::Read],
+    'CASE with ELSE and END' => ["SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END FROM t", StatementType::Read],
+    'TRY ... CATCH of reads' => ['BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH', StatementType::Read],
+    'WHILE with a block' => ['WHILE @i < 3 BEGIN SET @i = @i + 1 END', StatementType::Write],
+    'THROW after a condition' => ["IF @x = 1 THROW 51000, 'm', 1", StatementType::Write],
+    'IF NOT EXISTS and IS NOT NULL' => ['IF NOT EXISTS (SELECT 1 FROM t) AND @x IS NOT NULL SELECT 1 ELSE SELECT 2', StatementType::Read],
+    'function condition' => ["IF OBJECT_ID('t') IS NULL AND dbo.f(1) = 1 SELECT 1", StatementType::Read],
+    'nested IF in a block before ELSE' => ['IF @x = 1 BEGIN IF @y = 1 SELECT 1 END ELSE SELECT 2', StatementType::Read],
+    'bare RETURN before a statement' => ['IF @x IS NULL RETURN SELECT 1', StatementType::Read],
+    'aliases of every form' => ["SELECT a AS [b], c 'd', e f, g = 1, N'x' h FROM t AS u SELECT 1", StatementType::Read],
+    'TOP, WITH TIES and table hints' => ['SELECT DISTINCT TOP (3) WITH TIES t.* FROM dbo.t t WITH (NOLOCK) ORDER BY a DESC SELECT 1', StatementType::Read],
+    'FOR XML and ROLLUP' => ["SELECT a FROM t GROUP BY a WITH ROLLUP FOR XML PATH('r'), ROOT('x') SELECT 1", StatementType::Read],
+    'APPLY and PIVOT' => ['SELECT * FROM t CROSS APPLY f(t.a) x PIVOT (SUM(a) FOR b IN ([x], [y])) p SELECT 1', StatementType::Read],
+    'AT TIME ZONE and FOR SYSTEM_TIME' => ["SELECT a AT TIME ZONE 'UTC' AS z FROM t FOR SYSTEM_TIME AS OF '2020-01-01' SELECT 1", StatementType::Read],
+    'INSERT ... DEFAULT VALUES and EXEC' => ['INSERT t DEFAULT VALUES INSERT INTO #t EXEC p 1', StatementType::Write],
+    'MERGE DELETE action' => ['MERGE t USING s ON t.id = s.id WHEN MATCHED THEN DELETE SELECT 1', StatementType::Write],
+    'SET switches before a DELETE' => ['SET NOCOUNT ON DELETE FROM t WHERE a = 1', StatementType::Write],
+    'SET switch lists' => ['SET XACT_ABORT, NOCOUNT ON SET STATISTICS IO, TIME OFF SELECT 1', StatementType::Write],
+    'SET IDENTITY_INSERT around an INSERT' => ['SET IDENTITY_INSERT dbo.t ON INSERT INTO t (a) VALUES (1) SET IDENTITY_INSERT [dbo].[t] OFF', StatementType::Write],
+    'SET TRANSACTION ISOLATION LEVEL' => ['SET TRANSACTION ISOLATION LEVEL READ COMMITTED SELECT 1', StatementType::Write],
+    'SET settings with values' => ['SET DEADLOCK_PRIORITY -5 SET LANGUAGE us_english SET DATEFORMAT dmy SET LOCK_TIMEOUT 1000 SET CONTEXT_INFO 0x1F SELECT 1', StatementType::Write],
+    'SET of a variable' => ['DECLARE @x int SET @x = @@ROWCOUNT SET @x += 1 SELECT @x', StatementType::Write],
+    'DECLARE lists, tables and initializers' => ["DECLARE @x varchar(10) = N'a', @t TABLE (a int), @d AS dbo.T, @n decimal(10, 2) = 1.5 SELECT @x", StatementType::Write],
+    'DECLARE with a subquery and CASE' => ['DECLARE @x int = (SELECT COUNT(*) FROM t) IF @x > 0 SET @x = CASE WHEN @x > 1 THEN 2 ELSE 1 END SELECT @x', StatementType::Write],
+    'DECLARE CURSOR' => ['DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT a FROM t OPEN c', StatementType::Write],
+    'PRINT of an expression' => ["DECLARE @d datetime = GETDATE() PRINT 'done: ' + CAST(@d AS varchar(30))", StatementType::Write],
+    'bare THROW in CATCH' => ['BEGIN TRY SELECT 1 END TRY BEGIN CATCH THROW END CATCH', StatementType::Write],
+    'THROW with arguments before ELSE' => ["IF @x IS NULL THROW 51000, 'm', 1 ELSE PRINT 'ok'", StatementType::Write],
+    'EXEC with a bare argument' => ['EXEC sp_who active SELECT 1', StatementType::Write],
+    'EXEC with named, OUTPUT and WITH RECOMPILE arguments' => ["EXEC dbo.p @a = 1, @b = @c OUTPUT, @d = DEFAULT WITH RECOMPILE EXEC p N'x', @y OUT", StatementType::Write],
+    'EXECUTE AS and REVERT' => ["EXECUTE AS USER = 'u' SELECT 1 REVERT", StatementType::Write],
+    'RAISERROR with options' => ["RAISERROR('m', 16, 1) WITH NOWAIT RAISERROR 50001 'x'", StatementType::Write],
+    'USE before a query' => ['USE [db] SELECT 1', StatementType::Write],
+    'DBCC with options' => ["DBCC CHECKDB (db) WITH NO_INFOMSGS DBCC CHECKIDENT ('t', RESEED, 0)", StatementType::Write],
+    'WAITFOR' => ["WAITFOR DELAY '00:00:01' WAITFOR TIME '10:00' SELECT 1", StatementType::Write],
+    'cursor statements' => ['DECLARE c CURSOR FOR SELECT a FROM t OPEN c FETCH NEXT FROM c INTO @a, @b CLOSE c DEALLOCATE c', StatementType::Write],
+    'BACKUP and RESTORE' => ["BACKUP DATABASE d TO DISK = 'x' WITH INIT RESTORE DATABASE d FROM DISK = 'x' WITH MOVE 'a' TO 'b', REPLACE", StatementType::Write],
+    'KILL, CHECKPOINT and RECONFIGURE' => ['KILL 5 WITH STATUSONLY CHECKPOINT RECONFIGURE WITH OVERRIDE', StatementType::Write],
+    'THROW starting the batch' => ["THROW 50000, 'x', 1 SELECT 1", StatementType::Write],
+    'EXEC with a return status and a bare argument' => ['EXEC @rc = p active', StatementType::Write],
+    'REVERT WITH COOKIE' => ['REVERT WITH COOKIE = @c', StatementType::Write],
+    'USE master before a query' => ['USE master SELECT 1', StatementType::Write],
+    'CHECKPOINT with a duration' => ['CHECKPOINT 10 SELECT 1', StatementType::Write],
+]);
+
+test('a statement QueryProxy does not know is not taken into the one before it', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations[0])->toContain('cannot tell where the statements of this SQL Server batch end');
+})->with([
+    'DISABLE TRIGGER after IF' => 'IF 1 = 1 DISABLE TRIGGER ALL ON t',
+    'ENABLE TRIGGER after WHILE' => 'WHILE 1 = 0 ENABLE TRIGGER ALL ON ALL SERVER',
+    'ADD SIGNATURE after IF' => 'IF 1 = 1 ADD SIGNATURE TO dbo.p BY CERTIFICATE c',
+    'DISABLE TRIGGER after a SELECT' => 'SELECT 1 DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after an alias' => 'SELECT 1 AS a DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after a table name' => 'SELECT a FROM t DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after a parenthesized query' => '(SELECT 1) DISABLE TRIGGER ALL ON t',
+    'RECEIVE after IF' => 'IF 1 = 1 RECEIVE * FROM q',
+    'RECEIVE after a SELECT' => 'SELECT 1 RECEIVE TOP (1) * FROM q',
+    'RECEIVE after ORDER BY' => 'SELECT a FROM t ORDER BY a DESC RECEIVE * FROM q',
+    'RECEIVE after RETURN' => 'RETURN RECEIVE * FROM q',
+    'SEND after a SELECT' => 'SELECT 1 SEND ON CONVERSATION @h (@b)',
+    'DISABLE TRIGGER after GOTO' => 'GOTO x DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after RETURN' => 'RETURN DISABLE TRIGGER ALL ON t',
+    'unknown keyword after IF' => 'IF 1 = 1 FROBNICATE t',
+    'unknown keyword after a SELECT' => 'SELECT 1 FROBNICATE TABLE t',
+    'unknown keyword starting the batch' => 'FROBNICATE t SELECT 1',
+    'DISABLE TRIGGER after a SET switch' => 'SET NOCOUNT ON DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after SET of a variable' => 'SET @x = 1 DISABLE TRIGGER ALL ON t',
+    'SEND after SET TRANSACTION ISOLATION LEVEL' => 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED SEND ON CONVERSATION @h',
+    'unknown keyword after a SET switch' => 'SET NOCOUNT ON FROBNICATE',
+    'unknown SET option' => 'SET FROBNICATE ON',
+    'DISABLE TRIGGER after DECLARE' => 'DECLARE @x int DISABLE TRIGGER ALL ON t',
+    'unknown keyword after a DECLARE initializer' => 'DECLARE @x int = 5 FROBNICATE',
+    'DISABLE TRIGGER after a DECLARE CURSOR query' => 'DECLARE c CURSOR LOCAL FOR SELECT a FROM t DISABLE TRIGGER ALL ON t',
+    'RECEIVE after PRINT' => "PRINT 'x' RECEIVE TOP (1) * FROM q",
+    'DISABLE TRIGGER after THROW with arguments' => "IF 1 = 1 THROW 51000, 'm', 1 DISABLE TRIGGER ALL ON t",
+    'DISABLE TRIGGER after a bare THROW' => 'BEGIN TRY SELECT 1 END TRY BEGIN CATCH THROW DISABLE TRIGGER ALL ON t END CATCH',
+    'DISABLE TRIGGER after EXEC' => 'EXEC p 1 DISABLE TRIGGER ALL ON t',
+    'RECEIVE after the bare argument of an EXEC' => 'EXEC p active RECEIVE * FROM q',
+    'RECEIVE after an OUTPUT argument' => 'EXEC p @x OUTPUT RECEIVE * FROM q',
+    'RECEIVE after a DEFAULT argument' => 'EXEC p @a = DEFAULT RECEIVE * FROM q',
+    'RECEIVE after INSERT ... EXEC' => 'INSERT INTO #t EXEC p 1 RECEIVE * FROM q',
+    'DISABLE TRIGGER after RAISERROR' => "RAISERROR('m', 16, 1) DISABLE TRIGGER ALL ON t",
+    'DISABLE TRIGGER after USE' => 'USE db DISABLE TRIGGER ALL ON t',
+    'RECEIVE after USE' => 'USE [db] RECEIVE * FROM q',
+    'DISABLE TRIGGER after DBCC' => 'DBCC CHECKDB WITH NO_INFOMSGS DISABLE TRIGGER ALL ON t',
+    'SEND after KILL' => 'KILL 5 SEND ON CONVERSATION @h',
+    'unknown keyword after WAITFOR' => "WAITFOR DELAY '00:00:01' FROBNICATE",
+    'DISABLE TRIGGER after a cursor statement' => 'OPEN c DISABLE TRIGGER ALL ON t',
+    'ADD SIGNATURE after TRUNCATE' => 'TRUNCATE TABLE t ADD SIGNATURE TO dbo.p BY CERTIFICATE c',
+    'RECEIVE after DENY' => 'DENY SELECT ON t TO u CASCADE RECEIVE * FROM q',
+    'RECEIVE after UPDATE STATISTICS' => 'UPDATE STATISTICS t RECEIVE * FROM q',
+    'RECEIVE after DROP' => 'DROP TABLE IF EXISTS t RECEIVE * FROM q',
+    'DISABLE TRIGGER after CREATE INDEX' => 'CREATE INDEX ix ON t (a) DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after REVERT' => 'REVERT DISABLE TRIGGER ALL ON DATABASE',
+    'DISABLE TRIGGER after CHECKPOINT' => 'CHECKPOINT DISABLE TRIGGER ALL ON t',
+    'ENABLE TRIGGER after RECONFIGURE' => 'RECONFIGURE ENABLE TRIGGER tr ON t',
+    'RECEIVE after SETUSER' => 'SETUSER RECEIVE * FROM q',
+    'DISABLE TRIGGER after the procedure name of an EXEC' => 'EXEC p DISABLE TRIGGER ALL ON DATABASE',
+    'DISABLE TRIGGER after USE master' => 'USE master DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after a procedure named like a body keyword' => 'EXEC log DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after OPEN of a cursor' => 'OPEN cache DISABLE TRIGGER ALL ON t',
+    'DISABLE TRIGGER after THROW starting the batch' => "THROW 50000, 'x', 1 DISABLE TRIGGER ALL ON t",
+    'RECEIVE after a bare THROW starting the batch' => 'THROW RECEIVE * FROM q',
+]);
+
+test('DENY is rejected like GRANT and REVOKE', function (DbDriver $driver) {
+    foreach (['DENY SELECT ON t TO u', 'BEGIN; DENY SELECT ON t TO u; COMMIT;'] as $sql) {
+        $result = inspect($sql, $driver);
+
+        expect($result->passes())->toBeFalse()
+            ->and(implode(' ', $result->violations))->toContain('DENY statements are not allowed');
+    }
+})->with(DbDriver::cases());
+
+test('a statement starting with an unknown word is not a read even when a query follows it', function (DbDriver $driver) {
+    // The parser skips a leading word it does not know and parses the rest as
+    // a SELECT; the statement must still not take the transactionless read path.
+    expect(inspect('FROBNICATE SELECT * FROM t', $driver)->type())->not->toBe(StatementType::Read);
+})->with(DbDriver::cases());
+
+test('DENY after a query in a SQL Server batch is rejected', function () {
+    $result = inspect('SELECT 1 DENY SELECT ON t TO u', DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode(' ', $result->violations))->toContain('DENY statements are not allowed');
+});
+
+test('each ELSE takes an IF of its own', function () {
+    $result = inspect('IF 1 = 1 IF 2 = 2 SELECT 1 ELSE SELECT 2 ELSE SELECT 3 ELSE SELECT 4', DbDriver::Sqlsrv);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations[0])->toContain('ELSE without a preceding IF')
+        ->and(inspect('IF 1 = 1 IF 2 = 2 SELECT 1 ELSE SELECT 2 ELSE SELECT 3', DbDriver::Sqlsrv)->violations)->toBe([]);
+});
+
+test('SQL Server DDL with keywords that also start statements stays one statement', function (string $sql) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->violations)->toBe([])
+        ->and($result->hasDdl())->toBeTrue();
+})->with([
+    'foreign key actions' => 'ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES p(id) ON DELETE CASCADE ON UPDATE SET NULL',
+    'ALTER COLUMN' => 'ALTER TABLE t ALTER COLUMN a int',
+    'DROP COLUMN' => 'ALTER TABLE t DROP COLUMN a',
+    'DROP ... IF EXISTS' => 'DROP TABLE IF EXISTS t',
+    'procedure body' => 'CREATE PROCEDURE p AS BEGIN SELECT 1 DELETE FROM t END',
+]);
+
+test('SQL Server temporary tables are names, not comments', function (string $sql, StatementType $type, string $prepared) {
+    $result = inspect($sql, DbDriver::Sqlsrv);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe($type)
+        ->and($result->statements[0]->sql)->toBe($sql)
+        ->and($result->statements[0]->preparedSql)->toBe($prepared);
+})->with([
+    'local temporary table' => ['SELECT * FROM #t WHERE id = 1', StatementType::Read, 'SELECT TOP (1000) * FROM #t WHERE id = 1'],
+    'global temporary table' => ['SELECT * FROM ##t', StatementType::Read, 'SELECT TOP (1000) * FROM ##t'],
+    'bracketed temporary table' => ['SELECT * FROM [#t]', StatementType::Read, 'SELECT TOP (1000) * FROM [#t]'],
+    'insert into a temporary table' => ['INSERT INTO #t (a) VALUES (1)', StatementType::Write, 'INSERT INTO #t (a) VALUES (1)'],
+]);
+
+test('a statement after a SQL Server temporary table is still inspected', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlsrv)->passes())->toBeFalse();
+})->with([
+    'DELETE without WHERE on the same line' => 'SELECT * FROM #t WHERE id = 1 DELETE FROM #t',
+    'second statement after a semicolon' => 'SELECT 1 FROM #t; DROP TABLE users',
+    'DEL character next to a temporary table' => "SELECT 1 FROM #t\x7F",
+]);
+
+test('# keeps its meaning in MySQL and PostgreSQL', function () {
+    $mysql = inspect("SELECT * FROM t # DELETE FROM t\n", DbDriver::Mysql);
+    $pgsql = inspect('SELECT 5 # 3', DbDriver::Pgsql);
+
+    expect($mysql->violations)->toBe([])
+        ->and($mysql->type())->toBe(StatementType::Read)
+        ->and($pgsql->violations)->toBe([])
+        ->and($pgsql->type())->toBe(StatementType::Read);
+});
+
+test('quoting the guard reads differently from SQL Server or SQLite is rejected', function (string $sql, DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with([
+    'sqlsrv, backslash before a closing quote' => ["SELECT 'a\\' EXEC xp_cmdshell 'dir' --'", DbDriver::Sqlsrv],
+    'sqlite, backslash before a closing quote' => ["SELECT 'a\\' ATTACH 'x' AS y --'", DbDriver::Sqlite],
+    'sqlsrv, dollar quote' => ["SELECT \$\$a\$\$ EXEC xp_cmdshell 'dir' --\$\$", DbDriver::Sqlsrv],
+    'mysql, dollar quote' => ['SELECT $$a$$', DbDriver::Mysql],
+    'sqlite, dollar quote' => ['SELECT $$a$$', DbDriver::Sqlite],
+]);
+
+test('multibyte text does not move statement boundaries', function (DbDriver $driver) {
+    $result = inspect("BEGIN; SELECT 'ğğğğ'; DELETE FROM users WHERE id = 1; COMMIT;", $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->statements)->toHaveCount(2)
+        ->and($result->statements[1]->sql)->toBe('DELETE FROM users WHERE id = 1');
+})->with([
+    'mysql' => DbDriver::Mysql,
+    'pgsql' => DbDriver::Pgsql,
+    'sqlsrv' => DbDriver::Sqlsrv,
 ]);

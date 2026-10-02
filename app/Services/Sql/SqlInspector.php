@@ -140,6 +140,12 @@ class SqlInspector
     private const MAX_NESTING_DEPTH = 3;
 
     /**
+     * Stands in for a SQL Server "#" (temporary table marker) while the
+     * statement is inspected; see maskTemporaryTableMarkers().
+     */
+    private const TEMPORARY_TABLE_SENTINEL = "\x7F";
+
+    /**
      * Procedural languages whose functions execute outside the database's
      * permission system — installing one, or asking a DO block to run in one,
      * is equivalent to shell access on the database host. The PostgreSQL
@@ -251,6 +257,72 @@ class SqlInspector
     ];
 
     /**
+     * SQL Server procedures that run operating-system commands, change the
+     * server configuration, drive OLE automation objects or register another
+     * server, register a DLL or run an external R / Python script. Invoking
+     * one — as the first word of a statement or after EXEC / EXECUTE,
+     * however the name is qualified or bracketed — is rejected. A trailing
+     * "*" matches every name with that prefix.
+     *
+     * Only the invocation is judged, not every mention: a column that happens
+     * to be called xp_points is not a procedure call.
+     *
+     * Configuration is merged on top of this list and can only extend it;
+     * these entries are the floor.
+     *
+     * @var list<string>
+     */
+    public const BLOCKED_PROCEDURES = [
+        'xp_*',
+        'sp_configure',
+        'sp_oa*',
+        'sp_addlinkedserver',
+        'sp_addlinkedsrvlogin',
+        'sp_serveroption',
+        'sp_addextendedproc',
+        'sp_execute_external_script',
+    ];
+
+    /**
+     * SQL Server rowset functions that read from another server or from a
+     * file on the database host. Calling one is rejected.
+     */
+    private const REMOTE_ROWSET_FUNCTIONS = ['openrowset', 'opendatasource', 'openquery'];
+
+    /**
+     * Functions that load native code into the database process.
+     */
+    private const CODE_LOADING_FUNCTIONS = ['load_extension'];
+
+    /**
+     * SQLite pragmas that only report on the schema or the build. Any other
+     * pragma — and any pragma written with a value — is rejected: pragmas
+     * such as writable_schema or journal_mode change the database file or
+     * switch a protection off.
+     *
+     * Every entry here takes, at most, a read argument (the table or index
+     * to report on). Configuration is merged on top of this list and can
+     * only extend it; a configured pragma is allowed only in its bare read
+     * form ("PRAGMA user_version"), because "PRAGMA x(v)" assigns a value
+     * just like "PRAGMA x = v". These entries are the floor.
+     *
+     * @var list<string>
+     */
+    public const SQLITE_ALLOWED_PRAGMAS = [
+        'table_info',
+        'table_xinfo',
+        'index_list',
+        'index_info',
+        'index_xinfo',
+        'foreign_key_list',
+        'database_list',
+        'table_list',
+        'collation_list',
+        'function_list',
+        'compile_options',
+    ];
+
+    /**
      * SET scopes that survive the session and therefore change the server for
      * everyone. SESSION / LOCAL writes are deliberately not guarded.
      *
@@ -262,6 +334,7 @@ class SqlInspector
         '/^DROP\s+(DATABASE|SCHEMA)\b/i' => 'DROP DATABASE is not allowed through QueryProxy.',
         '/^GRANT\b/i' => 'GRANT statements are not allowed through QueryProxy.',
         '/^REVOKE\b/i' => 'REVOKE statements are not allowed through QueryProxy.',
+        '/^DENY\b/i' => 'DENY statements are not allowed through QueryProxy.',
         '/^(CREATE|ALTER|DROP)\s+(USER|ROLE|LOGIN)\b/i' => 'User / role management statements are not allowed through QueryProxy.',
         '/^CREATE\s+(AGGREGATE\s+)?FUNCTION\b.*\bSONAME\b/i' => 'CREATE FUNCTION ... SONAME is not allowed through QueryProxy (loadable UDF).',
         '/^SHUTDOWN\b/i' => 'SHUTDOWN is not allowed through QueryProxy.',
@@ -280,9 +353,21 @@ class SqlInspector
 
         [$sql, $lexicalViolation] = $this->resolveComments($sql, $driver);
         $lexicalViolation ??= $this->unicodeEscapeClauseViolation($sql, $driver);
+        $lexicalViolation ??= $this->dollarQuoteDialectViolation($sql, $driver);
+        $dialectRanges = null;
+
+        if ($lexicalViolation === null && ($driver === DbDriver::Sqlsrv || $driver === DbDriver::Sqlite)) {
+            [$sql, $dialectRanges, $lexicalViolation] = $this->maskTemporaryTableMarkers($sql, $driver);
+        }
+
+        $lexicalViolation ??= $this->dialectCommentViolation($sql, $driver);
+
+        if ($lexicalViolation === null && $dialectRanges !== null && $driver !== null) {
+            $lexicalViolation = $this->dialectLexicalViolation($sql, $dialectRanges, $driver);
+        }
 
         if ($lexicalViolation !== null) {
-            return new InspectionResult([], false, [$lexicalViolation]);
+            return new InspectionResult([], false, [$this->unmaskTemporaryTableMarkers($lexicalViolation)]);
         }
 
         $rawStatements = $this->splitStatements($sql);
@@ -305,9 +390,24 @@ class SqlInspector
         $infos = [];
 
         foreach ($executables as $index => $statementSql) {
-            [$info, $statementViolations] = $this->analyzeStatement($statementSql, $index + 1, $driver);
+            [$info, $statementViolations] = $driver === DbDriver::Sqlsrv
+                ? $this->analyzeSqlsrvBatch($statementSql, $index + 1)
+                : $this->analyzeStatement($statementSql, $index + 1, $driver);
             $infos[] = $info;
             $violations = array_merge($violations, $statementViolations);
+        }
+
+        if ($driver === DbDriver::Sqlsrv) {
+            $infos = array_map(fn (StatementInfo $info): StatementInfo => new StatementInfo(
+                $this->unmaskTemporaryTableMarkers($info->sql),
+                $this->unmaskTemporaryTableMarkers($info->preparedSql),
+                $info->type,
+                $info->parsed,
+                $info->limitInjected,
+                $info->limitClamped,
+                $info->isDdl,
+            ), $infos);
+            $violations = array_map($this->unmaskTemporaryTableMarkers(...), $violations);
         }
 
         return new InspectionResult($infos, $isTransaction, array_values(array_unique($violations)));
@@ -336,12 +436,17 @@ class SqlInspector
 
         foreach ($lexer->list->tokens as $token) {
             if ($token->type === TokenType::Delimiter && $token->token !== '' && $token->position !== null) {
-                if ($this->isWithinRange($token->position, $quoted)) {
+                // The lexer counts characters; the dollar-quoted ranges and
+                // substr() count bytes, which differ once the SQL holds
+                // multibyte text such as 'ğ'.
+                $offset = strlen(mb_substr($sql, 0, $token->position));
+
+                if ($this->isWithinRange($offset, $quoted)) {
                     continue;
                 }
 
-                $segments[] = substr($sql, $start, $token->position - $start);
-                $start = $token->position + strlen($token->token);
+                $segments[] = substr($sql, $start, $offset - $start);
+                $start = $offset + strlen($token->token);
             }
         }
 
@@ -466,6 +571,10 @@ class SqlInspector
 
         $tokens = $this->significantTokens($sql);
 
+        foreach ($this->dialectViolations($tokens, $driver) as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
         // The keyword is read from the token stream, never from whitespace:
         // "EXPLAIN(ANALYZE)DELETE", "SELECT*INTO t2" and "(SELECT ...)" all
         // start with a keyword that a split on spaces would not see.
@@ -522,6 +631,11 @@ class SqlInspector
             $isDdl = true;
         }
 
+        // An allowed PRAGMA only reports on the schema or the build.
+        if ($keyword === 'PRAGMA' && $wrappingParens === 0 && $this->pragmaViolation($tokens, 0) === null) {
+            $type = StatementType::Read;
+        }
+
         if ($functionWrites) {
             $type = StatementType::Write;
         }
@@ -556,6 +670,1302 @@ class SqlInspector
             new StatementInfo($sql, $preparedSql, $type, $parsed, $limitInjected, $limitClamped, $isDdl),
             $violations,
         ];
+    }
+
+    /**
+     * Judge one SQL Server batch. T-SQL needs no semicolon between
+     * statements, so "SELECT 1 DELETE FROM t" is two statements to the
+     * server; the batch is cut at every statement boundary
+     * (sqlsrvBatchParts()) and each statement is judged on its own. The
+     * batch takes the heaviest type and every violation of its statements.
+     * A batch whose boundaries cannot be told is refused (fail closed).
+     *
+     * A batch that holds a single statement is judged exactly as before; a
+     * split batch keeps its text and only the reads inside it get their TOP.
+     *
+     * @return array{0: StatementInfo, 1: list<string>}
+     */
+    private function analyzeSqlsrvBatch(string $sql, int $position): array
+    {
+        $label = "Statement {$position}";
+        $parts = $this->sqlsrvBatchParts($sql);
+
+        if (is_string($parts)) {
+            return [new StatementInfo($sql, $sql, StatementType::Write, false), ["{$label}: {$parts}"]];
+        }
+
+        if (count($parts) === 1 && ! $parts[0][1]) {
+            return $this->analyzeStatement($sql, $position, DbDriver::Sqlsrv);
+        }
+
+        $violations = [];
+        $type = StatementType::Read;
+        $isDdl = false;
+        $limitInjected = false;
+        $limitClamped = false;
+        $length = mb_strlen($sql);
+        $preparedSql = mb_substr($sql, 0, $parts[0][0]);
+
+        foreach ($parts as $index => [$start, $isControl]) {
+            $end = $parts[$index + 1][0] ?? $length;
+            $slice = mb_substr($sql, $start, $end - $start);
+            $text = rtrim($slice);
+            $trailing = substr($slice, strlen($text));
+
+            if ($isControl) {
+                [$partType, $partViolations] = $this->analyzeSqlsrvControl($text, $label);
+                $preparedSql .= $slice;
+            } else {
+                [$info, $partViolations] = $this->analyzeStatement($text, $position, DbDriver::Sqlsrv);
+                $partType = $info->type;
+                $isDdl = $isDdl || $info->isDdl;
+                $limitInjected = $limitInjected || $info->limitInjected;
+                $limitClamped = $limitClamped || $info->limitClamped;
+                $preparedSql .= $info->preparedSql.$trailing;
+            }
+
+            if ($partType === StatementType::Write) {
+                $type = StatementType::Write;
+            }
+
+            array_push($violations, ...$partViolations);
+        }
+
+        // A write batch runs as written: TOP only belongs to a read.
+        if ($type === StatementType::Write) {
+            $preparedSql = $sql;
+            $limitInjected = false;
+            $limitClamped = false;
+        }
+
+        return [
+            new StatementInfo($sql, $preparedSql, $type, false, $limitInjected, $limitClamped, $isDdl),
+            array_values(array_unique($violations)),
+        ];
+    }
+
+    /**
+     * A control-of-flow piece of a SQL Server batch — IF or WHILE with its
+     * condition, ELSE, BEGIN, END, BEGIN/END TRY, BEGIN/END CATCH or a
+     * label. It changes no data itself, but a condition can hold a subquery
+     * and call functions, so it gets the same denylist and function checks
+     * as a statement.
+     *
+     * @return array{0: StatementType, 1: list<string>}
+     */
+    private function analyzeSqlsrvControl(string $sql, string $label): array
+    {
+        $violations = [];
+        $normalized = $this->normalize($sql);
+
+        foreach (self::FORBIDDEN_PATTERNS as $pattern => $message) {
+            if (preg_match($pattern, $normalized)) {
+                $violations[] = "{$label}: {$message}";
+            }
+        }
+
+        foreach ($this->targetedViolations($sql) as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        $tokens = $this->significantTokens($sql);
+
+        foreach ($this->dialectViolations($tokens, DbDriver::Sqlsrv) as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        [$functionViolations, $functionWrites] = $this->functionCallEffects($tokens);
+
+        foreach ($functionViolations as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        return [$functionWrites ? StatementType::Write : StatementType::Read, $violations];
+    }
+
+    /**
+     * Words that start a statement in a SQL Server batch. All of them are
+     * reserved in T-SQL, so a bare one is never a name; THROW is not
+     * reserved and only starts a statement where a statement is expected.
+     */
+    private const SQLSRV_STATEMENT_KEYWORDS = [
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'DECLARE', 'SET', 'IF', 'ELSE', 'WHILE',
+        'BEGIN', 'END', 'EXEC', 'EXECUTE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'GRANT', 'REVOKE',
+        'DENY', 'PRINT', 'RETURN', 'BREAK', 'CONTINUE', 'GOTO', 'RAISERROR', 'USE', 'BACKUP', 'RESTORE',
+        'BULK', 'DBCC', 'KILL', 'SHUTDOWN', 'WAITFOR', 'OPEN', 'CLOSE', 'FETCH', 'DEALLOCATE', 'COMMIT',
+        'ROLLBACK', 'SAVE', 'CHECKPOINT', 'RECONFIGURE', 'READTEXT', 'WRITETEXT', 'UPDATETEXT',
+        'SETUSER', 'REVERT',
+    ];
+
+    /**
+     * Compound keyword tokens of the lexer whose later word is a statement
+     * keyword that does not start a statement there.
+     */
+    private const SQLSRV_STATEMENT_KEYWORD_COMPOUNDS = ['ON DELETE', 'ON UPDATE', 'FOR UPDATE'];
+
+    /**
+     * Statements whose clauses the batch parser follows token by token: a
+     * word that is neither one of their clauses nor a name or alias where
+     * one fits ends the batch with a refusal instead of being taken in.
+     */
+    private const SQLSRV_FOLLOWED_STATEMENTS = ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'MERGE'];
+
+    /**
+     * Keywords that open a clause or join two operands inside a followed
+     * statement, an IF / WHILE condition or a RETURN value; an operand is
+     * expected after them.
+     */
+    private const SQLSRV_CLAUSE_KEYWORDS = [
+        'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'IS', 'LIKE', 'BETWEEN', 'ESCAPE', 'COLLATE', 'ON', 'BY',
+        'GROUP', 'ORDER', 'HAVING', 'UNION', 'EXCEPT', 'INTERSECT', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL',
+        'OUTER', 'CROSS', 'APPLY', 'HASH', 'LOOP', 'REMOTE', 'WHEN', 'THEN', 'INTO', 'VALUES', 'DEFAULT',
+        'OUTPUT', 'USING', 'OVER', 'PARTITION', 'OFFSET', 'FOR', 'OPTION', 'PERCENT', 'PIVOT', 'UNPIVOT',
+        'TABLESAMPLE', 'REPEATABLE', 'AT', 'TO',
+    ];
+
+    /**
+     * Keywords that may only stand where an operand is expected.
+     */
+    private const SQLSRV_OPERAND_KEYWORDS = ['DISTINCT', 'ALL', 'ANY', 'SOME', 'EXISTS', 'CASE'];
+
+    /**
+     * Keywords that close an ORDER BY item or an OFFSET / FETCH clause.
+     */
+    private const SQLSRV_CLOSING_KEYWORDS = ['ASC', 'DESC', 'ROWS', 'ROW', 'ONLY'];
+
+    /**
+     * Keywords only right after the listed word; anywhere else they are
+     * plain names.
+     *
+     * @var array<string, list<string>>
+     */
+    private const SQLSRV_CONTEXT_KEYWORDS = [
+        'NEXT' => ['FETCH'], 'FIRST' => ['FETCH'], 'TIME' => ['AT'], 'ZONE' => ['TIME'], 'OF' => ['AS'],
+        'TIES' => ['WITH'], 'SYSTEM_TIME' => ['FOR'], 'CONTAINED' => ['SYSTEM_TIME'], 'XML' => ['FOR'],
+        'JSON' => ['FOR'], 'ROLLUP' => ['WITH'], 'CUBE' => ['WITH'],
+    ];
+
+    /**
+     * Words that are values on their own in a condition or RETURN value,
+     * where any other bare word would be a name outside a query.
+     */
+    private const SQLSRV_VALUE_KEYWORDS = ['NULL', 'CURRENT_TIMESTAMP', 'CURRENT_USER', 'SESSION_USER', 'SYSTEM_USER', 'USER'];
+
+    /**
+     * Expression states after which the statement being followed is
+     * complete, so the next statement may start.
+     */
+    private const SQLSRV_COMPLETE_STATES = ['complete', 'closed', 'aliased', 'typed', 'sized', 'done'];
+
+    /**
+     * States of the DECLARE and SET option grammars, which
+     * sqlsrvHeaderStep() follows instead of the expression rules.
+     */
+    private const SQLSRV_HEADER_STATES = [
+        'variable', 'type', 'type_name', 'typed', 'type_args', 'sized', 'table', 'table_args', 'cursor_name',
+        'cursor', 'cursor_for', 'option', 'statistics', 'switch', 'switch_next', 'identity', 'identity_name',
+        'isolation', 'level', 'isolation_level', 'read', 'repeatable', 'setting', 'done',
+    ];
+
+    /**
+     * SET options that take ON or OFF, alone or in a comma-separated list;
+     * the last four are the kinds of SET STATISTICS.
+     */
+    private const SQLSRV_SET_SWITCHES = [
+        'NOCOUNT', 'XACT_ABORT', 'ANSI_DEFAULTS', 'ANSI_NULL_DFLT_OFF', 'ANSI_NULL_DFLT_ON', 'ANSI_NULLS',
+        'ANSI_PADDING', 'ANSI_WARNINGS', 'ARITHABORT', 'ARITHIGNORE', 'CONCAT_NULL_YIELDS_NULL',
+        'CURSOR_CLOSE_ON_COMMIT', 'FMTONLY', 'FORCEPLAN', 'IMPLICIT_TRANSACTIONS', 'NOEXEC', 'NUMERIC_ROUNDABORT',
+        'PARSEONLY', 'QUOTED_IDENTIFIER', 'REMOTE_PROC_TRANSACTIONS', 'SHOWPLAN_ALL', 'SHOWPLAN_TEXT',
+        'SHOWPLAN_XML', 'NO_BROWSETABLE', 'IO', 'TIME', 'XML', 'PROFILE',
+    ];
+
+    /**
+     * SET options that take exactly one value.
+     */
+    private const SQLSRV_SET_SETTINGS = [
+        'DATEFIRST', 'DATEFORMAT', 'DEADLOCK_PRIORITY', 'LANGUAGE', 'LOCK_TIMEOUT', 'ROWCOUNT', 'TEXTSIZE',
+        'QUERY_GOVERNOR_COST_LIMIT', 'CONTEXT_INFO',
+    ];
+
+    /**
+     * Options between CURSOR and FOR in a DECLARE CURSOR.
+     */
+    private const SQLSRV_CURSOR_OPTIONS = [
+        'LOCAL', 'GLOBAL', 'FORWARD_ONLY', 'SCROLL', 'STATIC', 'KEYSET', 'DYNAMIC', 'FAST_FORWARD', 'READ_ONLY',
+        'SCROLL_LOCKS', 'OPTIMISTIC', 'TYPE_WARNING',
+    ];
+
+    /**
+     * Object types after which "IF EXISTS" belongs to a DROP, ALTER or
+     * CREATE statement instead of starting an IF.
+     */
+    private const SQLSRV_OBJECT_TYPES = [
+        'TABLE', 'VIEW', 'PROCEDURE', 'PROC', 'FUNCTION', 'INDEX', 'TRIGGER', 'SCHEMA', 'DATABASE',
+        'SEQUENCE', 'TYPE', 'SYNONYM', 'USER', 'ROLE', 'COLUMN', 'CONSTRAINT', 'DEFAULT', 'RULE',
+        'ASSEMBLY', 'STATISTICS', 'LOGIN', 'AGGREGATE', 'SECURITY POLICY', 'POLICY',
+    ];
+
+    /**
+     * Words that start a T-SQL statement QueryProxy does not split on: the
+     * Service Broker statements, the trigger switches and ADD SIGNATURE.
+     * None of them is reserved, so a body would otherwise take one as a
+     * name and the statement after it in. Inside a body they are refused
+     * as names; a bracketed name is still a name, and ALTER keeps ADD,
+     * DISABLE and ENABLE as clauses (SQLSRV_BODY_CONTEXT_KEYWORDS).
+     *
+     * @var list<string>
+     */
+    private const SQLSRV_UNLISTED_STATEMENT_HEADS = ['ADD', 'DISABLE', 'ENABLE', 'GET', 'MOVE', 'RECEIVE', 'SEND'];
+
+    /**
+     * Statement heads that take no name: their body starts after an item,
+     * so a bare word right after them is refused.
+     *
+     * @var list<string>
+     */
+    private const SQLSRV_NAMELESS_HEADS = ['CHECKPOINT', 'RECONFIGURE', 'REVERT', 'SETUSER', 'SHUTDOWN'];
+
+    /**
+     * Keywords a statement body that is not followed clause by clause — EXEC,
+     * USE, DBCC, RAISERROR, the DDL statements and every other statement
+     * head — may hold besides the clause, operand and object type keywords.
+     * A name is expected after them, so the next bare word is a name. Any
+     * other bare word where no name is expected is refused: a body cannot
+     * take in a statement QueryProxy does not know.
+     */
+    private const SQLSRV_BODY_KEYWORDS = [
+        'AS', 'WITH', 'WITHOUT', 'CONSTRAINT', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'UNIQUE',
+        'CLUSTERED', 'NONCLUSTERED', 'COLUMNSTORE', 'FULLTEXT', 'CHECK', 'NOCHECK', 'NO', 'INCLUDE',
+        'AUTHORIZATION', 'MEMBER', 'START', 'INCREMENT', 'MINVALUE', 'MAXVALUE', 'CACHE', 'SWITCH',
+        'TRANSFER', 'MODIFY', 'FILE', 'FILEGROUP', 'ENCRYPTION', 'DECRYPTION', 'PASSWORD', 'MASTER',
+        'SYMMETRIC', 'ASYMMETRIC', 'CERTIFICATE', 'GLOBAL', 'LOCAL', 'RESULT', 'SETS', 'LOG', 'PERIOD',
+    ];
+
+    /**
+     * Keywords that may end a statement body: after them a bare word is
+     * refused unless it calls a function, so a statement QueryProxy does not
+     * know cannot follow them unseen. The data types are among them.
+     */
+    private const SQLSRV_BODY_FINAL_KEYWORDS = [
+        'NULL', 'DEFAULT', 'ALL', 'OFF', 'CASCADE', 'ACTION', 'RECOMPILE', 'IDENTITY', 'PERSISTED', 'SPARSE',
+        'ROWGUIDCOL', 'CYCLE', 'NOWAIT', 'SIMPLE', 'REBUILD', 'REORGANIZE', 'RESUME', 'PAUSE', 'ABORT', 'OUT',
+        'OUTPUT', 'READONLY', 'REPLICATION', 'FULL', 'LEFT',
+        'RIGHT', 'ASC', 'DESC', 'CURRENT_USER', 'CURRENT_TIMESTAMP', 'SESSION_USER', 'SYSTEM_USER',
+        'BIGINT', 'INT', 'INTEGER', 'SMALLINT', 'TINYINT', 'BIT', 'DECIMAL', 'DEC', 'NUMERIC', 'MONEY',
+        'SMALLMONEY', 'FLOAT', 'REAL', 'DATE', 'DATETIME', 'DATETIME2', 'DATETIMEOFFSET', 'SMALLDATETIME',
+        'TIME', 'CHAR', 'CHARACTER', 'VARCHAR', 'NCHAR', 'NVARCHAR', 'TEXT', 'NTEXT', 'BINARY', 'VARBINARY',
+        'IMAGE', 'UNIQUEIDENTIFIER', 'XML', 'SQL_VARIANT', 'SYSNAME', 'ROWVERSION', 'TIMESTAMP',
+        'HIERARCHYID', 'GEOGRAPHY', 'GEOMETRY',
+    ];
+
+    /**
+     * Body keywords only in the body of the listed statement heads: ALTER
+     * TABLE ... ADD, ALTER INDEX ... DISABLE, ALTER TABLE ... ENABLE
+     * TRIGGER. Anywhere else they would start ADD SIGNATURE, DISABLE
+     * TRIGGER or ENABLE TRIGGER.
+     *
+     * @var array<string, list<string>>
+     */
+    private const SQLSRV_BODY_CONTEXT_KEYWORDS = [
+        'ADD' => ['ALTER'], 'DISABLE' => ['ALTER'], 'ENABLE' => ['ALTER'], 'MOVE' => ['RESTORE'],
+    ];
+
+    /**
+     * Where each statement and control-of-flow piece of a SQL Server batch
+     * starts: a list of [character position, is control piece], in order;
+     * each piece runs to the start of the next one. A string is returned —
+     * the reason — when the boundaries cannot be told: unbalanced
+     * parentheses, BEGIN/END, TRY/CATCH or CASE, an ELSE without an IF, a
+     * data-changing statement inside parentheses, or a token that cannot
+     * start a statement where one is expected.
+     *
+     * A statement keyword starts a new statement unless the statement in
+     * progress takes it: SELECT after UNION / EXCEPT / INTERSECT or as the
+     * source of an INSERT, the main query of a WITH, the actions of a MERGE,
+     * the SET of an UPDATE, ON DELETE / ON UPDATE actions, IF EXISTS in DDL,
+     * the clauses of ALTER and GRANT, OFFSET ... FETCH and a cursor's FOR
+     * SELECT. CREATE / ALTER of a module (procedure, function, trigger,
+     * view) is the last statement of its batch, so it takes the rest.
+     *
+     * @return list<array{0: int, 1: bool}>|string
+     */
+    private function sqlsrvBatchParts(string $sql): array|string
+    {
+        $ranges = $this->dialectLexicalRanges($sql, DbDriver::Sqlsrv);
+
+        if ($ranges === null) {
+            return 'QueryProxy cannot tell where a string, quoted name or comment in this SQL Server batch ends.';
+        }
+
+        $tokens = [];
+
+        foreach ((new Lexer($sql))->list->tokens as $token) {
+            if ($token->position !== null
+                && ! in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
+                $tokens[] = $token;
+            }
+        }
+
+        $parts = [];
+        $depth = 0;
+        $cases = 0;
+        $blocks = [];
+        $ifs = 0;
+        $outerIfs = [];
+        $expectStatement = false;
+        $statement = null;
+        $expression = null;
+        $unknownStart = false;
+        $skip = -1;
+        $skipBefore = -1;
+
+        foreach ($tokens as $index => $token) {
+            $position = (int) $token->position;
+
+            if ($index <= $skip || $position < $skipBefore) {
+                continue;
+            }
+
+            $bracketed = $this->isWithinRange($position, $ranges['brackets']);
+            $isWord = ! $bracketed && $this->isWordAt($tokens, $index, $this->firstWord($token));
+            $words = $isWord ? $this->tokenWords($token) : [];
+            $word = $words[0] ?? '';
+
+            if (count($words) > 1 && array_intersect(array_slice($words, 1), self::SQLSRV_STATEMENT_KEYWORDS) !== []
+                && ! in_array(implode(' ', $words), self::SQLSRV_STATEMENT_KEYWORD_COMPOUNDS, true)) {
+                return "The keyword sequence \"{$token->token}\" hides a statement keyword, so QueryProxy cannot tell where the statements of this SQL Server batch end.";
+            }
+
+            if ($word === 'CASE') {
+                $cases++;
+            }
+
+            if ($parts === [] && ! in_array($word, self::SQLSRV_STATEMENT_KEYWORDS, true) && ! in_array($word, ['THROW', 'WITH'], true)
+                && $token->type !== TokenType::Label) {
+                $parts[] = [$position, false];
+                $statement = $this->sqlsrvStatementState('');
+                $isParenthesized = ! $bracketed && $this->isOperator($token, '(');
+                // Only a parenthesized query is followed token by token; a
+                // statement that starts with any other word is one QueryProxy
+                // does not know, so the batch must hold nothing after it.
+                $expression = $isParenthesized ? $this->sqlsrvExpression('statement', '') : null;
+                $unknownStart = ! $isParenthesized;
+            }
+
+            if (! $bracketed && $this->isOperator($token, '(')) {
+                if ($expectStatement) {
+                    return $this->sqlsrvUnexpectedToken($token);
+                }
+
+                if ($depth === 0 && $expression !== null) {
+                    $expression = $this->sqlsrvExpressionStep($expression, 'open');
+
+                    if ($expression === null) {
+                        return $this->sqlsrvUnknownToken($token);
+                    }
+                }
+
+                $depth++;
+
+                continue;
+            }
+
+            if (! $bracketed && $this->isOperator($token, ')')) {
+                if (--$depth < 0) {
+                    return 'Unbalanced parentheses are not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+                }
+
+                if ($depth === 0 && $expression !== null) {
+                    $expression = $this->sqlsrvExpressionStep($expression, 'close');
+                }
+
+                continue;
+            }
+
+            if ($word === 'END' && $cases > 0) {
+                $cases--;
+
+                if ($depth === 0 && $expression !== null) {
+                    $expression = ['state' => 'complete', 'last' => 'END'] + $expression;
+                }
+
+                continue;
+            }
+
+            if ($word === 'ELSE' && $cases > 0) {
+                if ($depth === 0 && $expression !== null) {
+                    $expression = ['state' => 'operand', 'last' => 'ELSE'] + $expression;
+                }
+
+                continue;
+            }
+
+            if ($depth > 0) {
+                if (in_array($word, ['INSERT', 'UPDATE', 'DELETE', 'MERGE'], true)
+                    && $this->sqlsrvPreviousWord($tokens, $index) !== 'ON') {
+                    return 'A data-changing statement inside parentheses is not allowed: QueryProxy cannot tell where it ends in this SQL Server batch.';
+                }
+
+                continue;
+            }
+
+            if ($token->type === TokenType::Label) {
+                if ($expression !== null && ($expression['mode'] === 'condition'
+                    || (! in_array($expression['mode'], ['return', 'body'], true)
+                        && ! in_array($expression['state'], self::SQLSRV_COMPLETE_STATES, true)))) {
+                    return $this->sqlsrvUnknownToken($token);
+                }
+
+                $parts[] = [$position, true];
+                $statement = null;
+                $expression = null;
+                $expectStatement = true;
+
+                continue;
+            }
+
+            // "SET NOCOUNT ON DELETE FROM t" lexes ON DELETE as one token:
+            // outside a foreign key the ON ends a statement and the DELETE
+            // (or UPDATE) starts the next one, inside the token.
+            if (count($words) > 1 && $words[0] === 'ON' && in_array($words[1], ['DELETE', 'UPDATE'], true)) {
+                if ($statement !== null && $statement['references']) {
+                    continue;
+                }
+
+                if ($expectStatement || $cases > 0) {
+                    return $this->sqlsrvUnexpectedToken($token);
+                }
+
+                // Only a SET option such as SET NOCOUNT ends in ON.
+                if ($expression === null || ! in_array($expression['state'], ['switch', 'identity_name'], true)) {
+                    return $this->sqlsrvUnknownToken($token);
+                }
+
+                preg_match('/^\S+\s+/u', (string) $token->token, $match);
+                $parts[] = [$position + mb_strlen($match[0] ?? ''), false];
+                $statement = $this->sqlsrvStatementState($words[1]);
+                $expression = $this->sqlsrvExpression('statement', $words[1]);
+
+                continue;
+            }
+
+            // THROW is not reserved: it starts a statement only where one is
+            // expected or where a condition or RETURN value is complete.
+            $isKeyword = in_array($word, self::SQLSRV_STATEMENT_KEYWORDS, true)
+                || ($expectStatement && in_array($word, ['THROW', 'WITH'], true))
+                || ($parts === [] && in_array($word, ['THROW', 'WITH'], true))
+                || ($word === 'THROW' && $expression !== null && ($expression['mode'] === 'body'
+                    || ($expression['mode'] !== 'statement'
+                        && in_array($expression['state'], self::SQLSRV_COMPLETE_STATES, true))));
+
+            if (! $isKeyword) {
+                if ($expectStatement) {
+                    return $this->sqlsrvUnexpectedToken($token);
+                }
+
+                if ($expression !== null) {
+                    [$expression, $skipped, $skippedBefore] = $this->sqlsrvFollowExpression($expression, $tokens, $index, $words, $ranges);
+
+                    if ($expression === null) {
+                        return $this->sqlsrvUnknownToken($token);
+                    }
+
+                    $skip = max($skip, $skipped);
+                    $skipBefore = max($skipBefore, $skippedBefore);
+                }
+
+                if ($statement !== null) {
+                    $statement = $this->sqlsrvAdvanceStatement($statement, $tokens, $index, $word);
+                }
+
+                continue;
+            }
+
+            if ($expression !== null && $expression['state'] === 'as') {
+                return $this->sqlsrvUnknownToken($token);
+            }
+
+            if ($statement !== null && $this->sqlsrvContinuesStatement($statement, $tokens, $index, $words)) {
+                $statement = $this->sqlsrvAdvanceStatement($statement, $tokens, $index, $word);
+
+                if ($expression !== null) {
+                    // A body takes a name after the keyword; INSERT ... EXEC
+                    // runs a procedure followed as a body; the DELETE action of a MERGE is complete alone;
+                    // the query of a DECLARE CURSOR is followed as a SELECT.
+                    $expression = match (true) {
+                        $expression['mode'] === 'body' => ['state' => 'start', 'last' => $word, 'argument' => false] + $expression,
+                        in_array($word, ['EXEC', 'EXECUTE'], true) => $this->sqlsrvBodyExpression($word),
+                        $expression['state'] === 'cursor_for' => $this->sqlsrvFollowWords(
+                            $this->sqlsrvExpression('statement', $word), array_slice($words, 1), $tokens, $index,
+                        ) ?? ['state' => 'invalid'] + $expression,
+                        $expression['mode'] === 'declare' || $expression['mode'] === 'option' => ['state' => 'invalid'] + $expression,
+                        $word === 'DELETE' && $statement['merge'] => ['state' => 'complete', 'last' => $word, 'top' => false] + $expression,
+                        default => ['state' => 'operand', 'last' => $word, 'top' => false] + $expression,
+                    };
+
+                    if ($expression['state'] === 'invalid') {
+                        return $this->sqlsrvUnknownToken($token);
+                    }
+                }
+
+                continue;
+            }
+
+            // A condition and a followed statement must be complete before
+            // the next statement starts; a bare RETURN or THROW takes no value.
+            if ($expression !== null && ! in_array($expression['mode'], ['return', 'body'], true)
+                && ! in_array($expression['state'], self::SQLSRV_COMPLETE_STATES, true)) {
+                return $this->sqlsrvUnknownToken($token);
+            }
+
+            if ($cases > 0) {
+                return "A statement keyword ({$word}) inside a CASE expression is not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.";
+            }
+
+            $next = $tokens[$index + 1] ?? null;
+            $nextWord = $next !== null ? $this->firstWord($next) : '';
+
+            if (in_array($word, ['COMMIT', 'ROLLBACK', 'SAVE'], true)
+                || ($word === 'BEGIN' && in_array($nextWord, ['TRAN', 'TRANSACTION', 'DISTRIBUTED'], true))) {
+                return 'Transaction control (BEGIN TRAN, COMMIT, ROLLBACK, SAVE TRAN) inside a SQL Server batch is not allowed: QueryProxy runs the request in its own transaction.';
+            }
+
+            $statement = null;
+            $expression = null;
+            $expectStatement = false;
+
+            switch ($word) {
+                case 'BREAK':
+                case 'CONTINUE':
+                    $parts[] = [$position, true];
+                    $expectStatement = true;
+
+                    continue 2;
+                case 'GOTO':
+                    // GOTO takes exactly one label name.
+                    if ($next === null || $nextWord === '' || in_array($nextWord, self::SQLSRV_STATEMENT_KEYWORDS, true)
+                        || ! $this->isWordAt($tokens, $index + 1, $nextWord)
+                        || $this->isWithinRange((int) $next->position, $ranges['brackets'])) {
+                        return $this->sqlsrvUnexpectedToken($next ?? $token);
+                    }
+
+                    $parts[] = [$position, true];
+                    $skip = $index + 1;
+                    $expectStatement = true;
+
+                    continue 2;
+                case 'RETURN':
+                case 'IF':
+                case 'WHILE':
+                    $ifs += $word === 'IF' ? 1 : 0;
+                    $parts[] = [$position, true];
+                    $expression = $this->sqlsrvFollowWords(
+                        $this->sqlsrvExpression($word === 'RETURN' ? 'return' : 'condition', $word),
+                        array_slice($words, 1), $tokens, $index,
+                    );
+
+                    if ($expression === null) {
+                        return $this->sqlsrvUnknownToken($token);
+                    }
+
+                    continue 2;
+                case 'ELSE':
+                    // Each ELSE takes the innermost IF of its block that has none yet.
+                    if ($ifs === 0) {
+                        return 'ELSE without a preceding IF is not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+                    }
+
+                    $ifs--;
+                    $parts[] = [$position, true];
+                    $expectStatement = true;
+
+                    continue 2;
+                case 'BEGIN':
+                    // BEGIN DIALOG, BEGIN CONVERSATION and the other forms are
+                    // refused below: the word after them starts no statement.
+                    $blocks[] = in_array($nextWord, ['TRY', 'CATCH'], true) ? $nextWord : 'BLOCK';
+                    $skip = in_array($nextWord, ['TRY', 'CATCH'], true) ? $index + 1 : $skip;
+                    $outerIfs[] = $ifs;
+                    $ifs = 0;
+
+                    $parts[] = [$position, true];
+                    $expectStatement = true;
+
+                    continue 2;
+                case 'END':
+                    $kind = in_array($nextWord, ['TRY', 'CATCH'], true) ? $nextWord : 'BLOCK';
+
+                    if (array_pop($blocks) !== $kind) {
+                        return 'BEGIN ... END, BEGIN TRY ... END TRY and BEGIN CATCH ... END CATCH blocks that do not match are not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+                    }
+
+                    $skip = $kind !== 'BLOCK' ? $index + 1 : $skip;
+                    $ifs = (int) array_pop($outerIfs);
+                    $parts[] = [$position, true];
+                    $expectStatement = true;
+
+                    continue 2;
+            }
+
+            $parts[] = [$position, false];
+            $statement = $this->sqlsrvStatementState($word);
+
+            $expression = $this->sqlsrvFollowWords(
+                $this->sqlsrvStatementExpression($word, $next, $nextWord),
+                array_slice($words, 1), $tokens, $index,
+            );
+
+            if ($expression === null) {
+                return $this->sqlsrvUnknownToken($token);
+            }
+
+            if (in_array($word, ['CREATE', 'ALTER'], true) && $this->sqlsrvDefinesModule($tokens, $index)) {
+                if ($blocks !== []) {
+                    return 'A procedure, function, trigger or view definition inside BEGIN ... END is not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+                }
+
+                return $parts;
+            }
+        }
+
+        if ($depth !== 0) {
+            return 'Unbalanced parentheses are not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+        }
+
+        if ($cases !== 0) {
+            return 'A CASE expression without its END is not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+        }
+
+        if ($blocks !== []) {
+            return 'BEGIN ... END, BEGIN TRY ... END TRY and BEGIN CATCH ... END CATCH blocks that do not match are not allowed: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+        }
+
+        if ($unknownStart && count($parts) > 1) {
+            return 'The batch starts with a statement QueryProxy does not know: QueryProxy cannot tell where the statements of this SQL Server batch end.';
+        }
+
+        return $parts === [] ? [[0, false]] : $parts;
+    }
+
+    private function sqlsrvUnexpectedToken(Token $token): string
+    {
+        return "QueryProxy expects a statement before \"{$token->token}\" and cannot tell where the statements of this SQL Server batch end.";
+    }
+
+    private function sqlsrvUnknownToken(Token $token): string
+    {
+        return "\"{$token->token}\" is not a statement QueryProxy knows, nor part of the statement before it: QueryProxy cannot tell where the statements of this SQL Server batch end.";
+    }
+
+    /**
+     * A fresh expression state: the parser follows a SELECT, WITH, INSERT,
+     * UPDATE, DELETE or MERGE statement, an IF / WHILE condition or a
+     * RETURN value through its depth-0 tokens and expects an operand first.
+     *
+     * @param  'statement'|'condition'|'return'|'value'|'declare'|'option'|'body'  $mode
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}
+     */
+    private function sqlsrvExpression(string $mode, string $head): array
+    {
+        return ['mode' => $mode, 'state' => 'operand', 'last' => $head, 'top' => false];
+    }
+
+    /**
+     * The body of a statement that is not followed clause by clause: the
+     * names, values and body keywords after its head word. A head that
+     * takes no name starts after an item; USE takes exactly one name,
+     * whatever the word; EXEC and EXECUTE start at the module, whose name
+     * may take one bare word as its first argument.
+     *
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}
+     */
+    private function sqlsrvBodyExpression(string $head): array
+    {
+        $state = match (true) {
+            in_array($head, self::SQLSRV_NAMELESS_HEADS, true) => 'item',
+            $head === 'USE' => 'name',
+            in_array($head, ['EXEC', 'EXECUTE'], true) => 'module',
+            default => 'start',
+        };
+
+        return ['state' => $state, 'head' => $head, 'argument' => false]
+            + $this->sqlsrvExpression('body', $head);
+    }
+
+    /**
+     * The expression that follows the statement starting with $word. A
+     * SELECT, WITH, INSERT, UPDATE, DELETE or MERGE is followed clause by
+     * clause; PRINT takes a value and THROW an optional list of values;
+     * DECLARE and SET follow their own grammars; every other statement is
+     * followed as a body. None of them can take in a statement QueryProxy
+     * does not know.
+     *
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}
+     */
+    private function sqlsrvStatementExpression(string $word, ?Token $next, string $nextWord): array
+    {
+        $assignsVariable = $next !== null && $next->type === TokenType::Symbol
+            && str_starts_with((string) $next->token, '@');
+
+        return match (true) {
+            // UPDATE STATISTICS is maintenance, not a followed UPDATE.
+            $word === 'UPDATE' && $nextWord === 'STATISTICS' => $this->sqlsrvBodyExpression($word),
+            in_array($word, self::SQLSRV_FOLLOWED_STATEMENTS, true) => $this->sqlsrvExpression('statement', $word),
+            $word === 'PRINT', $word === 'SET' && $assignsVariable => $this->sqlsrvExpression('value', $word),
+            $word === 'THROW' => $this->sqlsrvExpression('return', $word),
+            $word === 'DECLARE' => ['state' => 'variable'] + $this->sqlsrvExpression('declare', $word),
+            $word === 'SET' => ['state' => 'option'] + $this->sqlsrvExpression('option', $word),
+            default => $this->sqlsrvBodyExpression($word),
+        };
+    }
+
+    /**
+     * One step of a statement body. In the "start" state a name is
+     * expected, so any bare word is one; in the "item" state a name,
+     * value or final keyword ended the last item, and only a body keyword,
+     * a function call or a qualified name such as a user-defined type may
+     * follow: no statement starts with a word followed by "(" or ".". A
+     * bracketed name is never a statement, so it fits anywhere.
+     *
+     * The "name" state (after USE) takes exactly one name. The "module"
+     * state (after EXEC) takes the module name — any word, a qualified
+     * name, "@rc =" before it or a parenthesised string; right after the
+     * module name one bare word may be the first argument, but only when
+     * no further bare word follows it, so the first words of a statement
+     * are never read as an argument. A word that starts a statement
+     * QueryProxy does not split on is never a name.
+     *
+     * @param  array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}  $expression
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}|null
+     */
+    private function sqlsrvBodyStep(array $expression, string $unit, string $word, string $nextWord, bool $isCallable): ?array
+    {
+        $state = $expression['state'];
+        $head = $expression['head'] ?? '';
+        $argument = false;
+
+        if ($unit === 'word') {
+            $isContextKeyword = in_array($head, self::SQLSRV_BODY_CONTEXT_KEYWORDS[$word] ?? [], true);
+
+            if (! $isContextKeyword && in_array($word, self::SQLSRV_UNLISTED_STATEMENT_HEADS, true)) {
+                return null;
+            }
+
+            $isBodyKeyword = $isContextKeyword
+                || in_array($word, self::SQLSRV_BODY_KEYWORDS, true)
+                || in_array($word, self::SQLSRV_CLAUSE_KEYWORDS, true)
+                || in_array($word, self::SQLSRV_OPERAND_KEYWORDS, true)
+                || in_array($word, self::SQLSRV_OBJECT_TYPES, true)
+                || in_array($word, self::SQLSRV_STATEMENT_KEYWORDS, true);
+            $endsArgument = preg_match('/^[A-Z_#][A-Z0-9_#$@]*$/', $nextWord) !== 1
+                || in_array($nextWord, self::SQLSRV_STATEMENT_KEYWORDS, true)
+                || in_array($nextWord, ['WITH', 'THROW'], true);
+
+            $next = match (true) {
+                $state === 'name' => 'item',
+                $state === 'module' => $isCallable ? 'module' : 'item',
+                $state === 'returns' => null,
+                in_array($word, self::SQLSRV_BODY_FINAL_KEYWORDS, true) => 'item',
+                $isBodyKeyword => 'start',
+                $state === 'start', $isCallable => 'item',
+                ($expression['argument'] ?? false) && $endsArgument => 'item',
+                default => null,
+            };
+
+            $argument = $state === 'module' && ! $isCallable;
+        } else {
+            $next = match (true) {
+                $state === 'name' => $unit === 'name' ? 'item' : null,
+                $state === 'module' => match ($unit) {
+                    'name' => $isCallable ? 'module' : 'item',
+                    'variable' => 'returns',
+                    'open', 'dot' => 'module',
+                    'close' => 'item',
+                    default => null,
+                },
+                $state === 'returns' => $unit === 'equals' ? 'module' : null,
+                in_array($unit, ['comma', 'operator', 'dot', 'equals'], true) => 'start',
+                $unit === 'open' => $state,
+                default => 'item',
+            };
+
+            $argument = $state === 'module' && $unit === 'name' && ! $isCallable;
+        }
+
+        if ($next === null) {
+            return null;
+        }
+
+        $expression['state'] = $next;
+        $expression['argument'] = $argument;
+
+        return $expression;
+    }
+
+    /**
+     * One step of the DECLARE and SET option grammars: the next state, or
+     * null when the unit has no place there.
+     *
+     * DECLARE: @name [AS] type [(size)] [= value], @name [AS] TABLE (...),
+     *
+     * @name CURSOR, or name [INSENSITIVE] [SCROLL] CURSOR [options] FOR
+     * query; a comma starts the next variable. SET: a list of ON / OFF
+     * options, STATISTICS kinds, IDENTITY_INSERT table, TRANSACTION
+     * ISOLATION LEVEL or one valued option. An option QueryProxy does not
+     * know is refused.
+     */
+    private function sqlsrvHeaderStep(string $state, string $unit, string $word): ?string
+    {
+        $isName = $unit === 'name'
+            || ($unit === 'word' && ! in_array($word, self::SQLSRV_STATEMENT_KEYWORDS, true));
+        $isWord = fn (string ...$candidates): bool => $unit === 'word' && in_array($word, $candidates, true);
+
+        return match ($state) {
+            'variable' => match (true) {
+                $unit === 'variable' => 'type',
+                $isName => 'cursor_name',
+                default => null,
+            },
+            'cursor_name' => match (true) {
+                $isWord('CURSOR') => 'cursor',
+                $isWord('INSENSITIVE', 'SCROLL') => 'cursor_name',
+                default => null,
+            },
+            'type', 'type_name' => match (true) {
+                $state === 'type' && $isWord('AS') => 'type_name',
+                $isWord('TABLE') => 'table',
+                $isWord('CURSOR') => 'sized',
+                $isName => 'typed',
+                default => null,
+            },
+            'typed', 'sized' => match (true) {
+                $state === 'typed' && $unit === 'open' => 'type_args',
+                $state === 'typed' && $unit === 'dot' => 'type_name',
+                $unit === 'equals' => 'operand',
+                $unit === 'comma' => 'variable',
+                default => null,
+            },
+            'type_args', 'table_args' => $unit === 'close' ? 'sized' : null,
+            'table' => $unit === 'open' ? 'table_args' : null,
+            'cursor' => match (true) {
+                $isWord(...self::SQLSRV_CURSOR_OPTIONS) => 'cursor',
+                $isWord('FOR') => 'cursor_for',
+                default => null,
+            },
+            'option' => match (true) {
+                $isWord(...self::SQLSRV_SET_SWITCHES) => 'switch',
+                $isWord('STATISTICS') => 'statistics',
+                $isWord('IDENTITY_INSERT') => 'identity',
+                $isWord('TRANSACTION') => 'isolation',
+                $isWord(...self::SQLSRV_SET_SETTINGS) => 'setting',
+                default => null,
+            },
+            'statistics', 'switch_next' => $isWord(...self::SQLSRV_SET_SWITCHES) ? 'switch' : null,
+            'switch' => match (true) {
+                $unit === 'comma' => 'switch_next',
+                $isWord('ON', 'OFF') => 'done',
+                default => null,
+            },
+            'identity' => $isName ? 'identity_name' : null,
+            'identity_name' => match (true) {
+                $unit === 'dot' => 'identity',
+                $isWord('ON', 'OFF') => 'done',
+                default => null,
+            },
+            'isolation' => $isWord('ISOLATION') ? 'level' : null,
+            'level' => $isWord('LEVEL') ? 'isolation_level' : null,
+            'isolation_level' => match (true) {
+                $isWord('READ') => 'read',
+                $isWord('REPEATABLE') => 'repeatable',
+                $isWord('SNAPSHOT', 'SERIALIZABLE') => 'done',
+                default => null,
+            },
+            'read' => $isWord('COMMITTED', 'UNCOMMITTED') ? 'done' : null,
+            'repeatable' => $isWord('READ') ? 'done' : null,
+            'setting' => $isName || in_array($unit, ['number', 'string', 'variable'], true) ? 'done' : null,
+            default => null,
+        };
+    }
+
+    /**
+     * Feed the remaining words of a compound keyword token at $index — for
+     * example NOT and EXISTS of "IF NOT EXISTS" — to the expression.
+     *
+     * @param  array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}  $expression
+     * @param  list<string>  $words
+     * @param  list<Token>  $tokens
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}|null
+     */
+    private function sqlsrvFollowWords(array $expression, array $words, array $tokens, int $index): ?array
+    {
+        foreach ($words as $offset => $word) {
+            $isLast = $offset === count($words) - 1;
+            $expression = $this->sqlsrvExpressionStep(
+                $expression,
+                'word',
+                $word,
+                $words[$offset + 1] ?? $this->sqlsrvNextWord($tokens, $index + 1),
+                $isLast && $this->sqlsrvIsCallable($tokens, $index + 1),
+            );
+
+            if ($expression === null) {
+                return null;
+            }
+        }
+
+        return $expression;
+    }
+
+    /**
+     * Move the expression past the depth-0 token at $index, which is not a
+     * statement keyword. Returns the new expression — null when the token
+     * fits nowhere in it — and the token index and character position
+     * before which the next tokens belong to this one: the String of N'...'
+     * and the rest of a [bracketed] name.
+     *
+     * @param  array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}  $expression
+     * @param  list<Token>  $tokens
+     * @param  list<string>  $words
+     * @param  array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}  $ranges
+     * @return array{0: array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}|null, 1: int, 2: int}
+     */
+    private function sqlsrvFollowExpression(array $expression, array $tokens, int $index, array $words, array $ranges): array
+    {
+        $token = $tokens[$index];
+        $position = (int) $token->position;
+
+        foreach ($ranges['brackets'] as [$start, $end]) {
+            if ($position >= $start && $position < $end) {
+                $nextIndex = $index + 1;
+
+                while (isset($tokens[$nextIndex]) && (int) $tokens[$nextIndex]->position < $end) {
+                    $nextIndex++;
+                }
+
+                return [$this->sqlsrvExpressionStep($expression, 'name', '', '', $this->sqlsrvIsCallable($tokens, $nextIndex)), -1, $end];
+            }
+        }
+
+        $next = $tokens[$index + 1] ?? null;
+
+        if ($words === ['N'] && $next !== null && $next->type === TokenType::String
+            && (int) $next->position === $position + 1) {
+            return [$this->sqlsrvExpressionStep($expression, 'string'), $index + 1, -1];
+        }
+
+        if ($words !== []) {
+            return [$this->sqlsrvFollowWords($expression, $words, $tokens, $index), -1, -1];
+        }
+
+        $unit = match (true) {
+            $token->type === TokenType::Number => 'number',
+            $token->type === TokenType::String => 'string',
+            $token->type === TokenType::Symbol && str_starts_with((string) $token->token, '@') => 'variable',
+            $this->isOperator($token, ',') => 'comma',
+            $this->isOperator($token, '*') => 'star',
+            $this->isOperator($token, '.') => 'dot',
+            $this->isOperator($token, '=') => 'equals',
+            $token->type === TokenType::Operator => 'operator',
+            default => 'name',
+        };
+
+        return [$this->sqlsrvExpressionStep($expression, $unit, '', '', $this->sqlsrvIsCallable($tokens, $index + 1)), -1, -1];
+    }
+
+    /**
+     * The first upper-cased word of the token at $index, "(" for an
+     * opening parenthesis, or '' past the end.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function sqlsrvNextWord(array $tokens, int $index): string
+    {
+        $token = $tokens[$index] ?? null;
+
+        return match (true) {
+            $token === null => '',
+            $this->isOperator($token, '(') => '(',
+            default => $this->firstWord($token),
+        };
+    }
+
+    /**
+     * Whether the token at $index makes the name before it a function or
+     * a qualified name: an opening parenthesis or a dot.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function sqlsrvIsCallable(array $tokens, int $index): bool
+    {
+        $token = $tokens[$index] ?? null;
+
+        return $token !== null && ($this->isOperator($token, '(') || $this->isOperator($token, '.'));
+    }
+
+    /**
+     * One step of the expression state machine. The state says what the
+     * expression waits for: an operand, an operator or clause after a
+     * complete operand, an alias name after AS, nothing more after an alias,
+     * or only a comma or clause after a closing keyword. Null means the
+     * unit fits nowhere — the fail-closed answer for any word that is not
+     * on one of the keyword lists, nor a name or alias where one fits.
+     *
+     * @param  array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}  $expression
+     * @param  'word'|'name'|'string'|'number'|'variable'|'star'|'comma'|'dot'|'equals'|'operator'|'open'|'close'  $unit
+     * @return array{mode: string, state: string, last: string, top: bool, head?: string, argument?: bool}|null
+     */
+    private function sqlsrvExpressionStep(array $expression, string $unit, string $word = '', string $nextWord = '', bool $isCallable = false): ?array
+    {
+        $state = $expression['state'];
+        $last = $expression['last'];
+        $isStatement = $expression['mode'] === 'statement';
+        $expression['last'] = $unit === 'word' ? $word : $unit;
+
+        if ($expression['mode'] === 'body') {
+            return $this->sqlsrvBodyStep($expression, $unit, $word, $nextWord, $isCallable);
+        }
+
+        if (in_array($state, self::SQLSRV_HEADER_STATES, true)
+            || ($expression['mode'] === 'declare' && $unit === 'comma' && in_array($state, ['complete', 'closed'], true))) {
+            $next = in_array($state, self::SQLSRV_HEADER_STATES, true)
+                ? $this->sqlsrvHeaderStep($state, $unit, $word)
+                : 'variable';
+
+            if ($next === null) {
+                return null;
+            }
+
+            $expression['top'] = false;
+            $expression['state'] = $next;
+
+            return $expression;
+        }
+
+        $unit = in_array($unit, ['dot', 'equals'], true) ? 'operator' : $unit;
+
+        if ($unit === 'word') {
+            $isContextual = in_array($last, self::SQLSRV_CONTEXT_KEYWORDS[$word] ?? [], true);
+
+            $next = match (true) {
+                $isContextual => in_array($word, ['ROLLUP', 'CUBE'], true) ? 'closed' : 'operand',
+                $word === 'ALL' && $last === 'SYSTEM_TIME' => 'closed',
+                $word === 'AS' && $nextWord === 'OF' => 'operand',
+                $word === 'AS' => $isStatement && $state === 'complete' ? 'as' : null,
+                $word === 'WITH' => $state !== 'as' && in_array($nextWord, ['(', 'TIES', 'ROLLUP', 'CUBE'], true) ? 'operand' : null,
+                $word === 'TOP' => in_array($last, ['SELECT', 'DISTINCT', 'ALL', 'INSERT', 'UPDATE', 'DELETE', 'MERGE'], true) ? 'operand' : null,
+                in_array($word, self::SQLSRV_CLOSING_KEYWORDS, true) => match ($state) {
+                    'operand' => 'complete',
+                    'complete', 'closed' => 'closed',
+                    default => null,
+                },
+                in_array($word, self::SQLSRV_OPERAND_KEYWORDS, true) => $state === 'operand' ? 'operand' : null,
+                in_array($word, self::SQLSRV_CLAUSE_KEYWORDS, true) => match (true) {
+                    $state === 'as' => null,
+                    $word === 'VALUES' && $last === 'DEFAULT' => 'closed',
+                    default => 'operand',
+                },
+                default => false,
+            };
+
+            if ($next !== false) {
+                if ($next === null) {
+                    return null;
+                }
+
+                $expression['top'] = $word === 'TOP';
+                $expression['state'] = $next;
+
+                return $expression;
+            }
+
+            $unit = 'name';
+            $isCallable = $isCallable || in_array($word, self::SQLSRV_VALUE_KEYWORDS, true);
+        }
+
+        $next = match ($unit) {
+            // Outside a query a bare name can only be a function or a
+            // qualified name: anything else is a statement in disguise.
+            'name' => match ($state) {
+                'operand' => $isStatement || $isCallable ? 'complete' : null,
+                'complete' => $isStatement ? 'aliased' : null,
+                'as' => 'aliased',
+                default => null,
+            },
+            'string' => match ($state) {
+                'operand' => 'complete',
+                'complete' => $isStatement ? 'aliased' : null,
+                'as' => 'aliased',
+                default => null,
+            },
+            'number', 'variable' => $state === 'operand' ? ($expression['top'] ? 'operand' : 'complete') : null,
+            'star' => match ($state) {
+                'operand' => 'complete',
+                'complete' => 'operand',
+                default => null,
+            },
+            'comma' => in_array($state, ['complete', 'aliased', 'closed'], true) ? 'operand' : null,
+            'operator' => in_array($state, ['operand', 'complete'], true) ? 'operand' : null,
+            'open' => $state === 'closed' ? null : $state,
+            'close' => $expression['top'] ? 'operand' : 'complete',
+        };
+
+        if ($next === null) {
+            return null;
+        }
+
+        if ($unit !== 'open') {
+            $expression['top'] = false;
+        }
+
+        $expression['state'] = $next;
+
+        return $expression;
+    }
+
+    /**
+     * The progress of the statement a batch is in: its head keyword, and
+     * the clauses it still waits for.
+     *
+     * @return array{head: string, main: bool, source: bool, set: bool, merge: bool, references: bool}
+     */
+    private function sqlsrvStatementState(string $head): array
+    {
+        return [
+            'head' => $head,
+            // WITH waits for its main query.
+            'main' => $head === 'WITH',
+            // INSERT waits for VALUES, DEFAULT VALUES, SELECT or EXEC.
+            'source' => $head === 'INSERT',
+            // UPDATE waits for SET.
+            'set' => $head === 'UPDATE',
+            'merge' => $head === 'MERGE',
+            // A foreign key was declared: ON DELETE / ON UPDATE are its actions.
+            'references' => false,
+        ];
+    }
+
+    /**
+     * Move the statement state past the token at $index.
+     *
+     * @param  array{head: string, main: bool, source: bool, set: bool, merge: bool, references: bool}  $statement
+     * @param  list<Token>  $tokens
+     * @return array{head: string, main: bool, source: bool, set: bool, merge: bool, references: bool}
+     */
+    private function sqlsrvAdvanceStatement(array $statement, array $tokens, int $index, string $word): array
+    {
+        if ($word === 'REFERENCES') {
+            $statement['references'] = true;
+        }
+
+        if ($statement['main'] && in_array($word, ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE'], true)) {
+            return ['main' => false] + $this->sqlsrvStatementState($word);
+        }
+
+        if ($statement['merge'] && $this->sqlsrvPreviousWord($tokens, $index) === 'THEN') {
+            $statement['source'] = $word === 'INSERT';
+            $statement['set'] = $word === 'UPDATE';
+
+            return $statement;
+        }
+
+        if ($statement['source'] && in_array($word, ['VALUES', 'DEFAULT', 'SELECT', 'EXEC', 'EXECUTE'], true)) {
+            $statement['source'] = false;
+        }
+
+        if ($statement['set'] && ($word === 'SET'
+            || ($word === 'STATISTICS' && $this->sqlsrvPreviousWord($tokens, $index) === 'UPDATE'))) {
+            $statement['set'] = false;
+        }
+
+        return $statement;
+    }
+
+    /**
+     * Whether the statement keyword at $index belongs to the statement in
+     * progress instead of starting a new one.
+     *
+     * @param  array{head: string, main: bool, source: bool, set: bool, merge: bool, references: bool}  $statement
+     * @param  list<Token>  $tokens
+     * @param  list<string>  $words
+     */
+    private function sqlsrvContinuesStatement(array $statement, array $tokens, int $index, array $words): bool
+    {
+        $word = $words[0];
+        $head = $statement['head'];
+        $previous = $tokens[$index - 1] ?? null;
+        $previousWords = $previous !== null && in_array($previous->type, [TokenType::None, TokenType::Keyword], true)
+            ? $this->tokenWords($previous)
+            : [];
+        $previousFirst = $previousWords[0] ?? '';
+        $previousLast = $previousWords === [] ? '' : $previousWords[count($previousWords) - 1];
+        $next = $tokens[$index + 1] ?? null;
+        $nextWord = $next !== null ? $this->firstWord($next) : '';
+
+        return match (true) {
+            $word === 'SELECT' && in_array($previousFirst, ['UNION', 'EXCEPT', 'INTERSECT'], true) => true,
+            $statement['source'] && in_array($word, ['SELECT', 'EXEC', 'EXECUTE'], true) => true,
+            $statement['main'] && in_array($word, ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE'], true) => true,
+            $statement['merge'] && $previousLast === 'THEN' && in_array($word, ['INSERT', 'UPDATE', 'DELETE'], true) => true,
+            $word === 'SET' && $statement['set'] => true,
+            $word === 'SET' && $head === 'ALTER' => true,
+            $word === 'ROLLBACK' && $head === 'ALTER' && $previousLast === 'WITH' => true,
+            $word === 'ALTER' && $head === 'CREATE' && $previousLast === 'OR' => true,
+            $word === 'SELECT' && $head === 'CREATE' && $previousLast === 'AS' => true,
+            $word === 'SELECT' && $head === 'DECLARE' && $previousLast === 'FOR' => true,
+            $word === 'FETCH' && in_array($previousLast, ['ROWS', 'ROW'], true) => true,
+            in_array($word, ['DELETE', 'UPDATE'], true) && $previousLast === 'ON' && $statement['references'] => true,
+            $word === 'SET' && $statement['references'] && in_array($previousLast, ['DELETE', 'UPDATE'], true)
+                && ($previousFirst === 'ON' || $this->sqlsrvPreviousWord($tokens, $index - 1) === 'ON') => true,
+            $word === 'IF' && in_array($head, ['DROP', 'ALTER', 'CREATE'], true)
+                && in_array($previousLast, self::SQLSRV_OBJECT_TYPES, true)
+                && (count($words) > 1 || in_array($nextWord, ['EXISTS', 'NOT'], true)) => true,
+            in_array($word, ['DROP', 'ALTER'], true) && $head === 'ALTER'
+                && in_array($nextWord, ['COLUMN', 'CONSTRAINT', 'INDEX', 'PERIOD'], true) => true,
+            in_array($head, ['GRANT', 'REVOKE', 'DENY'], true)
+                && (in_array($previousLast, ['GRANT', 'REVOKE', 'DENY', 'FOR', 'WITH'], true)
+                    || ($previous !== null && $this->isOperator($previous, ','))) => true,
+            default => false,
+        };
+    }
+
+    /**
+     * The last upper-cased word of the word token before $index, or '' when
+     * that token is not a word.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function sqlsrvPreviousWord(array $tokens, int $index): string
+    {
+        $previous = $tokens[$index - 1] ?? null;
+
+        if ($previous === null || ! in_array($previous->type, [TokenType::None, TokenType::Keyword], true)) {
+            return '';
+        }
+
+        $words = $this->tokenWords($previous);
+
+        return $words === [] ? '' : $words[count($words) - 1];
+    }
+
+    /**
+     * Whether the CREATE or ALTER at $index defines a module — a procedure,
+     * function, trigger or view, optionally as CREATE OR ALTER. Its body
+     * runs later, not now, and the definition is the last statement of its
+     * batch.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function sqlsrvDefinesModule(array $tokens, int $index): bool
+    {
+        $next = $index + 1;
+
+        if (isset($tokens[$next], $tokens[$next + 1]) && $this->firstWord($tokens[$next]) === 'OR'
+            && $this->firstWord($tokens[$next + 1]) === 'ALTER') {
+            $next += 2;
+        }
+
+        return isset($tokens[$next])
+            && in_array($this->firstWord($tokens[$next]), ['PROCEDURE', 'PROC', 'FUNCTION', 'TRIGGER', 'VIEW'], true);
     }
 
     /**
@@ -1252,14 +2662,16 @@ class SqlInspector
 
     private function classify(?object $statement, string $keyword, string $sql, bool $parsed): StatementType
     {
-        if ($statement instanceof SelectStatement
+        // The parser skips a leading word it does not know and parses what
+        // follows ("DENY SELECT ON t TO u" is a SelectStatement), so a parsed
+        // read counts only when the statement itself starts with a read
+        // keyword. A parsed SELECT can still smuggle a write inside a CTE
+        // body (PostgreSQL WITH ... AS (INSERT ...)), so WITH is re-checked below.
+        if (($statement instanceof SelectStatement
             || $statement instanceof ShowStatement
-            || $statement instanceof ExplainStatement) {
-            // A parsed SELECT can still smuggle a write inside a CTE body
-            // (PostgreSQL WITH ... AS (INSERT ...)), so WITH is re-checked below.
-            if (strtoupper($keyword) !== 'WITH') {
-                return StatementType::Read;
-            }
+            || $statement instanceof ExplainStatement)
+            && in_array(strtoupper($keyword), self::READ_KEYWORDS, true)) {
+            return StatementType::Read;
         }
 
         if ($keyword === 'WITH') {
@@ -1297,7 +2709,10 @@ class SqlInspector
         $limitIndex = null;
         $forIndex = null;
         $hasFetch = false;
-        $hasTop = false;
+        $topIndex = null;
+        $hasOffset = false;
+        $hasSetOperator = false;
+        $previous = null;
 
         foreach ($tokens as $i => $token) {
             if ($token->type === TokenType::Operator) {
@@ -1315,13 +2730,27 @@ class SqlInspector
             }
 
             $upper = strtoupper($token->token);
+            $afterBracket = $previous !== null && $previous->type === TokenType::None && $previous->token === '[';
+            $previous = $token;
+
+            if ($afterBracket) {
+                // "[top]", "[offset]", "[union]", ... are bracketed names,
+                // never the clause or operator of the same spelling.
+                continue;
+            }
 
             if ($upper === 'LIMIT') {
                 $limitIndex = $i;
             } elseif ($upper === 'FETCH') {
                 $hasFetch = true;
-            } elseif ($upper === 'TOP' && $driver === DbDriver::Sqlsrv) {
-                $hasTop = true;
+            } elseif ($upper === 'OFFSET') {
+                $hasOffset = true;
+            } elseif (in_array($this->firstWord($token), ['UNION', 'EXCEPT', 'INTERSECT'], true)) {
+                // The lexer types UNION as a keyword but EXCEPT / INTERSECT
+                // as plain words, so the token type is not consulted.
+                $hasSetOperator = true;
+            } elseif ($upper === 'TOP' && $driver === DbDriver::Sqlsrv && $topIndex === null) {
+                $topIndex = $i;
             } elseif ($forIndex === null && $token->type === TokenType::Keyword && str_starts_with($upper, 'FOR ')) {
                 // Locking clauses lex as compound keywords: "FOR UPDATE", "FOR SHARE", ...
                 $forIndex = $i;
@@ -1334,15 +2763,23 @@ class SqlInspector
         }
 
         // T-SQL SELECT TOP n: clamp the count; never append LIMIT.
-        if ($hasTop) {
-            return $this->clampTopClause($sql, $hardLimit);
+        if ($topIndex !== null) {
+            return $this->clampTopClause($sql, $tokens, $topIndex, $hardLimit);
         }
 
         if ($limitIndex === null) {
             if ($driver === DbDriver::Sqlsrv) {
-                // LIMIT is not valid T-SQL; the executor-level hard cap
-                // bounds the result instead.
-                return [$sql, false, false, []];
+                // LIMIT is not valid T-SQL. A plain top-level SELECT gets
+                // TOP (<default>) instead. T-SQL refuses TOP next to
+                // OFFSET, and TOP before a UNION / EXCEPT / INTERSECT would
+                // bound only the first branch and change the result, so
+                // those — and CTEs — are left untouched to the
+                // executor-level hard cap.
+                if ($hasOffset || $hasSetOperator) {
+                    return [$sql, false, false, []];
+                }
+
+                return $this->injectTopClause($sql, $tokens, $defaultLimit);
             }
 
             // No top-level LIMIT: inject the default, before a FOR UPDATE/SHARE
@@ -1448,27 +2885,115 @@ class SqlInspector
     }
 
     /**
+     * Clamp the T-SQL "TOP n" / "TOP (n)" at $topIndex to the hard cap.
+     * TOP n PERCENT is rejected — its row count depends on the table size —
+     * and so is any count other than a plain integer (a variable, an
+     * expression, a decimal): a limit the guard cannot read is a limit it
+     * cannot enforce.
+     *
+     * Token based, so a TOP inside a comment or a string literal is never
+     * mistaken for the clause.
+     *
+     * @param  list<Token>  $tokens  the full lexer stream, whitespace included
      * @return array{0: string, 1: bool, 2: bool, 3: list<string>}
      */
-    private function clampTopClause(string $sql, int $hardLimit): array
+    private function clampTopClause(string $sql, array $tokens, int $topIndex, int $hardLimit): array
     {
-        if (! preg_match('/\bTOP\s*\(?\s*(\d+)\s*\)?/i', $sql, $matches, PREG_OFFSET_CAPTURE)) {
+        $unsupported = [$sql, false, false, [
+            'Unsupported TOP clause; use TOP <n> with a plain row count.',
+        ]];
+
+        $next = $this->nextSignificantIndex($tokens, $topIndex);
+        $countToken = null;
+        $clauseEnd = $next;
+
+        if ($next !== null && $tokens[$next]->type === TokenType::Number) {
+            $countToken = $tokens[$next];
+        } elseif ($next !== null && $this->isOperator($tokens[$next], '(')) {
+            $inner = $this->nextSignificantIndex($tokens, $next);
+            $close = $inner === null ? null : $this->nextSignificantIndex($tokens, $inner);
+
+            if ($inner !== null && $close !== null
+                && $tokens[$inner]->type === TokenType::Number
+                && $this->isOperator($tokens[$close], ')')) {
+                $countToken = $tokens[$inner];
+                $clauseEnd = $close;
+            }
+        }
+
+        if ($countToken === null || $countToken->position === null || ! ctype_digit((string) $countToken->token)) {
+            return $unsupported;
+        }
+
+        $after = $this->nextSignificantIndex($tokens, (int) $clauseEnd);
+
+        if ($after !== null && strtoupper((string) $tokens[$after]->token) === 'PERCENT') {
             return [$sql, false, false, [
-                'Unsupported TOP clause; use TOP <n> with a plain row count.',
+                'TOP ... PERCENT is not allowed through QueryProxy; use TOP <n> with a plain row count.',
             ]];
         }
 
-        $count = (int) $matches[1][0];
-
-        if ($count <= $hardLimit) {
+        if ((int) $countToken->token <= $hardLimit) {
             return [$sql, false, false, []];
         }
 
-        $prepared = substr($sql, 0, $matches[1][1])
+        $prepared = substr($sql, 0, $countToken->position)
             .$hardLimit
-            .substr($sql, $matches[1][1] + strlen($matches[1][0]));
+            .substr($sql, $countToken->position + strlen($countToken->token));
 
         return [$prepared, false, true, []];
+    }
+
+    /**
+     * Give a top-level T-SQL SELECT without TOP a "TOP (<default>)", after
+     * SELECT or after its DISTINCT / ALL quantifier. Anything that does not
+     * start with SELECT (a CTE, for one) is returned unchanged.
+     *
+     * @param  list<Token>  $tokens  the full lexer stream, whitespace included
+     * @return array{0: string, 1: bool, 2: bool, 3: list<string>}
+     */
+    private function injectTopClause(string $sql, array $tokens, int $defaultLimit): array
+    {
+        $select = $this->nextSignificantIndex($tokens, -1);
+
+        if ($select === null || strtoupper((string) $tokens[$select]->token) !== 'SELECT') {
+            return [$sql, false, false, []];
+        }
+
+        $anchor = $select;
+        $quantifier = $this->nextSignificantIndex($tokens, $select);
+
+        if ($quantifier !== null && in_array(strtoupper((string) $tokens[$quantifier]->token), ['DISTINCT', 'ALL'], true)) {
+            $anchor = $quantifier;
+        }
+
+        $position = $tokens[$anchor]->position;
+
+        if ($position === null) {
+            return [$sql, false, false, []];
+        }
+
+        $offset = $position + strlen((string) $tokens[$anchor]->token);
+        $prepared = substr($sql, 0, $offset)." TOP ({$defaultLimit})".substr($sql, $offset);
+
+        return [$prepared, true, false, []];
+    }
+
+    /**
+     * The index of the first token after $index that is neither whitespace
+     * nor a comment, or null at the end of the stream.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function nextSignificantIndex(array $tokens, int $index): ?int
+    {
+        for ($i = $index + 1, $count = count($tokens); $i < $count; $i++) {
+            if (! in_array($tokens[$i]->type, [TokenType::Whitespace, TokenType::Comment], true)) {
+                return $i;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -1500,6 +3025,410 @@ class SqlInspector
         }
 
         return [];
+    }
+
+    /**
+     * SQLite PRAGMA is judged against an allowlist of read-only pragmas, and
+     * a pragma written with a value is rejected even when its name is
+     * allowed: "PRAGMA x = v" always, "PRAGMA x(v)" unless x is one of the
+     * hard-coded read pragmas, whose argument names what to report on. A
+     * schema prefix ("PRAGMA main.table_info(t)") is read past.
+     *
+     * @param  list<Token>  $tokens  significant tokens
+     * @param  int  $pragmaIndex  index of the PRAGMA word
+     */
+    private function pragmaViolation(array $tokens, int $pragmaIndex): ?string
+    {
+        [$name, $end] = $this->multipartNameAt($tokens, $pragmaIndex + 1);
+
+        if ($name === null || $name === '') {
+            return 'PRAGMA without a readable pragma name is not allowed through QueryProxy.';
+        }
+
+        for ($i = $end + 1, $count = count($tokens); $i < $count; $i++) {
+            if ($this->isOperator($tokens[$i], '=')) {
+                return "PRAGMA {$name} = ... is not allowed through QueryProxy: setting a pragma changes the database or the connection.";
+            }
+        }
+
+        if (! in_array($name, $this->allowedPragmas(), true)) {
+            return "PRAGMA {$name} is not allowed through QueryProxy: only read-only schema pragmas are.";
+        }
+
+        $argument = $tokens[$end + 1] ?? null;
+
+        if ($argument !== null && $this->isOperator($argument, '(')
+            && ! in_array($name, self::SQLITE_ALLOWED_PRAGMAS, true)) {
+            return "PRAGMA {$name}(...) is not allowed through QueryProxy: the call form sets the pragma; use the bare read form.";
+        }
+
+        return null;
+    }
+
+    /**
+     * The SQL Server and SQLite constructs that reach the operating system,
+     * another server or another database file:
+     *
+     *  - an invoked system procedure from {@see self::BLOCKED_PROCEDURES},
+     *    and an EXEC whose target is not a plain or dotted name (a variable,
+     *    a string literal, N'...', an expression) — fail closed;
+     *  - BULK INSERT (SQL Server and an unknown driver);
+     *  - a remote rowset function and load_extension();
+     *  - ATTACH / DETACH, VACUUM ... INTO and PRAGMA (allowlisted) — SQLite
+     *    and an unknown driver only: the words are ordinary identifiers in
+     *    the other dialects.
+     *
+     * Every token position is scanned, not just the statement head: the
+     * statement may sit behind EXPLAIN [QUERY PLAN], inside IF / BEGIN TRY,
+     * or follow another statement of a T-SQL batch without a semicolon. A
+     * command word counts as an identifier only when the token before it
+     * proves an identifier position (see isIdentifierPosition()); anywhere
+     * else it is a command, whatever follows it.
+     *
+     * The scan reads the comment-free token stream, so a name inside a string
+     * literal or a comment never counts.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function dialectViolations(array $tokens, ?DbDriver $driver): array
+    {
+        $sqlite = $driver === null || $driver === DbDriver::Sqlite;
+        $sqlsrv = $driver === null || $driver === DbDriver::Sqlsrv;
+        $procedures = $this->blockedProcedures();
+        $violations = [];
+
+        for ($index = 0, $count = count($tokens); $index < $count; $index++) {
+            $exec = $this->isWordAt($tokens, $index, 'EXEC') || $this->isWordAt($tokens, $index, 'EXECUTE');
+            $start = $exec ? $this->execTargetAt($tokens, $index) : ($index === 0 ? 0 : null);
+
+            if ($start !== null) {
+                [$procedure] = $this->multipartNameAt($tokens, $start);
+
+                if ($procedure !== null && $this->matchesFunctionList($procedure, $procedures)) {
+                    $violations[] = "{$procedure} is not allowed through QueryProxy: it runs operating-system commands, changes the server configuration or reaches another server.";
+                } elseif ($exec && ! $this->isOpaqueExecTarget($tokens[$start] ?? null) && ! $this->isPlainNameAt($tokens, $start)) {
+                    $violations[] = 'EXEC with a module QueryProxy cannot read (a variable, a string or an incomplete name) is not allowed through QueryProxy.';
+                }
+            }
+
+            if ($sqlsrv && $this->isWordAt($tokens, $index, 'BULK')
+                && ($this->isCommandWordAt($tokens, $index, 'BULK')
+                    || (isset($tokens[$index + 1]) && $this->firstWord($tokens[$index + 1]) === 'INSERT'))) {
+                $violations[] = 'BULK INSERT is not allowed through QueryProxy (server-side file IO).';
+            }
+
+            if ($sqlite) {
+                array_push($violations, ...$this->sqliteCommandViolations($tokens, $index));
+            }
+
+            [$name, $end] = $this->multipartNameAt($tokens, $index);
+            $next = $tokens[$end + 1] ?? null;
+
+            if ($name === null || $next === null || ! $this->isOperator($next, '(')) {
+                continue;
+            }
+
+            if (in_array($name, self::REMOTE_ROWSET_FUNCTIONS, true)) {
+                $violations[] = "{$name}() is not allowed through QueryProxy: it reads from another server or from a file on the database server.";
+            } elseif (in_array($name, self::CODE_LOADING_FUNCTIONS, true)) {
+                $violations[] = "{$name}() is not allowed through QueryProxy: it loads native code into the database process.";
+            }
+        }
+
+        return array_values(array_unique($violations));
+    }
+
+    /**
+     * The SQLite command at $index, when the word there is ATTACH, DETACH,
+     * VACUUM or PRAGMA in a command position. VACUUM is refused when INTO
+     * appears anywhere after it in the statement — the schema name before
+     * INTO may be bare, [bracketed], "quoted" or qualified.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function sqliteCommandViolations(array $tokens, int $index): array
+    {
+        if ($this->isCommandWordAt($tokens, $index, 'ATTACH') || $this->isCommandWordAt($tokens, $index, 'DETACH')) {
+            return ['ATTACH / DETACH is not allowed through QueryProxy (it changes the database files a connection can reach).'];
+        }
+
+        if ($this->isCommandWordAt($tokens, $index, 'VACUUM')) {
+            foreach (array_slice($tokens, $index + 1) as $token) {
+                if (preg_match('/\bINTO\b/i', (string) $token->token)) {
+                    return ['VACUUM INTO is not allowed through QueryProxy (it writes a database file on the server).'];
+                }
+            }
+
+            return [];
+        }
+
+        if ($this->isCommandWordAt($tokens, $index, 'PRAGMA')) {
+            $violation = $this->pragmaViolation($tokens, $index);
+
+            return $violation === null ? [] : [$violation];
+        }
+
+        return [];
+    }
+
+    /**
+     * Where the module name of the EXEC / EXECUTE at $index starts, past an
+     * "@status =" return-value capture.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function execTargetAt(array $tokens, int $index): int
+    {
+        $variable = $tokens[$index + 1] ?? null;
+        $assignment = $tokens[$index + 2] ?? null;
+
+        if ($variable !== null && $assignment !== null
+            && $variable->type === TokenType::Symbol && str_starts_with((string) $variable->token, '@')
+            && $this->isOperator($assignment, '=')) {
+            return $index + 3;
+        }
+
+        return $index + 1;
+    }
+
+    /**
+     * An EXEC target this phase deliberately leaves to the dynamic-SQL rules
+     * or that is not a module at all: "EXEC (...)" / "EXEC('...')" runs a
+     * string (judged by the dynamic-SQL guard), and EXECUTE as a privilege
+     * in a GRANT list ("GRANT SELECT, EXECUTE ON ...") is followed by "," or
+     * ")". Every other unreadable target fails closed.
+     */
+    private function isOpaqueExecTarget(?Token $target): bool
+    {
+        return $target !== null
+            && ($this->isOperator($target, '(') || $this->isOperator($target, ',') || $this->isOperator($target, ')'));
+    }
+
+    /**
+     * Whether a plain module name starts at $index: bare or [bracketed]
+     * parts joined by dots (master..xp_cmdshell, [dbo].[proc]). A string
+     * literal, a "quoted" or `quoted` name, a variable and an expression are
+     * not one. Neither is a name glued to the string after it: the lexer
+     * reads N'xp_cmdshell' as the word N followed by a string, and "N" with
+     * a string after it is refused in either spelling.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function isPlainNameAt(array $tokens, int $index): bool
+    {
+        $i = $index;
+        $last = null;
+
+        while (isset($tokens[$i])) {
+            $token = $tokens[$i];
+
+            if ($token->type === TokenType::None && $token->token === '[') {
+                $inner = $tokens[$i + 1] ?? null;
+                $close = $tokens[$i + 2] ?? null;
+
+                if ($inner === null || $close === null || $close->type !== TokenType::None || $close->token !== ']'
+                    || ! in_array($inner->type, [TokenType::None, TokenType::Keyword], true)) {
+                    return false;
+                }
+
+                $last = $close;
+                $i += 3;
+            } elseif (in_array($token->type, [TokenType::None, TokenType::Keyword], true) && $token->token !== ']') {
+                $last = $token;
+                $i++;
+            } else {
+                return false;
+            }
+
+            if (! isset($tokens[$i]) || ! $this->isOperator($tokens[$i], '.')) {
+                break;
+            }
+
+            while (isset($tokens[$i]) && $this->isOperator($tokens[$i], '.')) {
+                $i++;
+            }
+        }
+
+        $next = $tokens[$i] ?? null;
+
+        if ($last === null || $next === null || $next->type !== TokenType::String) {
+            return $last !== null;
+        }
+
+        $glued = $last->position !== null && $next->position !== null
+            && $next->position === $last->position + strlen((string) $last->token);
+
+        return ! $glued && ! ($i === $index + 1 && strtoupper((string) $last->token) === 'N');
+    }
+
+    /**
+     * Whether the token at $index is the bare word $word: not quoted, not
+     * [bracketed] and not the column part of a qualified name.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function isWordAt(array $tokens, int $index, string $word): bool
+    {
+        $token = $tokens[$index] ?? null;
+
+        if ($token === null
+            || ! in_array($token->type, [TokenType::None, TokenType::Keyword], true)
+            || $this->firstWord($token) !== $word) {
+            return false;
+        }
+
+        $previous = $tokens[$index - 1] ?? null;
+
+        return $previous === null
+            || ! ($this->isOperator($previous, '.') || ($previous->type === TokenType::None && $previous->token === '['));
+    }
+
+    /**
+     * Whether the bare word $word at $index is a command. It is one unless
+     * the token before it proves an identifier position; what follows the
+     * word is never consulted, because a unary operator, a string or INTO
+     * after a command word reads the same as a column in an expression.
+     * "SELECT attach FROM t" and "CREATE TABLE t (attach int)" are
+     * identifiers; "ATTACH +'x' AS y", "EXPLAIN PRAGMA x" and
+     * "SELECT 1 BULK INSERT ..." are commands.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function isCommandWordAt(array $tokens, int $index, string $word): bool
+    {
+        return $this->isWordAt($tokens, $index, $word) && ! $this->isIdentifierPosition($tokens, $index);
+    }
+
+    /**
+     * Whether the token before $index can only be followed by an identifier
+     * or an expression, never by a new statement: a clause keyword such as
+     * SELECT, FROM, JOIN, WHERE, SET or TABLE, a comma, an opening
+     * parenthesis or a comparison. Everything else — the statement head,
+     * EXPLAIN, BEGIN, THEN, ELSE, AS, a closing parenthesis, a value, an
+     * arithmetic operator — leaves the position ambiguous, and an ambiguous
+     * position is a command (fail closed).
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function isIdentifierPosition(array $tokens, int $index): bool
+    {
+        $previous = $tokens[$index - 1] ?? null;
+
+        if ($previous === null) {
+            return false;
+        }
+
+        if ($previous->type === TokenType::Operator) {
+            return in_array($previous->token, self::IDENTIFIER_OPERATORS, true);
+        }
+
+        if ($previous->type !== TokenType::Keyword) {
+            return false;
+        }
+
+        $words = preg_split('/\s+/', strtoupper(trim((string) $previous->token))) ?: [];
+
+        return in_array(end($words), self::IDENTIFIER_KEYWORDS, true);
+    }
+
+    /**
+     * Keywords (the last word of a compound one such as "LEFT JOIN" or
+     * "INSERT INTO") after which only an identifier or an expression can
+     * follow.
+     */
+    private const IDENTIFIER_KEYWORDS = [
+        'SELECT', 'DISTINCT', 'ALL', 'FROM', 'JOIN', 'BY', 'WHERE', 'HAVING', 'AND', 'OR',
+        'ON', 'SET', 'TABLE', 'INDEX', 'VIEW', 'INTO', 'UPDATE', 'IN', 'IS', 'NOT',
+        'EXISTS', 'WHEN', 'CASE', 'LIKE', 'BETWEEN', 'VALUES', 'REFERENCES',
+    ];
+
+    /**
+     * Operators after which only an identifier or an expression can follow.
+     */
+    private const IDENTIFIER_OPERATORS = [',', '(', '=', '<', '>', '<=', '>=', '<>', '!=', '||'];
+
+    /**
+     * The upper-cased first word of a token; compound keywords such as
+     * "INSERT INTO" or "UNION ALL" lex as one token.
+     */
+    private function firstWord(Token $token): string
+    {
+        return strtoupper((string) strtok((string) $token->token, " \t\r\n"));
+    }
+
+    /**
+     * The last part of the possibly qualified name that starts at $index —
+     * master..xp_cmdshell, [master].[dbo].[xp_cmdshell], main.table_info —
+     * case-folded, and the index of its last token. The name is null when
+     * the token there cannot name an object.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: ?string, 1: int}
+     */
+    private function multipartNameAt(array $tokens, int $index): array
+    {
+        $name = null;
+        $end = $index;
+        $i = $index;
+
+        while (isset($tokens[$i])) {
+            [$part, $partEnd] = $this->namePartAt($tokens, $i);
+
+            if ($part === null) {
+                break;
+            }
+
+            $name = $part;
+            $end = $partEnd;
+            $i = $partEnd + 1;
+
+            // "master..xp_cmdshell" leaves the schema part empty.
+            $dots = $i;
+
+            while (isset($tokens[$dots]) && $this->isOperator($tokens[$dots], '.')) {
+                $dots++;
+            }
+
+            if ($dots === $i) {
+                break;
+            }
+
+            $i = $dots;
+        }
+
+        return [$name, $end];
+    }
+
+    /**
+     * One part of a qualified name: a bare, "quoted" or `quoted` identifier
+     * (see functionName()), or a SQL Server [bracketed] one, which the lexer
+     * splits into "[", the name and "]".
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: ?string, 1: int}
+     */
+    private function namePartAt(array $tokens, int $index): array
+    {
+        $token = $tokens[$index];
+
+        if ($token->type === TokenType::None && $token->token === '[') {
+            $inner = $tokens[$index + 1] ?? null;
+            $close = $tokens[$index + 2] ?? null;
+
+            if ($inner === null || $close === null || $close->token !== ']') {
+                return [null, $index];
+            }
+
+            return [$this->functionName($inner), $index + 2];
+        }
+
+        if ($token->type === TokenType::None && $token->token === ']') {
+            return [null, $index];
+        }
+
+        return [$this->functionName($token), $index];
     }
 
     /**
@@ -1888,6 +3817,25 @@ class SqlInspector
     }
 
     /**
+     * @return list<string>
+     */
+    private function blockedProcedures(): array
+    {
+        return $this->guardList(self::BLOCKED_PROCEDURES, 'queryproxy.blocked_procedures');
+    }
+
+    /**
+     * The one allowlist among the guard lists: configuration extending it
+     * allows more pragmas, it never removes the read-only floor.
+     *
+     * @return list<string>
+     */
+    private function allowedPragmas(): array
+    {
+        return $this->guardList(self::SQLITE_ALLOWED_PRAGMAS, 'queryproxy.sqlite_allowed_pragmas');
+    }
+
+    /**
      * Merge a configured guard list on top of its hard-coded floor. The merge
      * direction is the point: configuration (and through it the environment)
      * can only ever add names, so neither a typo in .env nor a missing config
@@ -2083,6 +4031,322 @@ class SqlInspector
         }
 
         return [$sql, null];
+    }
+
+    /**
+     * SQLite and SQL Server read comments differently from the lexer: "--"
+     * starts a comment there whatever follows it ("--x", "1--1"), SQL Server
+     * nests block comments, and "#" starts no comment at all. Where the
+     * readings differ, the guard would skip text the server runs — "--x" on
+     * one line hides nothing from the server but shifts every token after it
+     * for the guard, and "#" hides the rest of the line from the guard only —
+     * so the SQL is refused instead.
+     *
+     * On SQL Server a "#" outside strings and comments never reaches this
+     * check: it starts a temporary table name and is masked beforehand (see
+     * maskTemporaryTableMarkers()).
+     */
+    private function dialectCommentViolation(string $sql, ?DbDriver $driver): ?string
+    {
+        if ($driver !== DbDriver::Sqlite && $driver !== DbDriver::Sqlsrv) {
+            return null;
+        }
+
+        $tokens = (new Lexer($sql))->list->tokens;
+        $dialect = $driver === DbDriver::Sqlite ? 'SQLite' : 'SQL Server';
+
+        foreach ($tokens as $index => $token) {
+            $text = (string) $token->token;
+
+            if ($token->type === TokenType::Comment) {
+                if (str_starts_with($text, '#')) {
+                    return "\"#\" is not a comment in {$dialect}; QueryProxy cannot read SQL that uses it outside a string. Start a comment with \"-- \" instead.";
+                }
+
+                if ($driver === DbDriver::Sqlsrv && str_starts_with($text, '/*') && str_contains(substr($text, 2), '/*')) {
+                    return 'A nested block comment is not allowed through QueryProxy: SQL Server and QueryProxy close it at different places.';
+                }
+
+                continue;
+            }
+
+            if (in_array($token->type, [TokenType::String, TokenType::Symbol, TokenType::Whitespace], true)) {
+                continue;
+            }
+
+            $next = $tokens[$index + 1] ?? null;
+
+            if (str_contains($text, '--') || ($text === '-' && $next !== null && str_starts_with((string) $next->token, '-'))) {
+                return "\"--\" not followed by a space is not allowed through QueryProxy: {$dialect} reads it as a comment and QueryProxy does not. Write \"-- \" for a comment.";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Dollar quoting is PostgreSQL syntax. The guard's dollar-quote scanner is
+     * driver-blind, so on any other server a "$$ ... $$" pair would hide the
+     * text between the tags from the guard (as one string) while the server
+     * runs it: "$$" is a plain identifier in MySQL, and "[$$]" a quoted name
+     * in SQL Server and SQLite. SQL that the scanner reads a dollar-quoted
+     * string in is therefore refused on those servers.
+     */
+    private function dollarQuoteDialectViolation(string $sql, ?DbDriver $driver): ?string
+    {
+        if ($driver === null || $driver === DbDriver::Pgsql) {
+            return null;
+        }
+
+        if ($this->dollarQuotedRanges($sql) === []) {
+            return null;
+        }
+
+        return 'Dollar-quoted text ($$ ... $$ or $tag$ ... $tag$) is PostgreSQL syntax and is not allowed on this connection: QueryProxy would read it as one string while the server does not.';
+    }
+
+    /**
+     * Locate the strings, quoted names and comments of a SQL Server or SQLite
+     * statement with that server's own lexical rules, and on SQL Server
+     * replace every "#" outside a string or a comment with a sentinel
+     * character the lexer reads as part of a name.
+     *
+     * In SQL Server "#" and "##" start a temporary table name, while the
+     * MySQL-dialect lexer reads "#" as a comment to the end of the line; left
+     * as it is, "FROM #t WHERE id = 1" would hide its WHERE clause (and
+     * anything after it) from the guard. DEL (0x7F) takes its place: the
+     * lexer treats it as a name character, it is a single byte so no offset
+     * moves, and SQL that already contains one is refused so every DEL seen
+     * later is known to be a masked "#". The sentinel is turned back into
+     * "#" in everything inspect() returns.
+     *
+     * @return array{0: string, 1: ?array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}, 2: ?string}
+     */
+    private function maskTemporaryTableMarkers(string $sql, DbDriver $driver): array
+    {
+        $dialect = $driver === DbDriver::Sqlite ? 'SQLite' : 'SQL Server';
+
+        if ($driver === DbDriver::Sqlsrv && str_contains($sql, self::TEMPORARY_TABLE_SENTINEL)) {
+            return [$sql, null, 'A DEL control character (0x7F) is not allowed in SQL Server SQL through QueryProxy.'];
+        }
+
+        $ranges = $this->dialectLexicalRanges($sql, $driver);
+
+        if ($ranges === null) {
+            return [$sql, null, "A string, quoted name or comment that is never closed (or a line comment broken by a lone carriage return) is not allowed: QueryProxy cannot tell where {$dialect} ends it."];
+        }
+
+        if ($driver !== DbDriver::Sqlsrv || ! str_contains($sql, '#')) {
+            return [$sql, $ranges, null];
+        }
+
+        $chars = mb_str_split($sql);
+        $opaque = array_merge($ranges['quoted'], $ranges['comments']);
+
+        foreach ($chars as $position => $char) {
+            if ($char === '#' && ! $this->isWithinRange($position, $opaque)) {
+                $chars[$position] = self::TEMPORARY_TABLE_SENTINEL;
+            }
+        }
+
+        return [implode('', $chars), $ranges, null];
+    }
+
+    private function unmaskTemporaryTableMarkers(string $text): string
+    {
+        return str_replace(self::TEMPORARY_TABLE_SENTINEL, '#', $text);
+    }
+
+    /**
+     * Character ranges of the quoted strings and names, the comments and the
+     * bracketed names of a statement, read with SQL Server's or SQLite's
+     * lexical rules: '...' and "..." double their quote and take no backslash
+     * escape, a backtick quotes a name in SQLite only, [...] quotes a name
+     * (SQL Server doubles "]" inside it, SQLite closes on the first one),
+     * "--" starts a comment wherever it appears and runs to the line feed,
+     * and block comments nest in SQL Server.
+     *
+     * Null when any of them is never closed, or when a line comment holds a
+     * carriage return that is not part of a CR LF pair (where the comment
+     * ends is then not certain).
+     *
+     * @return array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}|null
+     */
+    private function dialectLexicalRanges(string $sql, DbDriver $driver): ?array
+    {
+        $chars = mb_str_split($sql);
+        $length = count($chars);
+        $sqlsrv = $driver === DbDriver::Sqlsrv;
+        $ranges = ['quoted' => [], 'comments' => [], 'brackets' => []];
+        $offset = 0;
+
+        while ($offset < $length) {
+            $char = $chars[$offset];
+            $next = $chars[$offset + 1] ?? '';
+
+            if ($char === '-' && $next === '-') {
+                $end = $offset + 2;
+
+                while ($end < $length && $chars[$end] !== "\n") {
+                    if ($chars[$end] === "\r" && ($chars[$end + 1] ?? "\n") !== "\n") {
+                        return null;
+                    }
+
+                    $end++;
+                }
+
+                $ranges['comments'][] = [$offset, $end];
+                $offset = $end;
+
+                continue;
+            }
+
+            if ($char === '/' && $next === '*') {
+                $depth = 1;
+                $end = $offset + 2;
+
+                while ($end < $length && $depth > 0) {
+                    $pair = $chars[$end].($chars[$end + 1] ?? '');
+
+                    if ($sqlsrv && $pair === '/*') {
+                        $depth++;
+                        $end += 2;
+                    } elseif ($pair === '*/') {
+                        $depth--;
+                        $end += 2;
+                    } else {
+                        $end++;
+                    }
+                }
+
+                if ($depth > 0) {
+                    return null;
+                }
+
+                $ranges['comments'][] = [$offset, $end];
+                $offset = $end;
+
+                continue;
+            }
+
+            $closer = match (true) {
+                $char === "'", $char === '"' => $char,
+                $char === '`' && ! $sqlsrv => '`',
+                $char === '[' => ']',
+                default => null,
+            };
+
+            if ($closer === null) {
+                $offset++;
+
+                continue;
+            }
+
+            $doubles = $closer !== ']' || $sqlsrv;
+            $end = $offset + 1;
+            $closed = false;
+
+            while ($end < $length) {
+                if ($chars[$end] !== $closer) {
+                    $end++;
+
+                    continue;
+                }
+
+                if ($doubles && ($chars[$end + 1] ?? '') === $closer) {
+                    $end += 2;
+
+                    continue;
+                }
+
+                $end++;
+                $closed = true;
+
+                break;
+            }
+
+            if (! $closed) {
+                return null;
+            }
+
+            $ranges[$char === '[' ? 'brackets' : 'quoted'][] = [$offset, $end];
+            $offset = $end;
+        }
+
+        return $ranges;
+    }
+
+    /**
+     * Hold the lexer's tokens against the strings, names and comments the
+     * server itself reads (dialectLexicalRanges()). Every string or comment
+     * token, and every token carrying a quote character, must coincide with
+     * a server range of the same kind; no token may straddle the edge of a
+     * server range; and inside a bracketed name only plain name tokens may
+     * appear. Anything else means the guard and the server split the text
+     * differently — "'a\' EXEC ..." is one string to the lexer, which takes a
+     * backslash escape, but a string and an EXEC to the server — and the SQL
+     * is refused.
+     *
+     * Positions are counted in characters, as the lexer counts them; a line
+     * comment is compared without its trailing whitespace.
+     *
+     * @param  array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}  $ranges
+     */
+    private function dialectLexicalViolation(string $sql, array $ranges, DbDriver $driver): ?string
+    {
+        $dialect = $driver === DbDriver::Sqlite ? 'SQLite' : 'SQL Server';
+        $violation = "QueryProxy reads a string, quoted name or comment in this SQL differently from {$dialect} (a backslash escape, a backtick, or a quote inside a [bracketed] name), so it cannot inspect it safely.";
+
+        $serverRanges = [];
+
+        foreach (['quoted', 'comments', 'brackets'] as $kind) {
+            foreach ($ranges[$kind] as [$start, $end]) {
+                if ($kind === 'comments') {
+                    $end = $start + mb_strlen(rtrim(mb_substr($sql, $start, $end - $start)));
+                }
+
+                $serverRanges[] = [$start, $end, $kind];
+            }
+        }
+
+        foreach ((new Lexer($sql))->list->tokens as $token) {
+            $text = (string) $token->token;
+
+            if ($token->position === null || $text === '') {
+                continue;
+            }
+
+            $isComment = $token->type === TokenType::Comment;
+            $start = $token->position;
+            $end = $start + mb_strlen($isComment ? rtrim($text) : $text);
+            $isQuoted = $token->type === TokenType::String || strpbrk($text, '\'"`') !== false;
+            $matched = false;
+
+            foreach ($serverRanges as [$rangeStart, $rangeEnd, $kind]) {
+                if ($start >= $rangeEnd || $end <= $rangeStart) {
+                    continue;
+                }
+
+                if ($start === $rangeStart && $end === $rangeEnd
+                    && (($kind === 'comments' && $isComment) || ($kind === 'quoted' && $isQuoted && ! $isComment))) {
+                    $matched = true;
+
+                    continue;
+                }
+
+                if ($kind === 'brackets' && $start >= $rangeStart && $end <= $rangeEnd && ! $isComment && ! $isQuoted) {
+                    continue;
+                }
+
+                return $violation;
+            }
+
+            if (($isComment || $isQuoted) && ! $matched) {
+                return $violation;
+            }
+        }
+
+        return null;
     }
 
     /**

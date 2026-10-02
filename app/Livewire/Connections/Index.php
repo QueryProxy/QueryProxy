@@ -198,6 +198,10 @@ class Index extends Component
             'connections' => Connection::forTeam($team)->with('grantedUsers')->orderBy('name')->get(),
             'developers' => $team->users()->wherePivot('role', TeamRole::Developer->value)->orderBy('name')->get(),
             'drivers' => DbDriver::cases(),
+            // Without QUERYPROXY_SQLITE_ALLOWED_DIR a SQLite connection may
+            // point at any file the app can read; the form says so, but does
+            // not refuse the save.
+            'sqliteDirUnrestricted' => blank(config('queryproxy.sqlite_allowed_dir')),
         ]);
     }
 }

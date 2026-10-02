@@ -92,6 +92,21 @@ return [
         array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_RESOURCE_CONSUMING_FUNCTIONS', ''))),
     )))),
 
+    // SQL Server system procedures QueryProxy refuses to invoke ("xp_*"
+    // matches a prefix). The env list can only add to the floor.
+    'blocked_procedures' => array_values(array_unique(array_filter(array_merge(
+        SqlInspector::BLOCKED_PROCEDURES,
+        array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_BLOCKED_PROCEDURES', ''))),
+    )))),
+
+    // SQLite pragmas QueryProxy lets through — read-only, and never with a
+    // value. The env list can only add to the floor; an added pragma is
+    // allowed only in its bare form ("PRAGMA x"), since "PRAGMA x(v)" sets it.
+    'sqlite_allowed_pragmas' => array_values(array_unique(array_filter(array_merge(
+        SqlInspector::SQLITE_ALLOWED_PRAGMAS,
+        array_map('trim', explode(',', (string) env('QUERYPROXY_EXTRA_SQLITE_PRAGMAS', ''))),
+    )))),
+
     /*
     |--------------------------------------------------------------------------
     | Connection target restrictions
