@@ -6,11 +6,130 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — YYYY-MM-DD
+
+### Security
+
+- **`EXPLAIN ANALYZE <DML>` was classified as a read and ran the DML.**
+  `EXPLAIN ANALYZE` executes the statement it explains, but the guard treated
+  every `EXPLAIN` as a read, so `EXPLAIN ANALYZE DELETE FROM t` skipped the
+  `WHERE` rule, the write classification and the approval flow. An `EXPLAIN`
+  that analyzes is now judged as the statement inside it (type, denylist and
+  `WHERE` rule); `EXPLAIN` without `ANALYZE` stays a read. The option list is
+  checked against PostgreSQL's known options, and an option block the guard
+  cannot read (quoted or unknown options, an unclosed list, an expression value)
+  is rejected.
+- **`SELECT … INTO <table>` created a table but was classified as a read.** It
+  is now a write and DDL, and no `LIMIT` is added. `SELECT … INTO @var` stays a
+  read; `INTO OUTFILE` / `INTO DUMPFILE` were already denied.
+- **Functions with side effects passed as reads.** Calling `nextval`, `setval`,
+  the advisory-lock family, `get_lock`, `release_lock`, `pg_sleep*`, `sleep` or
+  `benchmark` now makes a statement a write. `pg_terminate_backend`,
+  `pg_cancel_backend`, `pg_reload_conf`, `pg_rotate_logfile`, `pg_promote`,
+  `pg_switch_wal`, `dblink*` and the server-side file functions
+  (`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `lo_import`, `lo_export`,
+  `load_file`) are denied. `set_config` is a write, and is denied when its first
+  argument is not a literal. Names are matched after quoting and `U&` escapes
+  are resolved. `dblink*` is a prefix match, so a user-defined function that
+  starts with `dblink` is denied too. The new
+  `QUERYPROXY_EXTRA_BLOCKED_FUNCTIONS`,
+  `QUERYPROXY_EXTRA_STATE_CHANGING_FUNCTIONS` and
+  `QUERYPROXY_EXTRA_RESOURCE_CONSUMING_FUNCTIONS` settings extend these lists,
+  and `QUERYPROXY_EXTRA_BLOCKED_PROCEDURES` (SQL Server, below) and
+  `QUERYPROXY_EXTRA_SQLITE_PRAGMAS` (SQLite, below) do the same for theirs;
+  they can only add to the built-in entries.
+- **SQL Server and SQLite constructs that reach outside the database were not
+  covered.** On SQL Server the guard now denies `xp_*`, `sp_configure`,
+  `sp_oa*`, `sp_addlinkedserver`, `sp_addlinkedsrvlogin`, `sp_serveroption`,
+  `sp_addextendedproc`, `sp_execute_external_script`, `OPENROWSET`,
+  `OPENDATASOURCE`, `OPENQUERY` and `BULK INSERT`, and also denies `DENY`
+  statements. A batch without semicolons is split at T-SQL statement boundaries
+  and every part is checked, so `SELECT 1 DELETE FROM t` is rejected. On SQLite
+  it denies `ATTACH`, `DETACH`, `VACUUM … INTO` and `load_extension(`, and only
+  allows a built-in set of read-only `PRAGMA`s (`table_info`, `table_xinfo`,
+  `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`,
+  `database_list`, `table_list`, `collation_list`, `function_list`,
+  `compile_options`), which `QUERYPROXY_EXTRA_SQLITE_PRAGMAS` can extend (bare
+  form only); any `PRAGMA` that sets a value, and any not on the list, is
+  rejected. The connection form warns when `QUERYPROXY_SQLITE_ALLOWED_DIR` is
+  empty.
+- **Dynamic SQL was not inspected.** `EXEC('…')`, `sp_executesql`,
+  `EXECUTE IMMEDIATE '…'`, MySQL `PREPARE … FROM '…'` and PostgreSQL
+  `PREPARE … AS <statement>` are now checked together with the SQL they carry.
+  When the SQL is a literal it is judged by the same rules as a top-level
+  statement; when it is a variable, an expression, a concatenation or an
+  `EXEC(…) AT <server>`, the request is rejected. **This can reject legitimate
+  use**: code that builds SQL at runtime and passes it through these forms no
+  longer runs through QueryProxy. **Behaviour change:** on SQL Server these 14
+  system procedures are rejected whatever their arguments are: `sp_prepare`,
+  `sp_prepexec`, `sp_prepexecrpc`, `sp_execute`, `sp_cursoropen`,
+  `sp_cursorprepare`, `sp_cursorprepexec`, `sp_msforeachtable`,
+  `sp_msforeachdb`, `sp_msforeach_worker`, `sp_sqlexec`, `sp_send_dbmail`,
+  `sp_add_jobstep` and `sp_update_jobstep`. `sp_executesql` is not on the list;
+  its SQL text is inspected. Dynamic SQL nested more than 3 levels deep is
+  rejected.
+- **`UPDATE` / `DELETE` inside a CTE skipped the `WHERE` rule.** The bodies of
+  `WITH … AS (…)` and the statement that follows the `WITH` are now checked,
+  including nested `WITH`s up to 3 levels; a `WITH` the guard cannot read is
+  rejected. `INSERT` and `MERGE` bodies are not checked separately; the outer
+  statement is a write.
+- **SQL Server `TOP` was only half enforced.** A `SELECT` without `TOP` was not
+  bounded by the guard, and `TOP` values with `PERCENT`, decimals or expressions
+  were read as plain numbers. An existing `TOP n` / `TOP (n)` stays capped
+  at 10000; now a top-level `SELECT` without `TOP` gets
+  `TOP (<default row limit>)`, and `TOP … PERCENT`, expressions and decimals
+  are rejected. For `WITH`, `OFFSET`, `UNION`, `EXCEPT` and `INTERSECT`
+  no `TOP` is added; the executor's row cap applies.
+- **New teams started with no masking rules.** A team created from now on starts
+  with the default masking rules. Existing teams are not changed (see
+  Upgrading).
+
 ### Fixed
 
-- `.env.example` now sets `REDIS_QUEUE_RETRY_AFTER=330`. Laravel's fallback of
-  90 seconds is below the worker's 310-second timeout, so with
-  `QUEUE_CONNECTION=redis` a slow query could be re-reserved and executed twice.
+- `retry_after` for the database, Beanstalkd and Redis queues no longer falls
+  back to Laravel's 90 seconds, which is below the worker's 310-second timeout
+  and let a slow query be re-reserved while it was still running and then marked
+  failed (notably with `QUEUE_CONNECTION=redis`). It is now derived from
+  `QUERYPROXY_EXECUTION_TIMEOUT` (timeout + 30 seconds, 330 by default)
+  instead of a fixed number. An explicit `*_QUEUE_RETRY_AFTER` still wins; a
+  value at or below the timeout logs a warning when a `queue:work` worker
+  starts. The Docker entrypoint derives the worker `--timeout`
+  (timeout + 10) and `stopwaitsecs` (timeout + 20) the same way.
+- **A query that finished late could turn a Failed request into Completed.** The
+  executor now moves a request to Completed only if it is still Running. A late
+  result is discarded, the result file is removed, and an
+  `execution.late_completion` audit entry is written; for a write it records
+  that the write was committed.
+
+### Upgrading
+
+- **Remove the fixed `retry_after` lines from your `.env`.** The 0.2.0
+  `.env.example` shipped `DB_QUEUE_RETRY_AFTER=330` as an active setting, and an
+  explicit value always wins over the derived one. If that line is still in your
+  `.env` (or `REDIS_QUEUE_RETRY_AFTER=330`, `BEANSTALKD_QUEUE_RETRY_AFTER`), delete
+  it unless you set it on purpose; otherwise raising
+  `QUERYPROXY_EXECUTION_TIMEOUT` leaves `retry_after` at 330, a long query is
+  re-reserved while it still runs, and a write can commit while its request is
+  marked Failed. A `--timeout` set by hand on a separately run worker (the
+  Docker image derives it itself) should be the execution timeout + 10 seconds.
+- **Existing teams do not get masking rules automatically.** A DBA opens the
+  team's **Masking** page and runs **Add default rules**. Query Studio and the
+  Masking page now show a banner for a team that has no masking rules, or none
+  enabled.
+- **Some statements now need approval.** `SELECT` statements that call
+  `nextval`, `setval`, an advisory-lock function, `get_lock`, `release_lock`,
+  `pg_sleep*`, `sleep`, `benchmark` or `set_config` are classified as writes, so
+  they go through the approval flow.
+- **Some statements that used to pass are now rejected.** In particular:
+  `EXPLAIN ANALYZE` on a `DELETE` / `UPDATE` without `WHERE`, dynamic SQL built
+  from a variable or an expression, the 14 SQL Server procedures listed under
+  Security, SQL Server `TOP … PERCENT`, any `PRAGMA` outside the allowed set on
+  SQLite, and, on PostgreSQL, any `UESCAPE` clause and any `EXPLAIN` option
+  block the guard cannot read. `SELECT … INTO <table>` is now a write.
+- **SQL Server `SELECT` without `TOP` now returns 1000 rows by default.** The
+  previous ceiling was 10000.
+- The full list is in the
+  [SQL guards wiki page](https://github.com/QueryProxy/QueryProxy/wiki/SQL-guards).
 
 ## [0.2.0] — 2026-09-18
 

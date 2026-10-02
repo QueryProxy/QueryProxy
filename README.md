@@ -116,6 +116,15 @@ refuses to run while `APP_ENV=production` unless you also set
 
 > **Before exposing QueryProxy to a network, read [Production hardening](#production-hardening).**
 
+> **Recommended production setup**
+>
+> - For teams or users who only read, register a separate connection with a database user that has `SELECT` privileges only. Keep write access on a different connection, since approved writes run through the connection they were submitted on.
+> - Point that read-only connection at a replica where you can.
+> - Restrict the network path between QueryProxy and the target database.
+> - On PostgreSQL, check the transport yourself: the connection uses `sslmode=prefer` today, and a TLS setting arrives in v0.3.0.
+>
+> The SQL guard is not a last line of defence. Until read-only execution on the database side arrives (v0.3.0), build the defence with database privileges as well.
+
 ## Manual installation
 
 Requirements: PHP ≥ 8.3 (pdo drivers for your target databases), Composer,
@@ -131,7 +140,7 @@ php artisan queryproxy:create-admin   # first administrator (skip if seeding dem
 npm install && npm run build
 
 php artisan serve              # dev only — use nginx + php-fpm in production
-php artisan queue:work --queue=queries,default --timeout=310   # worker (required!)
+php artisan queue:work --queue=queries,default --tries=1 --timeout=310   # worker (required!); --timeout = QUERYPROXY_EXECUTION_TIMEOUT + 10 (300 by default)
 php artisan schedule:work      # scheduler (optional)
 ```
 
