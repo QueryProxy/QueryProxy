@@ -32,6 +32,9 @@ jobs:
           POSTGRES_DB: queryproxy_test
           POSTGRES_USER: queryproxy_test
           POSTGRES_PASSWORD: queryproxy_test
+          # initdb trusts loopback by default; scram there makes the dblink
+          # test, which connects from the server to 127.0.0.1, use the password.
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-

@@ -133,10 +133,12 @@ final class LivePgsql
      * Without a host, libpq falls back to the server's local socket.
      *
      * The address the tests use is not always the one the server sees itself
-     * on: a container that publishes 5432 as 55432 (docker-compose.test.yml)
-     * still listens on 5432 inside its own network.
-     * QUERYPROXY_LIVE_PGSQL_SERVER_HOST and QUERYPROXY_LIVE_PGSQL_SERVER_PORT
-     * override HOST and PORT for this string only.
+     * on: a container that publishes its port under another number, or is
+     * reached through a host name only the test process resolves, needs
+     * QUERYPROXY_LIVE_PGSQL_SERVER_HOST / QUERYPROXY_LIVE_PGSQL_SERVER_PORT,
+     * which override HOST and PORT for this string only.
+     * docker-compose.test.yml avoids the problem by listening on 55432 inside
+     * the container as well.
      */
     public function serverSideDsn(): string
     {

@@ -16,11 +16,10 @@
  *   QUERYPROXY_LIVE_PGSQL_DATABASE=queryproxy_test \
  *   QUERYPROXY_LIVE_PGSQL_USERNAME=queryproxy_test \
  *   QUERYPROXY_LIVE_PGSQL_PASSWORD=queryproxy_test \
- *   QUERYPROXY_LIVE_PGSQL_SERVER_PORT=5432 \
  *   ./vendor/bin/pest --group=live-pgsql
  *
- * SERVER_HOST / SERVER_PORT are where dblink reaches the server from inside
- * it (see LivePgsql::serverSideDsn()); they default to HOST / PORT.
+ * SERVER_HOST / SERVER_PORT, when set, are where dblink reaches the server
+ * from inside it (see LivePgsql::serverSideDsn()); they default to HOST / PORT.
  *
  * Tests that need a superuser (most guarded settings are superuser-only, and
  * so is dblink) are skipped on a server where the test role is not one.

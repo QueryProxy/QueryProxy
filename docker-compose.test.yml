@@ -1,18 +1,20 @@
 # Throwaway PostgreSQL for the live guard tests (tests/Live, Pest group
 # "live-pgsql"). Test-only: fixed credentials, no volume, published on 55432 so
-# it does not collide with a local PostgreSQL on 5432.
+# it does not collide with a local PostgreSQL on 5432. The server listens on
+# 55432 inside the container too (PGPORT), so the dblink test, which connects
+# from the server itself, reaches it at the same host and port as the tests.
+#
+# Host (TCP) connections use scram-sha-256, loopback included: the image's
+# initdb would otherwise trust 127.0.0.1, and the dblink test would never send
+# the password it is meant to prove it passes on.
 #
 #   docker compose -f docker-compose.test.yml up -d --wait
 #   QUERYPROXY_LIVE_PGSQL_HOST=127.0.0.1 QUERYPROXY_LIVE_PGSQL_PORT=55432 \
 #   QUERYPROXY_LIVE_PGSQL_DATABASE=queryproxy_test \
 #   QUERYPROXY_LIVE_PGSQL_USERNAME=queryproxy_test \
 #   QUERYPROXY_LIVE_PGSQL_PASSWORD=queryproxy_test \
-#   QUERYPROXY_LIVE_PGSQL_SERVER_PORT=5432 \
 #   ./vendor/bin/pest --group=live-pgsql
 #   docker compose -f docker-compose.test.yml down
-#
-# SERVER_PORT is the port the server listens on inside the container: the
-# dblink test connects from the server itself, where 55432 does not exist.
 #
 # The image's POSTGRES_USER is a superuser, which the tests need: most of the
 # settings the guard refuses can only be changed by one, and so can dblink.
@@ -24,8 +26,10 @@ services:
       POSTGRES_DB: queryproxy_test
       POSTGRES_USER: queryproxy_test
       POSTGRES_PASSWORD: queryproxy_test
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      PGPORT: "55432"
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:55432:55432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U queryproxy_test -d queryproxy_test"]
       interval: 2s

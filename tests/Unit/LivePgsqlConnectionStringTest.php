@@ -7,12 +7,10 @@ use Tests\Live\LivePgsql;
  * live group itself needs a database; these checks only need the environment.
  */
 
-const LIVE_PGSQL_KEYS = ['HOST', 'PORT', 'SERVER_HOST', 'SERVER_PORT', 'DATABASE', 'USERNAME', 'PASSWORD'];
-
 beforeEach(function () {
     $this->savedLiveEnv = [];
 
-    foreach (LIVE_PGSQL_KEYS as $key) {
+    foreach (['HOST', 'PORT', 'SERVER_HOST', 'SERVER_PORT', 'DATABASE', 'USERNAME', 'PASSWORD'] as $key) {
         $this->savedLiveEnv[$key] = getenv(LivePgsql::ENV_PREFIX.$key);
         putenv(LivePgsql::ENV_PREFIX.$key);
     }
