@@ -499,6 +499,114 @@ test('EXPLAIN ANALYZE nested past the depth limit is rejected', function () {
         ->and(inspect('EXPLAIN ANALYZE EXPLAIN ANALYZE EXPLAIN ANALYZE EXPLAIN ANALYZE SELECT 1', DbDriver::Pgsql)->passes())->toBeFalse();
 });
 
+test('MariaDB ANALYZE is judged by the statement it executes', function (string $sql, bool $passes, StatementType $type) {
+    $result = inspect($sql, DbDriver::Mariadb);
+
+    expect($result->passes())->toBe($passes)
+        ->and($result->type())->toBe($type);
+})->with([
+    'select' => ['ANALYZE SELECT 1', true, StatementType::Read],
+    'update with WHERE' => ['ANALYZE UPDATE t SET a=1 WHERE id=1', true, StatementType::Write],
+    'delete with WHERE' => ['ANALYZE DELETE FROM t WHERE id=1', true, StatementType::Write],
+    'insert' => ['ANALYZE INSERT INTO t VALUES (1)', true, StatementType::Write],
+    'replace' => ['ANALYZE REPLACE INTO t VALUES (1)', true, StatementType::Write],
+    'CTE select' => ['ANALYZE WITH x AS (SELECT 1) SELECT * FROM x', true, StatementType::Read],
+    'parenthesised select' => ['ANALYZE (SELECT 1)', true, StatementType::Read],
+    'FORMAT=JSON select' => ['ANALYZE FORMAT=JSON SELECT 1', true, StatementType::Read],
+    'lower case FORMAT = json' => ['analyze format = json update t set a=1 where id=1', true, StatementType::Write],
+    'delete without WHERE' => ['ANALYZE DELETE FROM t', false, StatementType::Write],
+    'update without WHERE' => ['ANALYZE UPDATE t SET a=1', false, StatementType::Write],
+    'FORMAT=JSON delete without WHERE' => ['ANALYZE FORMAT=JSON DELETE FROM t', false, StatementType::Write],
+    'comment as separator' => ['ANALYZE/**/DELETE FROM t', false, StatementType::Write],
+    'DDL' => ['ANALYZE DROP TABLE t', false, StatementType::Write],
+    'TRUNCATE' => ['ANALYZE TRUNCATE t', false, StatementType::Write],
+    'SET' => ['ANALYZE SET GLOBAL general_log = 1', false, StatementType::Write],
+    'ANALYZE of ANALYZE' => ['ANALYZE ANALYZE DELETE FROM t WHERE id=1', false, StatementType::Write],
+    'FORMAT before something that is not a statement' => ['ANALYZE FORMAT=JSON t', false, StatementType::Write],
+    'FORMAT without =' => ['ANALYZE FORMAT JSON SELECT 1', false, StatementType::Write],
+    'FORMAT without a statement' => ['ANALYZE FORMAT=JSON', false, StatementType::Write],
+    'wrapped in parentheses' => ['(ANALYZE DELETE FROM t WHERE id=1)', false, StatementType::Write],
+]);
+
+test('MariaDB ANALYZE carries the inner denylist and limit without touching its prefix', function () {
+    $forbidden = inspect("ANALYZE SELECT load_file('/etc/passwd')", DbDriver::Mariadb);
+    $select = inspect('ANALYZE FORMAT=JSON SELECT * FROM t', DbDriver::Mariadb);
+
+    expect($forbidden->passes())->toBeFalse()
+        ->and($select->type())->toBe(StatementType::Read)
+        ->and($select->preparedSql())->toStartWith('ANALYZE FORMAT=JSON SELECT * FROM t')
+        ->and($select->preparedSql())->toContain('LIMIT');
+});
+
+test('MariaDB ANALYZE counts towards the nesting depth limit', function () {
+    expect(inspect("EXECUTE IMMEDIATE 'EXECUTE IMMEDIATE ''ANALYZE SELECT 1'''", DbDriver::Mariadb)->passes())->toBeTrue()
+        ->and(inspect("EXECUTE IMMEDIATE 'EXECUTE IMMEDIATE ''EXECUTE IMMEDIATE ''''ANALYZE SELECT 1'''''''", DbDriver::Mariadb)->passes())->toBeFalse();
+});
+
+test('ANALYZE and EXPLAIN ANALYZE cut the inner statement at its byte offset behind multibyte comments', function (string $sql, DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->type())->toBe(StatementType::Write)
+        ->and($result->violations)->toContain('Statement 1: DELETE without a WHERE clause is not allowed.');
+})->with([
+    'MariaDB ANALYZE' => ['ANALYZE /* '.str_repeat('é', 23).' */ DELETE FROM t', DbDriver::Mariadb],
+    'MariaDB ANALYZE with a short comment' => ['ANALYZE /* éé */ DELETE FROM t', DbDriver::Mariadb],
+    'MariaDB ANALYZE FORMAT=JSON' => ['ANALYZE FORMAT=JSON /* ééééé */ DELETE FROM t', DbDriver::Mariadb],
+    'MariaDB EXPLAIN ANALYZE' => ['EXPLAIN ANALYZE /* '.str_repeat('é', 23).' */ DELETE FROM t', DbDriver::Mariadb],
+    'PostgreSQL EXPLAIN ANALYZE' => ['EXPLAIN ANALYZE /* '.str_repeat('é', 23).' */ DELETE FROM t', DbDriver::Pgsql],
+]);
+
+test('ANALYZE behind a multibyte comment keeps its prefix whole', function () {
+    $result = inspect('ANALYZE /* ğüş */ SELECT * FROM t', DbDriver::Mariadb);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Read)
+        ->and($result->preparedSql())->toStartWith('ANALYZE /* ğüş */ SELECT * FROM t')
+        ->and($result->preparedSql())->toContain('LIMIT')
+        ->and(mb_check_encoding($result->preparedSql(), 'UTF-8'))->toBeTrue();
+});
+
+test('ANALYZE of a statement is read fail-closed on the mysql and unknown drivers', function (?DbDriver $driver) {
+    expect(inspect('ANALYZE DELETE FROM t', $driver)->passes())->toBeFalse()
+        ->and(inspect('ANALYZE FORMAT=JSON DELETE FROM t', $driver)->passes())->toBeFalse()
+        ->and(inspect('ANALYZE DROP TABLE t', $driver)->passes())->toBeFalse()
+        ->and(inspect('ANALYZE UPDATE t SET a=1 WHERE id=1', $driver)->type())->toBe(StatementType::Write);
+})->with([
+    'mysql' => [DbDriver::Mysql],
+    'unknown' => [null],
+]);
+
+test('ANALYZE TABLE and the maintenance spellings keep their classification', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write)
+        ->and($result->preparedSql())->toBe($sql);
+})->with([
+    'mysql ANALYZE TABLE' => ['ANALYZE TABLE t', DbDriver::Mysql],
+    'mysql NO_WRITE_TO_BINLOG' => ['ANALYZE NO_WRITE_TO_BINLOG TABLE t', DbDriver::Mysql],
+    'mysql LOCAL' => ['ANALYZE LOCAL TABLE t', DbDriver::Mysql],
+    'mysql histogram' => ['ANALYZE TABLE t UPDATE HISTOGRAM ON a', DbDriver::Mysql],
+    'mariadb ANALYZE TABLE' => ['ANALYZE TABLE t', DbDriver::Mariadb],
+    'unknown driver ANALYZE TABLE' => ['ANALYZE TABLE t', null],
+    'pgsql bare' => ['ANALYZE', DbDriver::Pgsql],
+    'pgsql table' => ['ANALYZE VERBOSE t', DbDriver::Pgsql],
+    'pgsql option list' => ['ANALYZE (VERBOSE) t', DbDriver::Pgsql],
+    'unknown driver table name' => ['ANALYZE t', null],
+    'sqlite table' => ['ANALYZE main.t', DbDriver::Sqlite],
+]);
+
+test('ANALYZE before a statement keeps its classification where ANALYZE never runs one', function (DbDriver $driver) {
+    $result = inspect('ANALYZE SELECT 1', $driver);
+
+    expect($result->type())->toBe(StatementType::Write)
+        ->and($result->preparedSql())->toBe('ANALYZE SELECT 1');
+})->with([
+    'pgsql' => [DbDriver::Pgsql],
+    'sqlite' => [DbDriver::Sqlite],
+]);
+
 test('SELECT INTO a table is a DDL write without a limit', function (DbDriver $driver) {
     $result = inspect('SELECT * INTO t2 FROM t', $driver);
 

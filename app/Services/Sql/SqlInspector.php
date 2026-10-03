@@ -91,6 +91,11 @@ use PhpMyAdmin\SqlParser\TokenType;
  *    PostgreSQL would not take as a boolean — is rejected rather than waved
  *    through as a read. A plain EXPLAIN only plans on PostgreSQL and SQLite,
  *    so there the calls it names are not judged.
+ *  - MariaDB's ANALYZE [FORMAT = x] <statement> runs its statement too and
+ *    is judged like EXPLAIN ANALYZE; it may only run SELECT, INSERT,
+ *    REPLACE, UPDATE or DELETE. The mysql and the unknown driver are read
+ *    the same way, since either may front a MariaDB server. ANALYZE TABLE
+ *    and the PostgreSQL / SQLite ANALYZE keep their classification.
  *  - SELECT ... INTO <table> creates a table (PostgreSQL, SQL Server) and is
  *    a DDL write; MySQL's SELECT ... INTO @variable stays a read.
  *  - The leading keyword, INTO and every called function name are read
@@ -117,6 +122,12 @@ class SqlInspector
      * DESCRIBE and DESC as synonyms of EXPLAIN).
      */
     private const EXPLAIN_KEYWORDS = ['EXPLAIN', 'DESCRIBE', 'DESC'];
+
+    /**
+     * The statements MariaDB's ANALYZE <statement> may run; "(" stands for a
+     * parenthesised SELECT. Any other statement behind ANALYZE is rejected.
+     */
+    private const ANALYZE_STATEMENT_KEYWORDS = ['SELECT', 'WITH', '(', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE'];
 
     /**
      * The options a PostgreSQL EXPLAIN (...) list may name. Any other option
@@ -523,10 +534,8 @@ class SqlInspector
 
         foreach ($lexer->list->tokens as $token) {
             if ($token->type === TokenType::Delimiter && $token->token !== '' && $token->position !== null) {
-                // The lexer counts characters; the dollar-quoted ranges and
-                // substr() count bytes, which differ once the SQL holds
-                // multibyte text such as 'ğ'.
-                $offset = strlen(mb_substr($sql, 0, $token->position));
+                // The dollar-quoted ranges and substr() count bytes.
+                $offset = $this->tokenByteOffset($sql, $token->position);
 
                 if ($this->isWithinRange($offset, $quoted)) {
                     continue;
@@ -703,6 +712,23 @@ class SqlInspector
             // ExplainExecuteQuery calls EvaluateParams), so its calls run.
             $executes = ! $this->explainIsPlanOnly($driver)
                 || $this->explainsExecute(substr($sql, $options['innerOffset']));
+        }
+
+        // MariaDB's ANALYZE <statement> runs the statement like EXPLAIN
+        // ANALYZE does; ANALYZE TABLE and the other maintenance spellings
+        // fall through and keep their classification.
+        if ($keyword === 'ANALYZE' && $this->analyzeMayRunStatement($driver)) {
+            $analyze = $this->analyzeStatementForm($sql, $wrappingParens);
+
+            if ($analyze !== null) {
+                if (is_string($analyze)) {
+                    $violations[] = "{$label}: {$analyze}";
+
+                    return [new StatementInfo($sql, $sql, StatementType::Write, false), $violations];
+                }
+
+                return $this->analyzeExplainAnalyze($sql, $analyze, 'ANALYZE', $position, $driver, $depth, $violations);
+            }
         }
 
         $functionWrites = false;
@@ -2671,10 +2697,12 @@ class SqlInspector
      * "EXPLAIN (SELECT ...)" is a parenthesised statement, not an option list,
      * and is read as such.
      *
-     * The original SQL is lexed (not its dollar-masked form) so the inner
-     * offset is a real byte offset into it; the option block never contains
-     * dollar quoting, and the lexer reads left to right, so anything later in
-     * the statement cannot shift the tokens of the block.
+     * The original SQL is lexed (not its dollar-masked form) so the token
+     * positions index into it; the option block never contains dollar
+     * quoting, and the lexer reads left to right, so anything later in the
+     * statement cannot shift the tokens of the block. Those positions count
+     * characters, so the inner offset goes through tokenByteOffset() before
+     * the caller cuts the SQL with substr().
      *
      * @return array{resolved: bool, analyze: bool, innerOffset: int}
      */
@@ -2766,9 +2794,106 @@ class SqlInspector
             }
         }
 
-        $innerOffset = isset($tokens[$index]) ? (int) $tokens[$index]->position : strlen($sql);
+        $innerOffset = isset($tokens[$index])
+            ? $this->tokenByteOffset($sql, $tokens[$index]->position)
+            : strlen($sql);
 
         return ['resolved' => true, 'analyze' => $analyze, 'innerOffset' => $innerOffset];
+    }
+
+    /**
+     * True when the server may read ANALYZE as MariaDB's ANALYZE <statement>,
+     * which executes that statement. MariaDB does; so may a server behind
+     * the mysql driver (Laravel's mysql driver is the usual way to reach
+     * MariaDB) or behind an unknown driver, and those are judged fail-closed
+     * as if they were MariaDB. PostgreSQL, SQLite and SQL Server have no
+     * ANALYZE that runs a statement.
+     */
+    private function analyzeMayRunStatement(?DbDriver $driver): bool
+    {
+        return $driver === null || $driver === DbDriver::Mariadb || $driver === DbDriver::Mysql;
+    }
+
+    /**
+     * Read a statement that starts with ANALYZE as MariaDB would:
+     *
+     *   ANALYZE [FORMAT = x] statement                    (runs the statement)
+     *   ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE t ...  (maintenance)
+     *
+     * Returns the byte offset of the statement ANALYZE runs, null when the
+     * ANALYZE is not of that form (ANALYZE TABLE, a bare ANALYZE, an
+     * identifier or a PostgreSQL option list after it) and keeps its
+     * classification, or a violation when ANALYZE would run something the
+     * guard refuses to let it run.
+     *
+     * MySQL and MariaDB take no table name right after ANALYZE, so a keyword
+     * there other than TABLE, NO_WRITE_TO_BINLOG or LOCAL starts a statement;
+     * one that MariaDB's ANALYZE does not take (DROP, TRUNCATE, SET, CALL,
+     * ...) is rejected rather than ignored. Behind FORMAT = x, whatever
+     * follows can only be a statement and is read as one. A bare identifier
+     * after ANALYZE (PostgreSQL / SQLite "ANALYZE t", reachable through the
+     * unknown driver) keeps its classification.
+     *
+     * The original SQL is lexed (not its dollar-masked form) so the token
+     * positions index into it; they count characters, and the offset goes
+     * through tokenByteOffset() before it is returned.
+     */
+    private function analyzeStatementForm(string $sql, int $wrappingParens): int|string|null
+    {
+        $tokens = [];
+
+        foreach ((new Lexer($sql))->list->tokens as $token) {
+            if (! in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
+                $tokens[] = $token;
+            }
+        }
+
+        $index = $wrappingParens + 1;
+        $format = false;
+
+        if (isset($tokens[$index]) && $tokens[$index]->type === TokenType::Keyword
+            && ($this->tokenWords($tokens[$index])[0] ?? '') === 'FORMAT') {
+            if (! isset($tokens[$index + 1], $tokens[$index + 2]) || ! $this->isOperator($tokens[$index + 1], '=')) {
+                return 'ANALYZE with a FORMAT option QueryProxy cannot read is not allowed.';
+            }
+
+            $format = true;
+            $index += 3;
+        }
+
+        $next = $tokens[$index] ?? null;
+
+        if ($next === null) {
+            return $format ? 'ANALYZE without a statement to analyze is not allowed.' : null;
+        }
+
+        $word = $this->tokenWords($next)[0] ?? '';
+
+        if ($this->isOperator($next, '(')) {
+            $runsStatement = $this->opensStatement($tokens[$index + 1] ?? null);
+
+            if (! $runsStatement && ! $format) {
+                return null;
+            }
+
+            $word = $runsStatement ? '(' : '';
+        } elseif ($next->type === TokenType::Keyword) {
+            if (! $format && in_array($word, ['TABLE', 'NO_WRITE_TO_BINLOG', 'LOCAL'], true)) {
+                return null;
+            }
+        } elseif (! $format) {
+            return null;
+        }
+
+        if (! in_array($word, self::ANALYZE_STATEMENT_KEYWORDS, true)) {
+            return 'ANALYZE runs the statement it analyzes and may only run SELECT, INSERT, REPLACE, UPDATE or DELETE.';
+        }
+
+        if ($wrappingParens > 0) {
+            return 'ANALYZE of a statement inside parentheses is not allowed.';
+        }
+
+        return $this->tokenByteOffset($sql, $next->position);
     }
 
     /**
@@ -5136,6 +5261,25 @@ class SqlInspector
         }
 
         return $sql;
+    }
+
+    /**
+     * Turn a lexer token position into a byte offset into the same SQL.
+     *
+     * The lexer reads multibyte SQL as a UtfString, so its token positions
+     * count characters, while substr() and the dollar-quoted ranges count
+     * bytes. A multibyte comment before the token ('é' is two bytes) would
+     * otherwise shift every cut that follows it.
+     */
+    private function tokenByteOffset(string $sql, ?int $position): int
+    {
+        $position = (int) $position;
+
+        if (strlen($sql) === mb_strlen($sql, 'UTF-8')) {
+            return $position;
+        }
+
+        return strlen(mb_substr($sql, 0, $position, 'UTF-8'));
     }
 
     /**
