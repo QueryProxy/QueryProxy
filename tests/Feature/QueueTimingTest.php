@@ -8,12 +8,16 @@ use App\Models\Team;
 use App\Providers\AppServiceProvider;
 use App\Services\Audit\AuditRecorder;
 use App\Services\Execution\QueryExecutor;
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Queue\Events\WorkerStarting;
 use Illuminate\Queue\WorkerOptions;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\BufferedOutput;
 
 /**
  * Evaluate config/queue.php with the given env overrides (null = unset),
@@ -344,4 +348,121 @@ test('booting outside a queue worker never checks the timing', function () {
     app()->getProvider(AppServiceProvider::class)->boot();
 
     Log::shouldNotHaveReceived('warning');
+});
+
+/**
+ * Raise CommandStarting the way the console kernel does: with the input
+ * already bound to the real command's definition.
+ *
+ * @param  array<string, mixed>  $parameters
+ */
+function startCommand(string $name, array $parameters = []): void
+{
+    $input = new ArrayInput($parameters, Artisan::all()[$name]->getDefinition());
+
+    event(new CommandStarting($name, $input, new BufferedOutput));
+}
+
+function forgetListenerChildMarker(): void
+{
+    unset($_SERVER['QUERYPROXY_QUEUE_LISTENER_CHILD'], $_ENV['QUERYPROXY_QUEUE_LISTENER_CHILD']);
+    putenv('QUERYPROXY_QUEUE_LISTENER_CHILD');
+}
+
+function unsafeQueueTiming(): void
+{
+    config([
+        'queue.default' => 'database',
+        'queue.connections.database.retry_after' => 300,
+        'queue.connections.redis.retry_after' => 300,
+        'queryproxy.execution_timeout' => 300,
+    ]);
+}
+
+function assertTimingWarnedOnceFor(string $connection): void
+{
+    Log::shouldHaveReceived('warning')
+        ->withArgs(fn (string $message, array $context) => str_contains($message, 'retry_after') && $context['queue_connection'] === $connection)
+        ->once();
+}
+
+describe('command-started queue processes', function () {
+    beforeEach(fn () => forgetListenerChildMarker());
+    afterEach(fn () => forgetListenerChildMarker());
+
+    test('they warn at start with an unsafe retry_after', function (string $command, array $parameters, string $connection) {
+        unsafeQueueTiming();
+
+        Log::spy();
+
+        startCommand($command, $parameters);
+
+        assertTimingWarnedOnceFor($connection);
+    })->with([
+        'queue:listen, default connection' => ['queue:listen', [], 'database'],
+        'queue:listen redis' => ['queue:listen', ['connection' => 'redis'], 'redis'],
+        'queue:work --once, default connection' => ['queue:work', ['--once' => true], 'database'],
+        'queue:work redis --once' => ['queue:work', ['connection' => 'redis', '--once' => true], 'redis'],
+    ]);
+
+    test('they stay quiet with a safe retry_after', function (string $command, array $parameters) {
+        config([
+            'queue.default' => 'database',
+            'queue.connections.database.retry_after' => 330,
+            'queryproxy.execution_timeout' => 300,
+        ]);
+
+        Log::spy();
+
+        startCommand($command, $parameters);
+
+        Log::shouldNotHaveReceived('warning');
+    })->with([
+        'queue:listen' => ['queue:listen', []],
+        'queue:work --once' => ['queue:work', ['--once' => true]],
+    ]);
+
+    test('queue:work --once warns only once per process', function () {
+        unsafeQueueTiming();
+
+        Log::spy();
+
+        startCommand('queue:work', ['--once' => true]);
+        startWorker('database');
+
+        assertTimingWarnedOnceFor('database');
+    });
+
+    test('queue:listen marks its --once children so they do not repeat the warning', function () {
+        unsafeQueueTiming();
+
+        startCommand('queue:listen');
+
+        expect(getenv('QUERYPROXY_QUEUE_LISTENER_CHILD'))->toBe('1')
+            ->and($_SERVER['QUERYPROXY_QUEUE_LISTENER_CHILD'] ?? null)->toBe('1');
+
+        // A fresh application stands in for the child process: new provider,
+        // inherited environment.
+        $this->refreshApplication();
+        unsafeQueueTiming();
+
+        Log::spy();
+
+        startCommand('queue:work', ['--once' => true]);
+
+        Log::shouldNotHaveReceived('warning');
+    });
+
+    test('unrelated commands and a plain queue:work start never check the timing', function (string $command, array $parameters) {
+        unsafeQueueTiming();
+
+        Log::spy();
+
+        startCommand($command, $parameters);
+
+        Log::shouldNotHaveReceived('warning');
+    })->with([
+        'migrate' => ['migrate', []],
+        'queue:work daemon (left to WorkerStarting)' => ['queue:work', []],
+    ]);
 });

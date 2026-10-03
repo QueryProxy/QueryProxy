@@ -52,8 +52,14 @@ volumes:
 #
 #  worker:
 #    image: queryproxy/queryproxy:latest
-#    command: php artisan queue:work --queue=queries,default --tries=1 --timeout=310
-#    environment: (same APP_KEY / DB_* as app — an explicit APP_KEY is required)
+#    # --timeout must stay QUERYPROXY_EXECUTION_TIMEOUT + 10. The image's
+#    # entrypoint computes exactly that into QUERYPROXY_WORKER_TIMEOUT before it
+#    # runs this command, so read it from there ($$ stops Compose from expanding
+#    # it on the host) instead of hard-coding a number that drifts. Do not
+#    # override `entrypoint:` here; if the variable is missing the command fails
+#    # fast instead of starting a worker with an empty --timeout.
+#    command: sh -c 'exec php artisan queue:work --queue=queries,default --tries=1 --timeout="$${QUERYPROXY_WORKER_TIMEOUT:?set by the image entrypoint}"'
+#    environment: (same APP_KEY / DB_* / QUERYPROXY_EXECUTION_TIMEOUT as app — an explicit APP_KEY is required)
 #    volumes:
 #      - queryproxy-data:/var/www/html/storage/app
 #    depends_on: [app]

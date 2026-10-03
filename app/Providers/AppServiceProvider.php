@@ -7,6 +7,7 @@ use App\Http\Middleware\EnsureTeamRole;
 use App\Models\QueryRequest;
 use App\Models\User;
 use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Http\Middleware\TrustProxies;
 use Illuminate\Http\Request;
 use Illuminate\Queue\Events\WorkerStarting;
@@ -21,6 +22,17 @@ use Livewire\Mechanisms\HandleRequests\EndpointResolver;
 
 class AppServiceProvider extends ServiceProvider
 {
+    /**
+     * Set by `queue:listen` for the `queue:work --once` children it spawns, so
+     * the listener warns once instead of every child warning on every poll.
+     */
+    private const QUEUE_LISTENER_CHILD_ENV = 'QUERYPROXY_QUEUE_LISTENER_CHILD';
+
+    /**
+     * Whether this process already ran the queue timing check.
+     */
+    private bool $queueTimingChecked = false;
+
     public function register(): void
     {
         //
@@ -41,8 +53,14 @@ class AppServiceProvider extends ServiceProvider
 
         // Checked when a queue worker starts — the only process the timing
         // matters for — rather than on every request or scheduler tick.
+        // WorkerStarting covers the `queue:work` daemon; `queue:listen` and
+        // `queue:work --once` never raise it, so they are caught at command start.
         Event::listen(WorkerStarting::class, function (WorkerStarting $event): void {
-            $this->warnOnUnsafeQueueTiming((string) $event->connectionName);
+            $this->checkQueueTimingOnce((string) $event->connectionName);
+        });
+
+        Event::listen(CommandStarting::class, function (CommandStarting $event): void {
+            $this->checkQueueTimingForCommand($event);
         });
 
         // System admins pass every ability check up-front — except the ones about a
@@ -78,13 +96,72 @@ class AppServiceProvider extends ServiceProvider
     }
 
     /**
+     * Run the timing check for `queue:listen` and `queue:work --once` starts.
+     *
+     * The `queue:work --once` children of a listener are skipped: the listener
+     * already warned for the same connection, and it spawns one child per
+     * poll, which would otherwise repeat the warning every few seconds.
+     */
+    private function checkQueueTimingForCommand(CommandStarting $event): void
+    {
+        $input = $event->input;
+
+        $isListen = $event->command === 'queue:listen';
+        $isOnce = $event->command === 'queue:work'
+            && $input->hasOption('once')
+            && (bool) $input->getOption('once');
+
+        if (! $isListen && ! $isOnce) {
+            return;
+        }
+
+        if ($isOnce && $this->isQueueListenerChild()) {
+            return;
+        }
+
+        $connection = $input->hasArgument('connection') ? $input->getArgument('connection') : null;
+
+        $this->checkQueueTimingOnce(
+            is_string($connection) && $connection !== '' ? $connection : (string) config('queue.default')
+        );
+
+        if ($isListen) {
+            // Symfony Process hands the children this process's environment.
+            putenv(self::QUEUE_LISTENER_CHILD_ENV.'=1');
+            $_SERVER[self::QUEUE_LISTENER_CHILD_ENV] = $_ENV[self::QUEUE_LISTENER_CHILD_ENV] = '1';
+        }
+    }
+
+    private function isQueueListenerChild(): bool
+    {
+        $value = $_SERVER[self::QUEUE_LISTENER_CHILD_ENV] ?? getenv(self::QUEUE_LISTENER_CHILD_ENV);
+
+        return $value === '1';
+    }
+
+    /**
+     * Run the timing check at most once per process, whichever start event
+     * reaches it first.
+     */
+    private function checkQueueTimingOnce(string $connection): void
+    {
+        if ($this->queueTimingChecked) {
+            return;
+        }
+
+        $this->queueTimingChecked = true;
+
+        $this->warnOnUnsafeQueueTiming($connection);
+    }
+
+    /**
      * Warn when the active queue would re-reserve a job before a query may finish.
      *
      * With retry_after <= execution_timeout a slow query is handed out again
      * (or failed, with tries=1) while it is still running. config/queue.php
      * derives a safe default, so this only fires on an explicit, too-low
-     * *_QUEUE_RETRY_AFTER. Runs once per `queue:work` start for the
-     * connection that worker consumes; config reads only, no I/O.
+     * *_QUEUE_RETRY_AFTER. Runs once per `queue:work` / `queue:listen` start
+     * for the connection that worker consumes; config reads only, no I/O.
      */
     private function warnOnUnsafeQueueTiming(string $connection): void
     {
