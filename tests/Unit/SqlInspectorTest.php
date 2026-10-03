@@ -423,6 +423,457 @@ test('the DO body scan does not reject an ordinary plpgsql block', function (str
     'a forbidden statement as literal data, not as code' => "DO \$\$ BEGIN UPDATE audit SET note = 'DROP DATABASE prod' WHERE id = 1; END \$\$",
 ]);
 
+test('the DO body is read with PostgreSQL string rules, not the lexer\'s', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('Inside the DO block body: Server-side file IO functions');
+})->with([
+    // standard_conforming_strings: 'a\' is a whole string, the call is code.
+    'backslash before the closing quote' => "DO \$\$ BEGIN PERFORM 'a\\', pg_read_file('/etc/passwd') --'; END \$\$",
+    'backslash before the closing quote, comment ended by a newline' => "DO \$\$ BEGIN PERFORM 'a\\', pg_read_file('/etc/passwd') --'\n; END \$\$",
+    'backslash before the closing quote, named tag' => "DO \$body\$ BEGIN PERFORM 'a\\', pg_read_file('/etc/passwd') --'; END \$body\$",
+    'escaped quote in an E string' => "DO \$\$ BEGIN PERFORM E'a\\'', pg_read_file('/etc/passwd') --'; END \$\$",
+    'statement quoted for EXECUTE with a nested tag' => "DO \$\$ BEGIN EXECUTE \$q\$SELECT 'a\\', pg_read_file('/etc/passwd') --'\$q\$; END \$\$",
+    '"#" is XOR in PL/pgSQL, not a comment' => "DO \$\$ BEGIN PERFORM 1 # 1, pg_read_file('/etc/passwd'); END \$\$",
+    'quoted function name' => "DO \$\$ BEGIN PERFORM \"pg_read_file\"('/etc/passwd'); END \$\$",
+    'E-string body' => "DO E'BEGIN PERFORM ''a\\\\'', pg_read_file(''/etc/passwd'') --''; END'",
+]);
+
+test('the DO body is the literal PostgreSQL runs, not merely the first one', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    // Literals separated by whitespace holding a newline are one string to PostgreSQL.
+    'string continuation' => ["DO 'BEGIN PERFORM pg_read_' \n 'file(''/etc/passwd''); END'", 'more than one string literal'],
+    'string continuation of an E string' => ["DO E'BEGIN PERFORM pg_read_' \n 'file(''/etc/passwd''); END'", 'more than one string literal'],
+    // LANGUAGE takes a string as well, before or after the body.
+    'language as a leading string' => ["DO LANGUAGE 'plpgsql' 'BEGIN PERFORM pg_read_file(''/etc/passwd''); END'", 'names its language with a string literal'],
+    'language as a trailing dollar-quoted string' => ["DO 'BEGIN PERFORM pg_read_file(''/etc/passwd''); END' LANGUAGE \$\$plpgsql\$\$", 'names its language with a string literal'],
+    'language as a leading dollar-quoted string' => ["DO LANGUAGE \$\$plpgsql\$\$ 'BEGIN PERFORM pg_read_file(''/etc/passwd''); END'", 'names its language with a string literal'],
+    'language as a string behind a comment' => ["DO LANGUAGE /* x */ 'plpgsql' \$\$ BEGIN PERFORM 1; END \$\$", 'names its language with a string literal'],
+]);
+
+test('a U& quoted identifier in a DO body is decoded before the scan', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('Inside the DO block body: Server-side file IO functions');
+})->with([
+    'default escape' => "DO \$\$ BEGIN PERFORM U&\"\\0070g_read_file\"('/etc/passwd'); END \$\$",
+    'lowercase prefix, long escape' => "DO \$\$ BEGIN PERFORM u&\"\\+000070g_read_file\"('/etc/passwd'); END \$\$",
+    'inside a nested tag' => "DO \$\$ BEGIN EXECUTE \$q\$SELECT U&\"\\0070g_read_file\"('/etc/passwd')\$q\$; END \$\$",
+]);
+
+test('a UESCAPE clause in a DO body is refused, whatever string names the escape', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('Inside the DO block body: a UESCAPE clause is not allowed');
+})->with([
+    'plain string' => "DO \$\$ BEGIN PERFORM U&\"!0070g_read_file\" UESCAPE '!' ('/etc/passwd'); END \$\$",
+    'behind a comment' => "DO \$\$ BEGIN PERFORM U&\"!0070g_read_file\" /* x */ UESCAPE\n'!'('/etc/passwd'); END \$\$",
+    'E string' => "DO \$\$ BEGIN PERFORM U&\"!0070g_read_file\" UESCAPE E'!'('/etc/passwd'); END \$\$",
+    'dollar-quoted string' => "DO \$\$ BEGIN PERFORM U&\"!0070g_read_file\" UESCAPE \$e\$!\$e\$('/etc/passwd'); END \$\$",
+    'string continuation' => "DO \$\$ BEGIN PERFORM U&\"!0070g_read_file\" UESCAPE ''\n'!'('/etc/passwd'); END \$\$",
+    'E string inside a nested tag' => "DO \$\$ BEGIN EXECUTE \$q\$SELECT U&\"!0070g_read_file\" UESCAPE E'!'('/etc/passwd')\$q\$; END \$\$",
+    'U& string' => "DO \$\$ BEGIN PERFORM U&'!0041' UESCAPE '!'; END \$\$",
+]);
+
+test('nested dollar-quoted strings joined for EXECUTE cannot hide a statement written out in the body', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    // EXECUTE runs "SELECT '', pg_read_file('/etc/passwd') --'".
+    'call after a quote opened in the previous region' => ["DO \$\$ BEGIN EXECUTE \$a\$SELECT '\$a\$ || \$b\$', pg_read_file('/etc/passwd') --'\$b\$; END \$\$", 'Inside the DO block body: Server-side file IO functions'],
+    'statement after a quote opened in the previous region' => ["DO \$\$ BEGIN EXECUTE \$a\$SELECT '\$a\$ || \$b\$'; DROP DATABASE prod; --'\$b\$; END \$\$", 'Inside the DO block body'],
+]);
+
+test('dynamic SQL in a DO body is refused, however EXECUTE is spelled', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('Inside the DO block body: dynamic SQL (EXECUTE) is not allowed');
+})->with([
+    'quoted statement' => ["DO \$\$ BEGIN EXECUTE 'SELECT pg_read_file(''/etc/passwd'')'; END \$\$"],
+    'quoted DROP DATABASE' => ["DO \$\$ BEGIN EXECUTE 'DROP DATABASE prod'; END \$\$"],
+    'E string' => ["DO \$\$ BEGIN EXECUTE E'SELECT pg_read_file(\\'/etc/passwd\\')'; END \$\$"],
+    'quoted DO body' => ["DO 'BEGIN EXECUTE ''SELECT pg_read_file(''''/etc/passwd'''')''; END'"],
+    'joined quoted and dollar-quoted text' => ["DO \$\$ BEGIN EXECUTE 'SELECT ''' || \$b\$', pg_read_file('/etc/passwd') --'\$b\$; END \$\$"],
+    'format()' => ["DO \$\$ BEGIN EXECUTE format(\$q\$UPDATE %I SET note = 'x' WHERE id = 1\$q\$, 'items'); END \$\$"],
+    'USING' => ["DO \$\$ DECLARE v int := 1; BEGIN EXECUTE \$q\$UPDATE items SET note = 'x' WHERE id = \$1\$q\$ USING v; END \$\$"],
+    'lower case' => ["DO \$\$ BEGIN execute 'SELECT 1'; END \$\$"],
+    'mixed case after a comment' => ["DO \$\$ BEGIN /* x */ ExEcUtE/**/'SELECT 1'; END \$\$"],
+    'across a line break' => ["DO \$\$ BEGIN\nEXECUTE\n'SELECT 1'; END \$\$"],
+    'line comment before it' => ["DO \$\$ BEGIN -- note\nEXECUTE 'SELECT 1'; END \$\$"],
+    'quoted identifier' => ["DO \$\$ BEGIN \"execute\" 'SELECT 1'; END \$\$"],
+    'U& identifier' => ["DO \$\$ BEGIN U&\"\\0065xecute\" 'SELECT 1'; END \$\$"],
+    'OPEN FOR EXECUTE' => ["DO \$\$ DECLARE c refcursor; BEGIN OPEN c FOR EXECUTE 'SELECT 1'; END \$\$"],
+    'function body created in the block' => ["DO \$\$ BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS \$f\$ BEGIN EXECUTE 'SELECT 1'; END \$f\$; END \$\$"],
+]);
+
+test('a DO body without EXECUTE may build text, quote data and create triggers', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    'RAISE with || after quoted nested data' => ["DO \$\$ BEGIN RAISE NOTICE \$m\$it's\$m\$; RAISE NOTICE '%', 'a' || 'b'; END \$\$"],
+    'format() without EXECUTE' => ["DO \$\$ BEGIN RAISE NOTICE '%', format(\$q\$UPDATE %I SET note = 'x' WHERE id = 1\$q\$, 'items'); END \$\$"],
+    'RAISE with || and a quoted identifier in nested data' => ["DO \$\$ DECLARE v int := 1; BEGIN RAISE NOTICE \$q\$\"Items\" \$1\$q\$; RAISE NOTICE '%', 'done ' || v; END \$\$"],
+    'the word in quoted data' => ["DO \$\$ BEGIN RAISE NOTICE 'execute later'; END \$\$"],
+    'a longer identifier' => ["DO \$\$ DECLARE executed int := 1; BEGIN RAISE NOTICE '%', executed; END \$\$"],
+    'trigger EXECUTE FUNCTION' => ['DO $$ BEGIN CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION audit_row(); END $$'],
+    'trigger EXECUTE PROCEDURE' => ['DO $$ BEGIN CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE public.audit_row(); END $$'],
+]);
+
+test('functions that run SQL given as text are refused, however they are named', function (string $sql, string $name) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain("{$name}() is not allowed through QueryProxy");
+})->with([
+    'query_to_xml' => ["SELECT query_to_xml('SELECT pg_read_file(''/etc/passwd'')', true, false, '')", 'query_to_xml'],
+    'query_to_xmlschema' => ["SELECT query_to_xmlschema('SELECT 1', true, false, '')", 'query_to_xmlschema'],
+    'query_to_xml_and_xmlschema' => ["SELECT query_to_xml_and_xmlschema('SELECT 1', true, false, '')", 'query_to_xml_and_xmlschema'],
+    'ts_stat' => ["SELECT * FROM ts_stat('SELECT 1')", 'ts_stat'],
+    'schema-qualified' => ["SELECT pg_catalog.query_to_xml('SELECT 1', true, false, '')", 'query_to_xml'],
+    'double-quoted' => ["SELECT \"query_to_xml\"('SELECT 1', true, false, '')", 'query_to_xml'],
+    'schema-qualified and double-quoted' => ["SELECT pg_catalog.\"ts_stat\"('SELECT 1')", 'ts_stat'],
+    'upper case' => ["SELECT QUERY_TO_XML('SELECT 1', true, false, '')", 'query_to_xml'],
+    'ts_rewrite' => ["SELECT ts_rewrite('a'::tsquery, 'SELECT t, s FROM aliases')", 'ts_rewrite'],
+    'crosstab' => ["SELECT * FROM crosstab('SELECT row_name, cat, value FROM t') AS ct(row_name text, a int)", 'crosstab'],
+    'crosstab3' => ["SELECT * FROM public.crosstab3('SELECT row_name, cat, value FROM t')", 'crosstab3'],
+    'crosstab with a category query' => ["SELECT * FROM crosstab('SELECT 1', 'SELECT pg_terminate_backend(1)') AS ct(a int)", 'crosstab'],
+    'connectby' => ["SELECT * FROM connectby('t', 'id', 'parent_id', '1', 0) AS c(id int, parent_id int, level int)", 'connectby'],
+    'xpath_table' => ["SELECT * FROM xpath_table('id', 'doc', 't', '/a', 'true') AS x(id int, a text)", 'xpath_table'],
+    'ts_rewrite in a DO body' => ["DO \$\$ BEGIN PERFORM ts_rewrite('a'::tsquery, 'SELECT 1'); END \$\$", 'ts_rewrite'],
+]);
+
+test('a setting carried by a function, procedure, database or role is held to the SET rule', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('SET session_replication_role is not allowed');
+})->with([
+    'CREATE FUNCTION ... SET before the body' => ['CREATE FUNCTION f() RETURNS void LANGUAGE sql SET session_replication_role = replica AS $$ DELETE FROM items WHERE id = 1 $$'],
+    'CREATE OR REPLACE PROCEDURE ... SET ... TO' => ['CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql SET session_replication_role TO replica AS $$ BEGIN NULL; END $$'],
+    'CREATE FUNCTION ... SET after the body' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$ SET session_replication_role FROM CURRENT'],
+    'CREATE FUNCTION with a single-quoted body' => ["CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1' SET session_replication_role = replica"],
+    'ALTER FUNCTION' => ['ALTER FUNCTION f() SET session_replication_role = replica'],
+    'ALTER FUNCTION, second action' => ['ALTER FUNCTION f(int) SET search_path = public SET session_replication_role = replica'],
+    'ALTER PROCEDURE with a quoted name' => ['ALTER PROCEDURE p() SET "session_replication_role" = replica'],
+    'ALTER ROUTINE with a U& name' => ['ALTER ROUTINE r() SET U&"session\\005Freplication_role" = replica'],
+    'ALTER FUNCTION, lower case, comment' => ['alter function f() set /* x */ session_replication_role to replica'],
+    'ALTER DATABASE' => ['ALTER DATABASE app SET session_replication_role = replica'],
+    'ALTER ROLE' => ['ALTER ROLE bob SET session_replication_role = replica'],
+    'ALTER ROLE IN DATABASE' => ['ALTER ROLE bob IN DATABASE app SET session_replication_role = replica'],
+    'ALTER USER IN DATABASE' => ['ALTER USER bob IN DATABASE app SET session_replication_role TO replica'],
+    'ALTER DATABASE in a DO body' => ['DO $$ BEGIN ALTER DATABASE app SET session_replication_role = replica; END $$'],
+    'ALTER FUNCTION after THEN in a DO body' => ['DO $$ BEGIN IF true THEN ALTER FUNCTION f() SET session_replication_role = replica; END IF; END $$'],
+    'ALTER FUNCTION in a quoted DO body' => ["DO 'BEGIN ALTER FUNCTION f() SET session_replication_role = replica; END'"],
+    'CREATE FUNCTION ... SET in a DO body' => ['DO $$ BEGIN CREATE FUNCTION g() RETURNS int LANGUAGE sql SET session_replication_role = replica AS $g$ SELECT 1 $g$; END $$'],
+    'ALTER FUNCTION in a function body' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN ALTER FUNCTION g() SET session_replication_role = replica; END $$'],
+    'ALTER FUNCTION in a single-quoted function body' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN ALTER DATABASE app SET session_replication_role = replica; END'"],
+    'nested DO body in a DO body' => ['DO $$ BEGIN DO $x$ BEGIN ALTER DATABASE app SET session_replication_role = replica; END $x$; END $$'],
+]);
+
+test('a SET clause on a function, procedure, database or role whose setting cannot be read is refused', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('the guard cannot tell which setting');
+})->with([
+    'quoted name that is no plain name' => ['ALTER FUNCTION f() SET "session_replication_role " = replica'],
+    'quoted name in a DO body' => ['DO $$ BEGIN ALTER DATABASE app SET "a-b" = 1; END $$'],
+    'name missing' => ['ALTER DATABASE app SET = replica'],
+]);
+
+test('a top-level SET with a U& setting name is judged by the decoded name', function () {
+    $refused = inspect('SET U&"session\\005Freplication_role" = replica', DbDriver::Pgsql);
+
+    expect($refused->passes())->toBeFalse()
+        ->and(implode("\n", $refused->violations))->toContain('SET session_replication_role is not allowed')
+        ->and(inspect('SET U&"search\\005Fpath" = public', DbDriver::Pgsql)->passes())->toBeTrue();
+});
+
+test('ordinary SET clauses on functions, procedures and databases pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'CREATE FUNCTION ... SET search_path FROM CURRENT' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql SET search_path FROM CURRENT AS $$ SELECT 1 $$'],
+    'ALTER FUNCTION ... SET search_path' => ['ALTER FUNCTION f() SET search_path = public, pg_temp'],
+    'ALTER FUNCTION ... SET SCHEMA' => ['ALTER FUNCTION f() SET SCHEMA archive'],
+    'ALTER DATABASE ... SET TABLESPACE' => ['ALTER DATABASE app SET TABLESPACE fast'],
+    'ALTER DATABASE ... SET statement_timeout' => ["ALTER DATABASE app SET statement_timeout TO '5s'"],
+    'ALTER FUNCTION ... RESET ALL' => ['ALTER FUNCTION f() RESET ALL'],
+    'a body that sets a row value' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN UPDATE t SET (a, b) = (1, 2) WHERE id = 1; END $$'],
+    'a single-quoted body that sets a row value' => ["CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'UPDATE t SET (a, b) = (1, 2) WHERE id = 1'"],
+]);
+
+test('a DO block or a function in a language other than plpgsql and sql is refused', function (string $sql, string $needle) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'DO plperl, leading' => ['DO LANGUAGE plperl $$ return 1; $$', 'LANGUAGE plperl is not allowed'],
+    'DO pltcl, trailing' => ['DO $$ return 1 $$ LANGUAGE pltcl', 'LANGUAGE pltcl is not allowed'],
+    'DO, double-quoted language' => ['DO LANGUAGE "plperl" $$ return 1; $$', 'LANGUAGE plperl is not allowed'],
+    'DO, U& language' => ['DO LANGUAGE U&"pl\\0070erl" $$ return 1; $$', 'LANGUAGE plperl is not allowed'],
+    'DO, U& untrusted language' => ['DO $$ x $$ LANGUAGE U&"pl\\0070erlu"', 'plperlu is an untrusted procedural language'],
+    'DO, upper case' => ['DO $$ x $$ LANGUAGE PLV8', 'LANGUAGE plv8 is not allowed'],
+    'CREATE FUNCTION plperl' => ['CREATE FUNCTION f() RETURNS int LANGUAGE plperl AS $$ return 1; $$', 'LANGUAGE plperl is not allowed'],
+    'CREATE FUNCTION plpython3u' => ['CREATE FUNCTION f() RETURNS text LANGUAGE plpython3u AS $$ import os $$', 'plpython3u is an untrusted procedural language'],
+    'CREATE FUNCTION c' => ["CREATE FUNCTION f(int) RETURNS int AS 'my_module', 'my_function' LANGUAGE c", 'LANGUAGE c is not allowed'],
+    'CREATE FUNCTION internal' => ["CREATE FUNCTION f(int) RETURNS int LANGUAGE internal AS 'int4abs'", 'LANGUAGE internal is not allowed'],
+    'CREATE FUNCTION, single-quoted language' => ["CREATE FUNCTION f() RETURNS int LANGUAGE 'plperl' AS \$\$ return 1; \$\$", 'LANGUAGE plperl is not allowed'],
+    'CREATE FUNCTION, double-quoted language' => ['CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ return 1; $$ LANGUAGE "plv8"', 'LANGUAGE plv8 is not allowed'],
+    'CREATE PROCEDURE, U& language' => ['CREATE PROCEDURE p() LANGUAGE U&"pl\\0070erl" AS $$ 1; $$', 'LANGUAGE plperl is not allowed'],
+    'CREATE FUNCTION, dollar-quoted language' => ['CREATE FUNCTION f() RETURNS int LANGUAGE $l$plperl$l$ AS $$ return 1; $$', 'language the guard cannot read'],
+    'DO, unresolvable U& language' => ['DO LANGUAGE U&"sql\\0020" $$ SELECT 1 $$', 'language the guard cannot read'],
+    "DO, E'' language" => ["DO LANGUAGE E'SQL' \$\$ SELECT 1 \$\$", 'names its language with a string literal'],
+    'CREATE FUNCTION without LANGUAGE' => ['CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$', 'without a LANGUAGE clause'],
+    'CREATE FUNCTION plperl in a DO body' => ['DO $$ BEGIN CREATE FUNCTION g() RETURNS int LANGUAGE plperl AS $g$ return 1; $g$; END $$', 'LANGUAGE plperl is not allowed'],
+    'CREATE FUNCTION c in a function body' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS \$\$ BEGIN CREATE FUNCTION g(int) RETURNS int AS 'm', 's' LANGUAGE c; END \$\$", 'LANGUAGE c is not allowed'],
+    'nested DO plperl in a DO body' => ['DO $$ BEGIN DO LANGUAGE plperl $x$ return 1; $x$; END $$', 'LANGUAGE plperl is not allowed'],
+    'nested DO, quoted language, in a quoted DO body' => ["DO 'BEGIN DO LANGUAGE \"plperl\" ''return 1;''; END'", 'LANGUAGE plperl is not allowed'],
+]);
+
+test('DO blocks and functions in plpgsql or sql pass the language rule', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'DO without LANGUAGE' => ['DO $$ BEGIN PERFORM 1; END $$'],
+    'DO plpgsql, quoted' => ['DO LANGUAGE "plpgsql" $$ BEGIN PERFORM 1; END $$'],
+    'DO plpgsql, U&' => ['DO $$ BEGIN PERFORM 1; END $$ LANGUAGE U&"plpgsq\\006C"'],
+    'CREATE FUNCTION sql' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'],
+    'CREATE FUNCTION SQL, upper case, trailing' => ['CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE SQL'],
+    "CREATE FUNCTION 'sql'" => ["CREATE FUNCTION f() RETURNS int LANGUAGE 'sql' AS \$\$ SELECT 1 \$\$"],
+    'CREATE FUNCTION with a RETURN body and no LANGUAGE' => ['CREATE FUNCTION f(a int) RETURNS int RETURN a + 1'],
+    'INSERT ... ON CONFLICT DO NOTHING' => ['INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING'],
+    'ON CONFLICT DO UPDATE in a DO body' => ['DO $$ BEGIN INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET n = 2; END $$'],
+    'a function body naming a language in data' => ["CREATE FUNCTION f() RETURNS text LANGUAGE sql AS \$\$ SELECT 'LANGUAGE plperl' \$\$"],
+]);
+
+test('a quoted language name is matched as written, the way PostgreSQL resolves it', function (string $sql, string $needle) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'DO, "Sql"' => ['DO LANGUAGE "Sql" $$ SELECT 1 $$', 'LANGUAGE "Sql" is not allowed'],
+    'DO, "PLPGSQL", trailing' => ['DO $$ BEGIN END $$ LANGUAGE "PLPGSQL"', 'LANGUAGE "PLPGSQL" is not allowed'],
+    'DO, U& "Sql"' => ['DO LANGUAGE U&"S\\0071l" $$ SELECT 1 $$', 'LANGUAGE "Sql" is not allowed'],
+    'CREATE FUNCTION, "Sql"' => ['CREATE FUNCTION f() RETURNS int LANGUAGE "Sql" AS $$ SELECT 1 $$', 'LANGUAGE "Sql" is not allowed'],
+    "CREATE FUNCTION, 'Sql'" => ["CREATE FUNCTION f() RETURNS int LANGUAGE 'Sql' AS \$\$ SELECT 1 \$\$", 'LANGUAGE "Sql" is not allowed'],
+    "CREATE FUNCTION, E'SQL'" => ["CREATE FUNCTION f() RETURNS int LANGUAGE E'SQL' AS \$\$ SELECT 1 \$\$", 'LANGUAGE "SQL" is not allowed'],
+    'CREATE PROCEDURE, U& "PlPgSql"' => ['CREATE PROCEDURE p() LANGUAGE U&"PlPg\\0053ql" AS $$ BEGIN END $$', 'LANGUAGE "PlPgSql" is not allowed'],
+    'nested DO "Sql" in a DO body' => ['DO $$ BEGIN DO LANGUAGE "Sql" $x$ SELECT 1 $x$; END $$', 'LANGUAGE "Sql" is not allowed'],
+]);
+
+test('bare language names fold to lower case and quoted ones written in lower case pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'DO, bare PLPGSQL' => ['DO LANGUAGE PLPGSQL $$ BEGIN PERFORM 1; END $$'],
+    'DO, "plpgsql"' => ['DO $$ BEGIN PERFORM 1; END $$ LANGUAGE "plpgsql"'],
+    'CREATE FUNCTION, bare Sql' => ['CREATE FUNCTION f() RETURNS int LANGUAGE Sql AS $$ SELECT 1 $$'],
+    'CREATE FUNCTION, "sql"' => ['CREATE FUNCTION f() RETURNS int LANGUAGE "sql" AS $$ SELECT 1 $$'],
+    'CREATE FUNCTION, U& "sql"' => ['CREATE FUNCTION f() RETURNS int LANGUAGE U&"\\0073ql" AS $$ SELECT 1 $$'],
+]);
+
+test('statements that create a language or rename one are refused', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('CREATE LANGUAGE and ALTER LANGUAGE ... RENAME are not allowed through QueryProxy');
+})->with([
+    'CREATE LANGUAGE' => ['CREATE LANGUAGE "Sql" HANDLER plperl_call_handler'],
+    'CREATE TRUSTED PROCEDURAL LANGUAGE' => ['CREATE TRUSTED PROCEDURAL LANGUAGE foo HANDLER plperl_call_handler'],
+    'CREATE OR REPLACE LANGUAGE' => ['CREATE OR REPLACE LANGUAGE plpgsql HANDLER plperl_call_handler'],
+    'ALTER LANGUAGE ... RENAME' => ['ALTER LANGUAGE plperl RENAME TO "Sql"'],
+    'ALTER PROCEDURAL LANGUAGE ... RENAME' => ['ALTER PROCEDURAL LANGUAGE plperl RENAME TO plpgsql'],
+    'CREATE LANGUAGE in a DO body' => ['DO $$ BEGIN CREATE LANGUAGE "Sql" HANDLER plperl_call_handler; END $$'],
+    'ALTER LANGUAGE ... RENAME in a function body' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN ALTER LANGUAGE plperl RENAME TO plpgsql; END $$'],
+]);
+
+test('changing the owner of a language or dropping one passes the language rule', function (string $sql) {
+    expect(implode("\n", inspect($sql, DbDriver::Pgsql)->violations))->not->toContain('LANGUAGE');
+})->with([
+    'ALTER LANGUAGE ... OWNER TO' => ['ALTER LANGUAGE plperl OWNER TO admin'],
+    'DROP LANGUAGE' => ['DROP LANGUAGE plperl'],
+]);
+
+test('a quoted setting name on a database, function or procedure is judged by its value', function (string $sql, bool $passes) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBe($passes);
+
+    if (! $passes) {
+        expect(implode("\n", $result->violations))->toContain('SET session_replication_role is not allowed');
+    }
+})->with([
+    'ALTER DATABASE, dotted quoted name' => ["ALTER DATABASE app SET \"app.jwt_secret\" TO 'x'", true],
+    'ALTER DATABASE, U& dotted name' => ["ALTER DATABASE app SET U&\"app.jwt\\005Fsecret\" TO 'x'", true],
+    'ALTER DATABASE, quoted parts' => ["ALTER DATABASE app SET \"app\".\"jwt_secret\" = 'x'", true],
+    'CREATE FUNCTION, dotted quoted name' => ["CREATE FUNCTION f() RETURNS int LANGUAGE sql SET \"app.tenant\" = 'a' AS \$\$ SELECT 1 \$\$", true],
+    'ALTER DATABASE, quoted guarded name' => ['ALTER DATABASE app SET "session_replication_role" TO replica', false],
+    'ALTER DATABASE, quoted guarded name in mixed case' => ['ALTER DATABASE app SET "Session_Replication_Role" TO replica', false],
+]);
+
+test('a DO body is held to the blocked-function and guarded-setting rules of the top level', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    'PERFORM dblink_exec' => ["DO \$\$ BEGIN PERFORM dblink_exec('dbname=x', 'DROP DATABASE prod'); END \$\$", 'Inside the DO block body: dblink_exec() is not allowed'],
+    'PERFORM pg_terminate_backend' => ['DO $$ BEGIN PERFORM pg_terminate_backend(1); END $$', 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'nested quoted DO body' => ["DO \$\$ BEGIN DO 'BEGIN PERFORM pg_terminate_backend(1); END'; END \$\$", 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'nested quoted DO body with LANGUAGE' => ["DO \$\$ BEGIN DO LANGUAGE plpgsql 'BEGIN SET session_replication_role = replica; END'; END \$\$", 'Inside the DO block body: SET session_replication_role is not allowed'],
+    'schema-qualified, quoted name' => ['DO $$ BEGIN PERFORM pg_catalog."pg_terminate_backend"(1); END $$', 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'U& name' => ['DO $$ BEGIN PERFORM U&"\\0070g_terminate_backend"(1); END $$', 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'assignment from query_to_xml' => ["DO \$\$ DECLARE x xml; BEGIN x := query_to_xml('SELECT 1', true, false, ''); END \$\$", 'Inside the DO block body: query_to_xml() is not allowed'],
+    'ts_stat in a loop' => ["DO \$\$ DECLARE r record; BEGIN FOR r IN SELECT * FROM ts_stat('SELECT 1') LOOP NULL; END LOOP; END \$\$", 'Inside the DO block body: ts_stat() is not allowed'],
+    'call in nested dollar-quoted text' => ['DO $$ BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $f$ BEGIN PERFORM pg_terminate_backend(1); END $f$; END $$', 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'quoted DO body' => ["DO 'BEGIN PERFORM pg_terminate_backend(1); END'", 'Inside the DO block body: pg_terminate_backend() is not allowed'],
+    'set_config' => ["DO \$\$ BEGIN PERFORM set_config('session_replication_role', 'replica', false); END \$\$", "Inside the DO block body: set_config('session_replication_role') is not allowed"],
+    'set_config with an E string' => ["DO \$\$ BEGIN PERFORM set_config(E'session\\_replication_role', 'replica', false); END \$\$", "Inside the DO block body: set_config('session_replication_role') is not allowed"],
+    'set_config with a U& string' => ["DO \$\$ BEGIN PERFORM set_config(U&'session\\005freplication_role', 'replica', false); END \$\$", "Inside the DO block body: set_config('session_replication_role') is not allowed"],
+    'set_config with a computed name' => ["DO \$\$ BEGIN PERFORM set_config('session_' || 'replication_role', 'replica', false); END \$\$", 'Inside the DO block body: set_config() with a setting name that is not a plain string literal'],
+    'set_config with a dollar-quoted name' => ["DO \$\$ BEGIN PERFORM set_config(\$n\$session_replication_role\$n\$, 'replica', false); END \$\$", 'Inside the DO block body: set_config()'],
+    'SET' => ['DO $$ BEGIN SET session_replication_role = replica; END $$', 'Inside the DO block body: SET session_replication_role is not allowed'],
+    'SET LOCAL after THEN' => ['DO $$ BEGIN IF true THEN SET LOCAL session_replication_role TO replica; END IF; END $$', 'session_replication_role is not allowed'],
+    'lower-case set with a quoted name' => ['DO $$ BEGIN set "session_replication_role" = replica; END $$', 'Inside the DO block body: SET session_replication_role is not allowed'],
+    'SET after a comment' => ['DO $$ BEGIN /* x */ SET session_replication_role = replica; END $$', 'Inside the DO block body: SET session_replication_role is not allowed'],
+]);
+
+test('a DO body may call ordinary functions and set ordinary settings', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    'set_config of an application setting' => ["DO \$\$ BEGIN PERFORM set_config('app.user_id', '42', true); END \$\$"],
+    'SET of an ordinary setting' => ["DO \$\$ BEGIN SET LOCAL statement_timeout = '5s'; END \$\$"],
+    'UPDATE ... SET' => ['DO $$ BEGIN UPDATE t SET session_replication_role = 1 WHERE id = 1; END $$'],
+    'ordinary calls' => ["DO \$\$ BEGIN PERFORM pg_sleep(0); RAISE NOTICE '%', now(); END \$\$"],
+    'blocked name in quoted data' => ["DO \$\$ BEGIN RAISE NOTICE 'pg_terminate_backend(1)'; END \$\$"],
+]);
+
+test('a single-quoted function body is scanned like a DO body', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    'EXECUTE' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN EXECUTE ''DROP DATABASE prod''; END'", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+    'forbidden statement' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN DROP DATABASE prod; END'", 'Inside the function body: DROP DATABASE'],
+    'blocked function' => ["CREATE OR REPLACE FUNCTION f() RETURNS void AS 'BEGIN PERFORM pg_terminate_backend(1); END' LANGUAGE plpgsql", 'Inside the function body: pg_terminate_backend() is not allowed'],
+    'guarded SET' => ["CREATE PROCEDURE p() LANGUAGE plpgsql AS 'BEGIN SET session_replication_role = replica; END'", 'Inside the function body: SET session_replication_role is not allowed'],
+    'SQL body with a file read' => ["CREATE FUNCTION f() RETURNS text LANGUAGE sql AS 'SELECT pg_read_file(''/etc/passwd'')'", 'Inside the function body'],
+    'E string body' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS E'BEGIN PERFORM pg_terminate_backend(1); END'", 'Inside the function body: pg_terminate_backend() is not allowed'],
+    'E string hiding a call behind \\\\\'' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS E'BEGIN PERFORM \\'a\\', pg_terminate_backend(1); END'", 'Inside the function body: pg_terminate_backend() is not allowed'],
+    'inside a DO body' => ["DO \$\$ BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN EXECUTE ''DROP DATABASE prod''; END'; END \$\$", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+    'inside a DO body, blocked function' => ["DO \$\$ BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN PERFORM dblink_exec(''x'', ''y''); END'; END \$\$", 'Inside the function body: dblink_exec() is not allowed'],
+    'inside a quoted DO body' => ["DO 'BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS ''BEGIN EXECUTE ''''SELECT 1''''; END''; END'", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+    'inside a function body in a DO body' => ["DO \$\$ BEGIN CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS \$f\$ BEGIN CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS 'BEGIN EXECUTE ''SELECT 1''; END'; END \$f\$; END \$\$", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+    'comment between AS and the body' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS /* x */ 'BEGIN EXECUTE ''SELECT 1''; END'", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+]);
+
+test('a single-quoted function body the guard cannot read is refused', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('function body');
+})->with([
+    // PostgreSQL joins string literals split across lines into one body.
+    'continued literal' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN EXEC'\n'UTE ''SELECT 1''; END'"],
+    'continued literal after a comment' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN EXEC' -- x\n'UTE ''SELECT 1''; END'"],
+    'unterminated literal' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN PERFORM 1; END"],
+    'open block comment' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN /* PERFORM 1; END'"],
+    'UESCAPE' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN PERFORM U&\"!0070g_terminate_backend\" UESCAPE ''!''(1); END'"],
+]);
+
+test('an ordinary single-quoted function body passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    'SQL body' => ["CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'"],
+    'plpgsql body with quoted data' => ["CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''pg_terminate_backend(1)''; UPDATE t SET x = 1 WHERE id = 2; END'"],
+    'inside a DO body' => ["DO \$\$ BEGIN CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; END \$\$"],
+    'a string after AS outside a routine' => ["SELECT 'a' AS x"],
+    'a default argument' => ["CREATE FUNCTION f(a text DEFAULT 'x') RETURNS text LANGUAGE sql AS 'SELECT a'"],
+]);
+
+test('a dollar-quoted function body is scanned like a DO body', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    'EXECUTE' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS \$\$ BEGIN EXECUTE 'SELECT 1'; END \$\$", 'Inside the function body: dynamic SQL (EXECUTE) is not allowed'],
+    'forbidden statement' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN DROP DATABASE prod; END $$', 'Inside the function body: DROP DATABASE'],
+    'blocked function, tagged, OR REPLACE' => ['CREATE OR REPLACE FUNCTION f() RETURNS void AS $f$ BEGIN PERFORM pg_terminate_backend(1); END $f$ LANGUAGE plpgsql', 'Inside the function body: pg_terminate_backend() is not allowed'],
+    'LANGUAGE sql calling query_to_xml' => ["CREATE FUNCTION f() RETURNS xml LANGUAGE sql AS \$\$ SELECT query_to_xml('SELECT 1', true, false, '') \$\$", 'Inside the function body: query_to_xml() is not allowed'],
+    'LANGUAGE sql calling set_config' => ["CREATE FUNCTION f() RETURNS text LANGUAGE sql AS \$\$ SELECT set_config('session_replication_role', 'replica', false) \$\$", "Inside the function body: set_config('session_replication_role') is not allowed"],
+    'procedure with SET' => ['CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN SET session_replication_role = replica; END $$', 'Inside the function body: SET session_replication_role is not allowed'],
+    'comment between AS and the body' => ["CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS /* x */ \$\$ BEGIN PERFORM dblink_exec('a', 'b'); END \$\$", 'Inside the function body: dblink_exec() is not allowed'],
+    'lower case' => ['create or replace procedure p() language plpgsql as $$ begin perform pg_cancel_backend(1); end $$', 'Inside the function body: pg_cancel_backend() is not allowed'],
+]);
+
+test('a function body the guard cannot extract is refused', function (string $sql, string $needle) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'BEGIN ATOMIC' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END', 'BEGIN ATOMIC'],
+    'BEGIN ATOMIC in one statement' => ['CREATE PROCEDURE p() LANGUAGE sql BEGIN ATOMIC END', 'BEGIN ATOMIC'],
+    'no body' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql', 'function body'],
+]);
+
+test('ordinary dollar-quoted function bodies and triggers pass', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->violations)->toBe([]);
+})->with([
+    'SQL body' => ['CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'],
+    'trigger function' => ['CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.updated_at := now(); RETURN NEW; END $$'],
+    'dollar-quoted default argument' => ['CREATE FUNCTION f(a text DEFAULT $d$x$d$) RETURNS text LANGUAGE sql AS $$ SELECT a $$'],
+    'SQL-standard RETURN body' => ['CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql RETURN a + 1'],
+    'EXECUTE FUNCTION trigger' => ['CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION touch()'],
+    'EXECUTE PROCEDURE trigger with an argument' => ["CREATE TRIGGER t BEFORE UPDATE ON items FOR EACH ROW EXECUTE PROCEDURE touch('a')"],
+]);
+
+test('an apostrophe in nested dollar-quoted data does not reject the DO block', function () {
+    expect(inspect("DO \$\$ BEGIN RAISE NOTICE \$m\$ it's done \$m\$; UPDATE t SET x = 1 WHERE id = 2; END \$\$", DbDriver::Pgsql)->passes())->toBeTrue();
+});
+
+test('an open block comment inside a nested dollar-quoted string does not reject the DO block', function () {
+    expect(inspect('DO $$ BEGIN RAISE NOTICE $m$ /* $m$; END $$', DbDriver::Pgsql)->passes())->toBeTrue();
+});
+
+test('code before an open block comment in a nested dollar-quoted string is still scanned', function () {
+    $result = inspect("DO \$\$ BEGIN EXECUTE \$a\$SELECT pg_read_file('/etc/passwd') /*\$a\$ || '*/'; END \$\$", DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('Inside the DO block body: Server-side file IO functions');
+});
+
+test('a DO block with one body and a plain language name still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    'single-quoted body, trailing language' => "DO 'BEGIN PERFORM 1; END' LANGUAGE plpgsql",
+    'single-quoted body with a doubled quote' => "DO 'BEGIN RAISE NOTICE ''x''; END'",
+    'string in a comment before the body' => "DO /* 'x' */ \$\$ BEGIN PERFORM 1; END \$\$",
+    'U& identifier that is no function' => 'DO $$ BEGIN UPDATE t SET U&"\\0061" = 1 WHERE id = 1; END $$',
+]);
+
+test('text PostgreSQL reads as string data in a DO body is not scanned as code', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    // In an E string \' escapes the quote, so the call stays inside it.
+    'call inside an E string' => "DO \$\$ BEGIN PERFORM E'a\\', pg_read_file(/etc/passwd) --'; END \$\$",
+    '"#" inside a string' => "DO \$\$ BEGIN UPDATE t SET note = 'x # pg_read_file(1)' WHERE id = 1; END \$\$",
+    'quoted column name' => "DO \$\$ BEGIN UPDATE t SET \"Note\" = 'x' WHERE id = 1; END \$\$",
+]);
+
 test('an untrusted language is caught by the pl...u convention, not only by name', function () {
     // plpython4u is in no list; the naming convention is what refuses it.
     expect(inspect('CREATE EXTENSION plpython4u')->passes())->toBeFalse()

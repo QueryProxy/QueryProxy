@@ -167,6 +167,12 @@ class SqlInspector
     private const MAX_EXECUTABLE_COMMENT_DEPTH = 3;
 
     /**
+     * How deep dollar-quoted strings may sit inside one another in the body
+     * of a DO block before the body scan stops reading and rejects it.
+     */
+    private const MAX_BLOCK_BODY_QUOTE_DEPTH = 8;
+
+    /**
      * What the guard reports for a version-conditional comment whose end it
      * cannot place where the server does (see versionConditionalComments()).
      */
@@ -297,9 +303,14 @@ class SqlInspector
     ];
 
     /**
-     * Functions that control the server or other sessions, or open a channel
-     * to another server. Calling one is rejected outright. A trailing "*"
-     * matches every name with that prefix.
+     * Functions that control the server or other sessions, open a channel
+     * to another server, or run SQL handed to them as text (query_to_xml*,
+     * ts_stat, ts_rewrite's query form, and the tablefunc / xml2 contrib
+     * functions crosstab*, connectby and xpath_table, which build and run a
+     * query from their text arguments), which no scan of the calling
+     * statement can see. Calling one
+     * is rejected outright. A trailing "*" matches every name with that
+     * prefix.
      *
      * Configuration is merged on top of this list and can only extend it;
      * these entries are the floor.
@@ -314,6 +325,14 @@ class SqlInspector
         'pg_promote',
         'pg_switch_wal',
         'dblink*',
+        'query_to_xml',
+        'query_to_xmlschema',
+        'query_to_xml_and_xmlschema',
+        'ts_stat',
+        'ts_rewrite',
+        'crosstab*',
+        'connectby',
+        'xpath_table',
     ];
 
     /**
@@ -3808,7 +3827,7 @@ class SqlInspector
             }
 
             if ($this->matchesFunctionList($name, $blocked)) {
-                $violations[] = "{$name}() is not allowed through QueryProxy: it controls the server or other sessions, or opens a channel to another server.";
+                $violations[] = "{$name}() is not allowed through QueryProxy: it controls the server or other sessions, opens a channel to another server, or runs SQL given as text.";
             } elseif ($this->matchesFunctionList($name, self::FILE_IO_FUNCTIONS)) {
                 $violations[] = "{$name}() is not allowed through QueryProxy: it reads or writes files on the database server.";
             } elseif ($name === 'set_config') {
@@ -4394,15 +4413,39 @@ class SqlInspector
         $keyword = strtoupper((string) $tokens[0]->value);
 
         if ($keyword === 'DO') {
-            return $this->anonymousBlockViolations($sql, $tokens);
+            return array_values(array_unique(array_merge(
+                $this->routineClauseViolations($sql),
+                $this->anonymousBlockViolations($sql),
+            )));
         }
 
         if ($keyword === 'SET') {
             return $this->serverVariableViolations($tokens, $driver);
         }
 
-        if ($keyword === 'CREATE' && isset($tokens[1]) && strtoupper((string) $tokens[1]->value) === 'EXTENSION') {
-            return $this->extensionViolations($tokens);
+        if ($keyword === 'CREATE') {
+            $violations = isset($tokens[1]) && strtoupper((string) $tokens[1]->value) === 'EXTENSION'
+                ? $this->extensionViolations($tokens)
+                : [];
+
+            // A function or procedure body written as a '...' literal is run
+            // by PostgreSQL when the routine is called; it is held to the
+            // rules of a DO body (see nestedBodyViolations()).
+            if ($driver === null || $driver === DbDriver::Pgsql) {
+                $violations = array_merge($violations, $this->nestedBodyViolations($sql, 0));
+            }
+
+            if ($driver === DbDriver::Pgsql) {
+                $violations = array_merge($violations, $this->routineBodyViolations($sql), $this->routineClauseViolations($sql));
+            }
+
+            return array_values(array_unique($violations));
+        }
+
+        // ALTER FUNCTION | PROCEDURE | ROUTINE | DATABASE | ROLE | USER ...
+        // SET carries a setting into every later call or session.
+        if ($keyword === 'ALTER' && $driver === DbDriver::Pgsql) {
+            return $this->routineClauseViolations($sql);
         }
 
         return [];
@@ -4871,86 +4914,932 @@ class SqlInspector
     }
 
     /**
-     * A DO block is judged by its LANGUAGE clause. Both spellings put the
-     * clause outside the body — DO LANGUAGE plpgsql $$...$$ and
-     * DO $$...$$ LANGUAGE plpgsql — and the body is masked to a plain literal
-     * before tokenization, so body text cannot steer the scan. Every LANGUAGE
-     * occurrence is checked rather than just the first: naming an untrusted
-     * language anywhere in the statement is enough to reject it.
+     * The literals of a DO block: a language written as a literal is
+     * refused, and so is more than one literal; the one body literal is then
+     * scanned, so that a DO block cannot carry a statement the unconditional
+     * denylist refuses on its own. The LANGUAGE clause itself is judged by
+     * routineClauseViolations().
      *
-     * No LANGUAGE clause at all means the PostgreSQL default, plpgsql, which
-     * is a trusted language and passes.
-     *
-     * The body is then scanned as well, so that a DO block cannot carry a
-     * statement the unconditional denylist refuses on its own.
-     *
-     * @param  list<Token>  $tokens
      * @return list<string>
      */
-    private function anonymousBlockViolations(string $sql, array $tokens): array
+    private function anonymousBlockViolations(string $sql): array
     {
         $violations = [];
 
-        for ($i = 1, $count = count($tokens); $i < $count; $i++) {
-            if (strtoupper((string) $tokens[$i]->value) !== 'LANGUAGE' || ! isset($tokens[$i + 1])) {
-                continue;
-            }
-
-            $language = $this->identifierValue($tokens[$i + 1]);
-
-            if ($this->isUntrustedLanguage($language)) {
-                $violations[] = "DO ... LANGUAGE {$language} is not allowed through QueryProxy: {$language} is an untrusted procedural language, so the block would run as the database superuser.";
-            }
-        }
-
-        $body = $this->anonymousBlockBody($sql, $tokens);
-
-        if ($body === null) {
-            return $violations;
-        }
-
-        // The body is PL/pgSQL, read by PostgreSQL's scanner: its comments
-        // nest, so they are blanked by those rules before the MySQL-first
-        // lexer gets a chance to end one early.
-        $ranges = $this->postgresLexicalRanges($body);
+        $ranges = $this->postgresLexicalRanges($sql);
 
         if ($ranges === null) {
-            $violations[] = 'A DO block whose body leaves a block comment open is not allowed.';
+            $violations[] = 'A DO block that leaves a block comment open is not allowed.';
 
             return $violations;
         }
 
-        return array_merge($violations, $this->forbiddenInBlockBody($this->blankRanges($body, $ranges['comments'])));
+        $literals = $this->anonymousBlockLiterals($sql, $ranges);
+
+        if ($this->languageLiteral($sql, $literals, $ranges['comments'])) {
+            $violations[] = 'A DO block that names its language with a string literal (LANGUAGE \'...\' or LANGUAGE $$...$$) is not allowed: the guard reads the language, and tells it from the body, only when it is written as a plain name.';
+
+            return $violations;
+        }
+
+        if (count($literals) > 1) {
+            $violations[] = 'A DO block with more than one string literal is not allowed: PostgreSQL joins literals split across lines into one body, and the guard will not guess which text it runs.';
+
+            return $violations;
+        }
+
+        if ($literals === []) {
+            return $violations;
+        }
+
+        $body = $this->anonymousBlockBody($sql, $literals[0]);
+
+        return array_values(array_unique(array_merge($violations, $this->blockBodyViolations($body, 'DO block'))));
     }
 
     /**
-     * The source text a DO block asks the server to execute: the contents of
-     * its outermost dollar-quoted region, or of its single-quoted body when it
-     * is written in that older form. Nested dollar quoting is left in place —
-     * inside the body it is quoting, not framing, and the body scan wants to
-     * see through it.
+     * Scan the source text of a procedural body — a DO block's, or a
+     * function's written as a '...' literal — with the rules a DO body is
+     * held to. $label names the body in the messages ("DO block",
+     * "function"); $depth counts the bodies this one is written inside.
      *
-     * @param  list<Token>  $tokens
+     * The body is PL/pgSQL (or SQL), read by PostgreSQL's scanner, so the
+     * scan reads it through that scanner's eyes rather than the MySQL-first
+     * lexer's (see postgresBlockBodyView()). It applies, in turn:
+     *  - the refusal of UESCAPE and of dynamic SQL (EXECUTE);
+     *  - the unconditional denylist (forbiddenInBlockBody());
+     *  - the top level's blocked-function and guarded SET / set_config()
+     *    rules (blockBodyCallViolations());
+     *  - the same scan, recursively, on every function body and DO body
+     *    written inside this one as a '...' literal (nestedBodyViolations()).
+     *
+     * @return list<string>
      */
-    private function anonymousBlockBody(string $sql, array $tokens): ?string
+    private function blockBodyViolations(string $body, string $label, int $depth = 0): array
     {
-        $ranges = $this->dollarQuotedRanges($sql);
+        $view = $this->postgresBlockBodyView($body);
 
-        if ($ranges !== []) {
-            [$start, $end] = $ranges[0];
-            $region = substr($sql, $start, $end - $start);
-            $tag = preg_match('/^\$[A-Za-z0-9_\x80-\xff]*\$/', $region, $matches) ? $matches[0] : '';
+        if ($view === null) {
+            $subject = $label === 'DO block' ? 'A DO block whose body' : "A {$label} body that";
 
-            return substr($region, strlen($tag), strlen($region) - 2 * strlen($tag));
+            return ["{$subject} leaves a block comment open, or nests dollar quoting more than ".self::MAX_BLOCK_BODY_QUOTE_DEPTH.' levels deep, is not allowed.'];
         }
 
-        foreach ($tokens as $token) {
-            if ($token->type === TokenType::String) {
-                return (string) $token->value;
+        // EXECUTE runs nested dollar-quoted strings joined together, and a
+        // quote one of them leaves open carries into the next. The body is
+        // therefore read a second time with every dollar tag blanked, as one
+        // text, which is how the lexer read it before the scan moved to
+        // PostgreSQL's rules: "EXECUTE $a$SELECT '$a$ || $b$', pg_read_file(..)
+        // --'$b$" hides the call from the first reading, not from this one.
+        $flatBody = $this->withoutDollarTags($body);
+        $flatView = $this->postgresBlockBodyView($flatBody, openCommentRunsToEnd: true) ?? '';
+
+        // UESCAPE takes its escape character from any string constant —
+        // E'..', $$..$$, a continued '..' — so, as at the top level (see
+        // unicodeEscapeClauseViolation()), it is refused rather than decoded.
+        foreach ([$view, $flatView] as $reading) {
+            if (preg_match('/(?<![A-Za-z0-9_$\x80-\xff])UESCAPE(?![A-Za-z0-9_$\x80-\xff])/i', $reading) === 1) {
+                return ["Inside the {$label} body: a UESCAPE clause is not allowed through QueryProxy; write Unicode escapes with the default backslash escape."];
             }
         }
 
-        return null;
+        $violations = [];
+
+        // Dynamic SQL is refused outright: the statement EXECUTE runs is text
+        // built at run time, which no reading of the body can see. Both
+        // readings are checked, so a comment, a line break, a U&"..." or a
+        // "..." spelling of the keyword does not hide it, nor does a function
+        // body written in a nested dollar-quoted string.
+        if ($this->executesDynamicSql($view) || $this->executesDynamicSql($flatView)) {
+            $violations[] = "Inside the {$label} body: dynamic SQL (EXECUTE) is not allowed through QueryProxy, because the statement it runs is built at run time and cannot be inspected.";
+        }
+
+        // The call and SET readings keep a string whose value is a plain
+        // setting name, so set_config('<name>', ...) is judged by its name;
+        // nested dollar-quoted text is read as code, as it is for EXECUTE.
+        $nameView = $this->postgresBlockBodyView($body, keepNameStrings: true) ?? '';
+        $flatNameView = $this->postgresBlockBodyView($flatBody, openCommentRunsToEnd: true, keepNameStrings: true) ?? '';
+
+        return array_values(array_unique(array_merge(
+            $violations,
+            $this->forbiddenInBlockBody($view, $label),
+            $this->forbiddenInBlockBody($flatView, $label),
+            $this->blockBodyCallViolations($this->withoutDollarTags($nameView), $label),
+            $this->blockBodyCallViolations($flatNameView, $label),
+            $this->nestedBodyViolations($body, $depth),
+        )));
+    }
+
+    /**
+     * Hold one reading of a procedural body (see blockBodyViolations()) to
+     * the rules the top level applies to a statement's calls and SETs, by
+     * running the same checks: functionCallEffects() — BLOCKED_FUNCTIONS,
+     * file IO, set_config() — over the whole reading, and
+     * serverVariableViolations() over every body statement that starts with
+     * SET. A body statement starts after a semicolon or after a PL/pgSQL
+     * keyword that opens one (BEGIN, THEN, ELSE, LOOP, ...).
+     *
+     * The reading has its comments, strings and dollar tags rewritten
+     * already; "`" and "@" are blanked too, because they are operator
+     * characters to PostgreSQL but quote an identifier or a variable to the
+     * lexer, which would then hide the name after them.
+     *
+     * @return list<string>
+     */
+    private function blockBodyCallViolations(string $reading, string $label): array
+    {
+        $reading = strtr($reading, ['`' => ' ', '@' => ' ']);
+        [$messages] = $this->functionCallEffects($this->significantTokens($reading));
+
+        $statements = preg_split('/;|\b(?:BEGIN|DECLARE|END|THEN|ELSE|ELSIF|LOOP|EXECUTE|PERFORM|RETURN)\b/i', $reading) ?: [];
+
+        foreach ($statements as $statement) {
+            $tokens = $this->significantTokens($statement);
+
+            if ($tokens !== [] && strtoupper((string) $tokens[0]->value) === 'SET') {
+                $messages = array_merge($messages, $this->serverVariableViolations($tokens, DbDriver::Pgsql));
+            }
+        }
+
+        return array_map(fn (string $message): string => "Inside the {$label} body: {$message}", $messages);
+    }
+
+    /**
+     * Scan every procedural body written inside $text: a function or
+     * procedure body (CREATE [OR REPLACE] FUNCTION | PROCEDURE ... AS '...'
+     * or AS $tag$...$tag$) and a nested DO block's body (DO '...'). Inside a
+     * DO body a '...' body reads as data, while PostgreSQL runs it when the
+     * function is called; at the top level any function body does. Other
+     * nested dollar-quoted text is searched as well, since a body there may
+     * hold one in turn.
+     *
+     * A body the guard cannot read the way PostgreSQL does is refused: one
+     * left unterminated, and a '...' one followed by another literal, which
+     * PostgreSQL joins to it when a line break separates them.
+     *
+     * @return list<string>
+     */
+    private function nestedBodyViolations(string $text, int $depth): array
+    {
+        if ($depth >= self::MAX_BLOCK_BODY_QUOTE_DEPTH) {
+            return ['A procedural body nested more than '.self::MAX_BLOCK_BODY_QUOTE_DEPTH.' levels deep is not allowed.'];
+        }
+
+        $ranges = $this->postgresLexicalRanges($text, openCommentRunsToEnd: true);
+
+        if ($ranges === null) {
+            return ['A function body the guard cannot read is not allowed.'];
+        }
+
+        $violations = [];
+        $scanned = [];
+
+        foreach ($this->procedureBodies($text, $ranges) as [$label, $body, $start]) {
+            $scanned[$start] = true;
+
+            if ($body === null) {
+                $violations[] = "A {$label} body that is unterminated, or written as a string literal continued by another literal, is not allowed: the guard will not guess which text PostgreSQL runs.";
+
+                continue;
+            }
+
+            $violations = array_merge($violations, $this->blockBodyViolations($body, $label, $depth + 1));
+        }
+
+        foreach ($ranges['quoted'] as [$start, $end]) {
+            if (! isset($scanned[$start])) {
+                $violations = array_merge($violations, $this->nestedBodyViolations($this->dollarQuotedInner(substr($text, $start, $end - $start)), $depth + 1));
+            }
+        }
+
+        return $violations;
+    }
+
+    /**
+     * The checks a PostgreSQL CREATE FUNCTION | PROCEDURE statement needs
+     * beyond those of nestedBodyViolations(), which scans a body written as
+     * a literal after AS. A SQL-standard body is plain code:
+     *  - RETURN <expression> is scanned from RETURN to the end like a body;
+     *  - BEGIN ATOMIC ... END holds semicolons the statement splitter takes
+     *    for statement ends, so the guard cannot extract it, and refuses it.
+     * A routine statement whose body is none of these is refused too, since
+     * the guard cannot tell what PostgreSQL would run.
+     *
+     * @return list<string>
+     */
+    private function routineBodyViolations(string $sql): array
+    {
+        $ranges = $this->postgresLexicalRanges($sql, openCommentRunsToEnd: true);
+
+        if ($ranges === null) {
+            return [];
+        }
+
+        $code = $this->postgresCodeText($sql, $ranges);
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+        $end = '(?![A-Za-z0-9_$\x80-\xff])';
+
+        if (preg_match("/^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:FUNCTION|PROCEDURE){$end}/i", $code) !== 1) {
+            return [];
+        }
+
+        if (preg_match("/{$word}BEGIN\\s+ATOMIC{$end}/i", $code) === 1) {
+            return ['A function body written as BEGIN ATOMIC ... END is not allowed through QueryProxy: the guard cannot extract it from the statement; write the body as a dollar-quoted string (AS $$ ... $$) instead.'];
+        }
+
+        if (preg_match("/{$word}RETURN{$end}/i", $code, $matches, PREG_OFFSET_CAPTURE) === 1) {
+            return $this->blockBodyViolations(substr($sql, $matches[0][1]), 'function');
+        }
+
+        $bodies = array_filter($this->procedureBodies($sql, $ranges), fn (array $body): bool => $body[0] === 'function');
+
+        return $bodies === []
+            ? ['A CREATE FUNCTION or CREATE PROCEDURE statement whose function body the guard cannot find is not allowed through QueryProxy.']
+            : [];
+    }
+
+    /**
+     * The LANGUAGE and SET clauses of PostgreSQL statements that outlive
+     * themselves, in $text and, recursively, in every procedural body and
+     * dollar-quoted string written inside it:
+     *  - a DO block or a CREATE FUNCTION | PROCEDURE runs in plpgsql or sql
+     *    only — the languages whose bodies the guard reads. Any other
+     *    language, a language written as anything but a plain name or a
+     *    plain '...' name, and a routine with no LANGUAGE clause and no
+     *    SQL-standard body (where PostgreSQL requires one) are refused. A
+     *    DO block without a LANGUAGE clause runs in plpgsql;
+     *  - a SET clause of CREATE FUNCTION | PROCEDURE, or of ALTER FUNCTION |
+     *    PROCEDURE | ROUTINE | DATABASE | ROLE | USER, carries its setting
+     *    into every call or session, so it is held to the rule of a SET
+     *    statement (serverVariableViolations()). A clause whose setting the
+     *    guard cannot read is refused.
+     *
+     * The text is read as PostgreSQL reads it (see postgresBlockBodyView()),
+     * with every dollar-quoted string replaced by an opaque literal: its
+     * contents are judged when the recursion reaches them, as code.
+     *
+     * @return list<string>
+     */
+    private function routineClauseViolations(string $text, int $depth = 0): array
+    {
+        if ($depth >= self::MAX_BLOCK_BODY_QUOTE_DEPTH) {
+            return ['A procedural body nested more than '.self::MAX_BLOCK_BODY_QUOTE_DEPTH.' levels deep is not allowed.'];
+        }
+
+        $ranges = $this->postgresLexicalRanges($text, openCommentRunsToEnd: true);
+        $view = $ranges === null ? null : $this->postgresBlockBodyView($text, openCommentRunsToEnd: true, keepNameStrings: true);
+
+        if ($ranges === null || $view === null) {
+            return ['A statement whose LANGUAGE and SET clauses the guard cannot read is not allowed through QueryProxy.'];
+        }
+
+        foreach ($ranges['quoted'] as [$start, $end]) {
+            $length = $end - $start;
+            $view = substr_replace($view, $length >= 2 ? "'".str_repeat(' ', $length - 2)."'" : ' ', $start, $length);
+        }
+
+        $view = $this->withQuotedNamesSpelledOut($text, $view, $ranges['strings']);
+        $violations = [];
+
+        foreach (explode(';', $view) as $statement) {
+            $violations = array_merge(
+                $violations,
+                $this->routineLanguageViolations($statement),
+                $this->routineSetClauseViolations($statement),
+                $this->languageDefinitionViolations($statement),
+            );
+        }
+
+        $dollarStarts = [];
+
+        foreach ($ranges['quoted'] as [$start, $end]) {
+            $dollarStarts[$start] = true;
+            $violations = array_merge($violations, $this->routineClauseViolations(
+                $this->dollarQuotedParts(substr($text, $start, $end - $start))[0],
+                $depth + 1,
+            ));
+        }
+
+        // A '...' body is data to the reading above; its text is code to
+        // PostgreSQL, and is read as such here.
+        foreach ($this->procedureBodies($text, $ranges) as [, $body, $start]) {
+            if ($body !== null && ! isset($dollarStarts[$start])) {
+                $violations = array_merge($violations, $this->routineClauseViolations($body, $depth + 1));
+            }
+        }
+
+        return array_values(array_unique($violations));
+    }
+
+    /**
+     * A reading of $text (see routineClauseViolations()) in which every
+     * closed "..." and U&"..." identifier is written back as "<value>",
+     * decoded, so the rules that read it can tell a quoted name from a bare
+     * one: PostgreSQL folds a bare name to lower case and keeps a quoted one
+     * as written, so LANGUAGE "Sql" is not LANGUAGE sql. Only a value made
+     * of name characters and dots is written out; any other is left as the
+     * reading has it, which the rules cannot read and refuse. A value is
+     * never longer than its spelling, so byte positions are kept.
+     *
+     * @param  list<array{0: int, 1: int, 2: string}>  $strings
+     */
+    private function withQuotedNamesSpelledOut(string $text, string $view, array $strings): string
+    {
+        foreach ($strings as [$start, $end, $kind]) {
+            $length = $end - $start;
+
+            if ($text[$start] !== '"' || $length < 2 || $text[$end - 1] !== '"') {
+                continue;
+            }
+
+            $inner = str_replace('""', '"', substr($text, $start + 1, $length - 2));
+            $value = $kind === 'unicode' ? $this->decodeUnicodeEscapes($inner, '\\') : $inner;
+
+            if ($value === null || preg_match('/^[A-Za-z0-9_$.\x80-\xff]+$/', $value) !== 1) {
+                continue;
+            }
+
+            $prefix = $this->stringPrefixLength($kind);
+            $view = substr_replace($view, str_pad("\"{$value}\"", $length + $prefix), $start - $prefix, $length + $prefix);
+        }
+
+        return $view;
+    }
+
+    /**
+     * CREATE [OR REPLACE] [TRUSTED] [PROCEDURAL] LANGUAGE defines a language
+     * over any handler, and ALTER [PROCEDURAL] LANGUAGE ... RENAME TO
+     * renames one: either can give a language the guard does not read
+     * (plperl, a C handler) the name of one it allows, so a later DO block or
+     * function "in plpgsql" runs that language. Both are refused. Changing a
+     * language's owner and dropping one move no name, and pass this rule.
+     *
+     * @return list<string>
+     */
+    private function languageDefinitionViolations(string $statement): array
+    {
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+        $end = '(?![A-Za-z0-9_$\x80-\xff])';
+
+        $defines = preg_match("/{$word}CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:TRUSTED\\s+)?(?:PROCEDURAL\\s+)?LANGUAGE{$end}/i", $statement) === 1;
+        $renames = preg_match("/{$word}ALTER\\s+(?:PROCEDURAL\\s+)?LANGUAGE{$end}.*{$word}RENAME{$end}/is", $statement) === 1;
+
+        return $defines || $renames
+            ? ['CREATE LANGUAGE and ALTER LANGUAGE ... RENAME are not allowed through QueryProxy: they can give a language the guard cannot read the name of plpgsql or sql.']
+            : [];
+    }
+
+    /**
+     * The language rule of routineClauseViolations() over one statement of
+     * a reading.
+     *
+     * @return list<string>
+     */
+    private function routineLanguageViolations(string $statement): array
+    {
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+        $end = '(?![A-Za-z0-9_$\x80-\xff])';
+        $violations = [];
+
+        if (preg_match("/{$word}CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:FUNCTION|PROCEDURE){$end}/i", $statement, $match, PREG_OFFSET_CAPTURE) === 1) {
+            $rest = substr($statement, $match[0][1] + strlen($match[0][0]));
+            // The whole statement is read, a SQL-standard body included: a
+            // routine or a type may be named "return" or "begin", so the
+            // words cannot mark where the clauses end.
+            $languages = $this->languageClauses($rest);
+
+            if ($languages === [] && preg_match("/{$word}(?:RETURN|BEGIN\\s+ATOMIC){$end}/i", $rest) !== 1) {
+                $violations[] = 'A CREATE FUNCTION or CREATE PROCEDURE statement without a LANGUAGE clause is not allowed through QueryProxy: write LANGUAGE plpgsql or LANGUAGE sql.';
+            }
+
+            foreach ($languages as $language) {
+                $violations = array_merge($violations, $this->languageViolations($language, 'CREATE FUNCTION', 'function'));
+            }
+        }
+
+        // DO opens a block only when a LANGUAGE clause or the body literal
+        // follows; ON CONFLICT DO UPDATE and a rule's DO INSTEAD are not one.
+        preg_match_all("/{$word}DO\\s*(?=LANGUAGE{$end}|(?:E|U&)?')/i", $statement, $blocks, PREG_OFFSET_CAPTURE);
+
+        foreach ($blocks[0] as [, $position]) {
+            foreach ($this->languageClauses(substr($statement, $position)) as $language) {
+                $violations = array_merge($violations, $this->languageViolations($language, 'DO', 'block'));
+            }
+        }
+
+        return $violations;
+    }
+
+    /**
+     * The language named by every LANGUAGE keyword outside parentheses in a
+     * reading, resolved as PostgreSQL resolves it: a bare name is folded to
+     * lower case, a "..." name (U& ones are spelled "..." by now, see
+     * withQuotedNamesSpelledOut()) and a '...' name are kept as written.
+     * Null for a language written any other way, which the guard cannot
+     * read.
+     *
+     * @return list<?string>
+     */
+    private function languageClauses(string $reading): array
+    {
+        $end = '(?![A-Za-z0-9_$\x80-\xff])';
+        $name = '[A-Za-z_\x80-\xff][A-Za-z0-9_$\x80-\xff]*';
+        preg_match_all("/[()]|(?<![A-Za-z0-9_\$\\x80-\\xff])LANGUAGE{$end}/i", $reading, $matches, PREG_OFFSET_CAPTURE);
+
+        $languages = [];
+        $depth = 0;
+
+        foreach ($matches[0] as [$token, $position]) {
+            if ($token === '(' || $token === ')') {
+                $depth = max(0, $depth + ($token === '(' ? 1 : -1));
+
+                continue;
+            }
+
+            if ($depth > 0) {
+                continue;
+            }
+
+            $after = substr($reading, $position + strlen($token));
+            // A bare name directly followed by & or a quote is a U& or E prefix
+            // the guard could not resolve, not the language itself.
+            if (preg_match("/^\\s*(?:({$name})(?![&'\"])|\"({$name})\"|'({$name})')(?!\\s*\\.)/", $after, $language) !== 1) {
+                $languages[] = null;
+            } elseif ($language[1] !== '') {
+                $languages[] = strtolower($language[1]);
+            } else {
+                $languages[] = $language[2] !== '' ? $language[2] : $language[3];
+            }
+        }
+
+        return $languages;
+    }
+
+    /**
+     * Why a DO block ($subject "DO", $noun "block") or a routine ($subject
+     * "CREATE FUNCTION", $noun "function") may not run in $language; none
+     * for plpgsql and sql.
+     *
+     * @return list<string>
+     */
+    private function languageViolations(?string $language, string $subject, string $noun): array
+    {
+        if ($language === null) {
+            return ["A {$subject} statement whose language the guard cannot read is not allowed through QueryProxy: write LANGUAGE plpgsql or LANGUAGE sql as a plain name."];
+        }
+
+        if (in_array($language, ['plpgsql', 'sql'], true)) {
+            return [];
+        }
+
+        if ($language !== strtolower($language)) {
+            return ["{$subject} ... LANGUAGE \"{$language}\" is not allowed through QueryProxy: a quoted language name keeps its case, so it is not plpgsql or sql, and only plpgsql and sql bodies are allowed."];
+        }
+
+        if ($this->isUntrustedLanguage($language)) {
+            return ["{$subject} ... LANGUAGE {$language} is not allowed through QueryProxy: {$language} is an untrusted procedural language, so the {$noun} would run as the database superuser."];
+        }
+
+        return ["{$subject} ... LANGUAGE {$language} is not allowed through QueryProxy: only plpgsql and sql bodies are allowed, because they are the only languages the guard can read."];
+    }
+
+    /**
+     * The SET-clause rule of routineClauseViolations() over one statement of
+     * a reading. ALTER FUNCTION ... SET SCHEMA and ALTER DATABASE ... SET
+     * TABLESPACE move the object rather than carry a setting, and are
+     * skipped.
+     *
+     * @return list<string>
+     */
+    private function routineSetClauseViolations(string $statement): array
+    {
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+        $end = '(?![A-Za-z0-9_$\x80-\xff])';
+        $name = '[A-Za-z_\x80-\xff][A-Za-z0-9_$\x80-\xff]*';
+
+        if (preg_match("/{$word}(?:CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:FUNCTION|PROCEDURE)|ALTER\\s+(?:FUNCTION|PROCEDURE|ROUTINE|DATABASE|ROLE|USER)){$end}/i", $statement, $match, PREG_OFFSET_CAPTURE) !== 1) {
+            return [];
+        }
+
+        // The whole statement is read, as in routineLanguageViolations().
+        $rest = substr($statement, $match[0][1] + strlen($match[0][0]));
+        preg_match_all("/[()]|{$word}SET{$end}/i", $rest, $matches, PREG_OFFSET_CAPTURE);
+
+        $violations = [];
+        $depth = 0;
+
+        foreach ($matches[0] as [$token, $position]) {
+            if ($token === '(' || $token === ')') {
+                $depth = max(0, $depth + ($token === '(' ? 1 : -1));
+
+                continue;
+            }
+
+            if ($depth > 0) {
+                continue;
+            }
+
+            $after = substr($rest, $position + strlen($token));
+
+            if (preg_match("/^\\s+(?:SCHEMA|TABLESPACE){$end}(?!\\s*(?:=|TO{$end}|FROM{$end}))/i", $after) === 1) {
+                continue;
+            }
+
+            $part = "(?:{$name}|\"[A-Za-z0-9_\$.\\x80-\\xff]+\")";
+            $setting = preg_match("/^\\s*({$part}(?:\\s*\\.\\s*{$part})*)\\s*(?:=|TO{$end}|FROM\\s+CURRENT{$end})/i", $after, $parts) === 1
+                ? (string) preg_replace('/[\s"]+/', '', $parts[1])
+                : null;
+
+            // A quoted part may hold dots ("app.jwt_secret"); a setting name
+            // is case-insensitive to PostgreSQL, quoted or not.
+            if ($setting === null || preg_match("/^{$name}(?:\\.{$name})*\$/", $setting) !== 1) {
+                $violations[] = 'A SET clause on a function, procedure, database or role whose setting the guard cannot read is not allowed through QueryProxy: the guard cannot tell which setting it carries.';
+
+                continue;
+            }
+
+            $violations = array_merge($violations, $this->serverVariableViolations(
+                $this->significantTokens("SET {$setting} = DEFAULT"),
+                DbDriver::Pgsql,
+            ));
+        }
+
+        return $violations;
+    }
+
+    /**
+     * The inner text of a dollar-quoted region, whether it is closed, and
+     * its tag ($$ or $name$).
+     *
+     * @return array{0: string, 1: bool, 2: string}
+     */
+    private function dollarQuotedParts(string $region): array
+    {
+        $tag = preg_match('/^\$[A-Za-z0-9_\x80-\xff]*\$/', $region, $matches) === 1 ? $matches[0] : '';
+        $closed = $tag !== '' && strlen($region) >= 2 * strlen($tag) && str_ends_with($region, $tag);
+
+        return [substr($region, strlen($tag), strlen($region) - strlen($tag) - ($closed ? strlen($tag) : 0)), $closed, $tag];
+    }
+
+    /**
+     * How many bytes a quoted string's prefix takes before its opening
+     * quote: E for an "escape" string, U& for a "unicode" one.
+     */
+    private function stringPrefixLength(string $kind): int
+    {
+        return match ($kind) {
+            'escape' => 1,
+            'unicode' => 2,
+            default => 0,
+        };
+    }
+
+    /**
+     * $text with its comments, dollar-quoted strings, '...' strings and
+     * "..." identifiers blanked, byte length kept: the code PostgreSQL reads
+     * around them. $ranges is postgresLexicalRanges() of $text.
+     *
+     * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges
+     */
+    private function postgresCodeText(string $text, array $ranges): string
+    {
+        return $this->blankRanges($text, array_merge(
+            $ranges['comments'],
+            $ranges['quoted'],
+            array_map(fn (array $string): array => [$string[0], $string[1]], $ranges['strings']),
+        ));
+    }
+
+    private function dollarQuotedInner(string $region): string
+    {
+        return $this->dollarQuotedParts($region)[0];
+    }
+
+    /**
+     * The literals of $text that PostgreSQL runs as a procedural body, each
+     * as [label, body, start offset], the body null when it cannot be read:
+     * the literal is unterminated, or a '...' one is followed by another
+     * literal with only whitespace and comments between (string
+     * continuation). A '...' or dollar-quoted literal is a body when it
+     * follows AS in a statement that creates a function or a procedure; a
+     * '...' literal is one when it follows DO (with or without a LANGUAGE
+     * clause) — a dollar-quoted DO body is code to the reading already.
+     *
+     * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges  postgresLexicalRanges() of $text
+     * @return list<array{0: string, 1: ?string, 2: int}>
+     */
+    private function procedureBodies(string $text, array $ranges): array
+    {
+        $literals = array_merge(
+            array_map(fn (array $range): array => [$range[0], $range[1], 'dollar'], $ranges['quoted']),
+            array_values(array_filter($ranges['strings'], fn (array $string): bool => $text[$string[0]] === "'")),
+        );
+        usort($literals, fn (array $a, array $b): int => $a[0] <=> $b[0]);
+
+        $code = $this->postgresCodeText($text, $ranges);
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+
+        $bodies = [];
+
+        foreach ($literals as $index => [$start, $end, $kind]) {
+            $before = substr($code, 0, $start - $this->stringPrefixLength($kind));
+            $statement = substr($before, (int) strrpos($before, ';'));
+
+            $label = match (true) {
+                preg_match("/{$word}AS\\s*\$/i", $before) === 1
+                    && preg_match("/{$word}CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:FUNCTION|PROCEDURE)(?![A-Za-z0-9_\$\\x80-\\xff])/i", $statement) === 1 => 'function',
+                $kind !== 'dollar'
+                    && preg_match("/{$word}DO(?:\\s+LANGUAGE\\s+(?:U&)?(?:[A-Za-z_\\x80-\\xff][A-Za-z0-9_\$\\x80-\\xff]*)?)?\\s*\$/i", $before) === 1 => 'DO block',
+                default => null,
+            };
+
+            if ($label === null) {
+                continue;
+            }
+
+            $region = substr($text, $start, $end - $start);
+
+            if ($kind === 'dollar') {
+                [$inner, $closed] = $this->dollarQuotedParts($region);
+                $bodies[] = [$label, $closed ? $inner : null, $start];
+
+                continue;
+            }
+
+            $closed = preg_match($kind === 'escape' ? "/^'(?:[^'\\\\]|''|\\\\.)*'\$/s" : "/^'(?:[^']|'')*'\$/s", $region) === 1;
+            $next = $literals[$index + 1] ?? null;
+            $continued = $next !== null
+                && trim(substr($code, $end, $next[0] - $this->stringPrefixLength($next[2]) - $end)) === '';
+
+            $bodies[] = [$label, $closed && ! $continued
+                ? $this->decodePostgresString(substr($region, 1, -1), $kind)
+                : null, $start];
+        }
+
+        return $bodies;
+    }
+
+    /**
+     * Whether a body reading uses EXECUTE as anything but the trigger clause
+     * EXECUTE FUNCTION / PROCEDURE name(...), which names a function to call
+     * rather than text to run.
+     */
+    private function executesDynamicSql(string $reading): bool
+    {
+        $word = '[A-Za-z_\x80-\xff][A-Za-z0-9_$\x80-\xff]*';
+
+        return preg_match(
+            "/(?<![A-Za-z0-9_\$\\x80-\\xff])EXECUTE(?![A-Za-z0-9_\$\\x80-\\xff])(?!\\s+(?:FUNCTION|PROCEDURE)\\s+{$word}(?:\\s*\\.\\s*{$word})?\\s*\\()/i",
+            $reading,
+        ) === 1;
+    }
+
+    /**
+     * The body with every dollar-quote tag ($$, $tag$) replaced by spaces of
+     * the same length, so its nested dollar-quoted strings read as one text.
+     */
+    private function withoutDollarTags(string $body): string
+    {
+        return (string) preg_replace_callback(
+            '/(?<![A-Za-z0-9_$\x80-\xff])\$(?:[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)?\$/',
+            fn (array $match): string => str_repeat(' ', strlen($match[0])),
+            $body,
+        );
+    }
+
+    /**
+     * The body of a DO block as PostgreSQL reads it, respelled so that the
+     * MySQL-first lexer behind normalize() cannot read it any other way.
+     *
+     * The lexer takes a backslash as an escape in every string and "#" as
+     * the start of a comment; PL/pgSQL (standard_conforming_strings on) takes
+     * neither. "PERFORM 'a\', pg_read_file('/etc/passwd') --'" is one string
+     * to the lexer and a call to PostgreSQL, and so is "PERFORM 1 # 1,
+     * pg_read_file(...)". Every region is therefore located with
+     * postgresLexicalRanges() and rewritten, byte length kept:
+     *  - comments are blanked (they nest, and "--" needs no space after it);
+     *  - '...' strings — plain, E'...' and U&'...' — keep their quotes and
+     *    have their contents blanked, so no backslash is left in one;
+     *  - a "..." identifier that is a plain name is unquoted, so a quoted
+     *    call ("pg_read_file"(...)) meets the same patterns as a bare one;
+     *    any other one is blanked like a string;
+     *  - "#" left in code is the XOR operator and becomes a space;
+     *  - a nested dollar-quoted string keeps its tags and has its contents
+     *    rewritten the same way: inside a body it is how a statement is
+     *    spelled for EXECUTE, and the scan wants to read that statement.
+     *
+     * A U&"..." identifier is decoded with the default backslash escape
+     * and, when the result is a plain name, written out bare in place of the
+     * whole spelling: U&"\0070g_read_file"(...) is pg_read_file(...) to
+     * PostgreSQL. A UESCAPE clause is not decoded; the caller refuses it.
+     *
+     * Null when a block comment in the body is never closed, or when dollar
+     * quoting is nested deeper than MAX_BLOCK_BODY_QUOTE_DEPTH. Inside a
+     * nested dollar-quoted string an open block comment only runs to the end
+     * of that string: the string is data, valid however it ends, and the code
+     * written before the comment is still scanned.
+     */
+    private function postgresBlockBodyView(string $body, int $depth = 0, bool $openCommentRunsToEnd = false, bool $keepNameStrings = false): ?string
+    {
+        if ($depth > self::MAX_BLOCK_BODY_QUOTE_DEPTH) {
+            return null;
+        }
+
+        $ranges = $this->postgresLexicalRanges($body, $openCommentRunsToEnd);
+
+        if ($ranges === null) {
+            return null;
+        }
+
+        $view = $this->blankRanges($body, $ranges['comments']);
+        foreach ($ranges['strings'] as [$start, $end, $kind]) {
+            $length = $end - $start;
+            $quote = $body[$start];
+            $closed = $length >= 2 && $body[$end - 1] === $quote;
+            $inner = substr($body, $start + 1, $closed ? $length - 2 : $length - 1);
+
+            $name = $quote === '"' && $closed && $kind === 'unicode'
+                ? $this->decodeUnicodeEscapes(str_replace('""', '"', $inner), '\\')
+                : null;
+
+            if ($name !== null && $this->isPlainPostgresName($name)) {
+                // U& and the quotes go too; an escape is never shorter than
+                // the character it names, so the name always fits.
+                $view = substr_replace($view, str_pad(' '.$name, $length + 2), $start - 2, $length + 2);
+
+                continue;
+            }
+
+            if ($keepNameStrings && $quote === "'" && $closed) {
+                $value = $this->decodePostgresString($inner, $kind);
+
+                if (preg_match('/^[A-Za-z0-9_.]+$/', $value) === 1) {
+                    // E and U& go too, so the lexer meets a plain literal;
+                    // a decoded value is never longer than its spelling.
+                    $prefix = $this->stringPrefixLength($kind);
+                    $view = substr_replace($view, str_pad("'{$value}'", $length + $prefix), $start - $prefix, $length + $prefix);
+
+                    continue;
+                }
+            }
+
+            if ($quote === '"' && $closed && $this->isPlainPostgresName($inner)) {
+                $replacement = ' '.$inner.' ';
+            } else {
+                // An unterminated string runs to the end of the body; it is
+                // closed here as well, so the lexer reads no further than
+                // PostgreSQL does. A lone quote at the very end is dropped.
+                $replacement = $length >= 2 ? $quote.str_repeat(' ', $length - 2).$quote : ' ';
+            }
+
+            $view = substr_replace($view, $replacement, $start, $length);
+        }
+
+        foreach ($ranges['quoted'] as [$start, $end]) {
+            [$inner, $closed, $tag] = $this->dollarQuotedParts(substr($body, $start, $end - $start));
+            $innerView = $this->postgresBlockBodyView($inner, $depth + 1, openCommentRunsToEnd: true, keepNameStrings: $keepNameStrings);
+
+            if ($innerView === null) {
+                return null;
+            }
+
+            $view = substr_replace($view, $tag.$innerView.($closed ? $tag : ''), $start, $end - $start);
+        }
+
+        $opaque = array_merge($ranges['comments'], $ranges['quoted'], array_map(
+            fn (array $string): array => [$string[0], $string[1]],
+            $ranges['strings'],
+        ));
+
+        foreach ($this->bytePositions($body, '#') as $position) {
+            if (! $this->isWithinRange($position, $opaque)) {
+                $view[$position] = ' ';
+            }
+        }
+
+        return $view;
+    }
+
+    private function isPlainPostgresName(string $name): bool
+    {
+        return preg_match('/^[A-Za-z_\x80-\xff][A-Za-z0-9_$\x80-\xff]*$/', $name) === 1;
+    }
+
+    /**
+     * The string literals of a DO statement — its '...' strings, E'...' and
+     * U&'...' included, and its dollar-quoted strings — located the way
+     * PostgreSQL reads them (see postgresLexicalRanges()), in source order.
+     * Each is [start, end, kind], kind being "dollar" or the backslash
+     * reading of a quoted string. A "..." identifier is not a literal.
+     *
+     * PostgreSQL's grammar takes a literal in two places of a DO statement:
+     * as the body, and as the language name after LANGUAGE. It also joins
+     * '...' literals separated by whitespace holding a newline into one
+     * (string continuation). The caller therefore accepts exactly one
+     * literal, not after LANGUAGE, as the body; anything else is refused.
+     *
+     * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges  postgresLexicalRanges() of $sql
+     * @return list<array{0: int, 1: int, 2: string}>
+     */
+    private function anonymousBlockLiterals(string $sql, array $ranges): array
+    {
+        $literals = array_map(fn (array $range): array => [$range[0], $range[1], 'dollar'], $ranges['quoted']);
+
+        foreach ($ranges['strings'] as $string) {
+            if ($sql[$string[0]] === "'") {
+                $literals[] = $string;
+            }
+        }
+
+        usort($literals, fn (array $a, array $b): int => $a[0] <=> $b[0]);
+
+        return $literals;
+    }
+
+    /**
+     * True when one of the literals is the operand of a LANGUAGE keyword:
+     * LANGUAGE 'plpgsql', LANGUAGE $$plpgsql$$, comments in between allowed.
+     *
+     * @param  list<array{0: int, 1: int, 2: string}>  $literals
+     * @param  list<array{0: int, 1: int}>  $comments
+     */
+    private function languageLiteral(string $sql, array $literals, array $comments): bool
+    {
+        $code = $this->blankRanges($sql, $comments);
+
+        foreach ($literals as [$start, , $kind]) {
+            if (preg_match('/(?<![A-Za-z0-9_$\x80-\xff])LANGUAGE\s*$/i', substr($code, 0, $start - $this->stringPrefixLength($kind))) === 1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The source text a DO block asks the server to execute, given its one
+     * body literal (see anonymousBlockLiterals()): the contents of a
+     * dollar-quoted body, or the decoded value of a quoted one. Nested
+     * dollar quoting is left in place — inside the body it is quoting, not
+     * framing, and the body scan wants to see through it.
+     *
+     * A quoted body is decoded the way PostgreSQL reads it, not the way the
+     * lexer does: the lexer takes a backslash in a plain string as an escape
+     * and does not know E'...' strings, so its reading of the body text would
+     * differ from the text the server hands to PL/pgSQL.
+     *
+     * @param  array{0: int, 1: int, 2: string}  $literal
+     */
+    private function anonymousBlockBody(string $sql, array $literal): string
+    {
+        [$start, $end, $kind] = $literal;
+        $region = substr($sql, $start, $end - $start);
+
+        if ($kind === 'dollar') {
+            return $this->dollarQuotedParts($region)[0];
+        }
+
+        $closed = strlen($region) >= 2 && str_ends_with($region, "'");
+
+        return $this->decodePostgresString(substr($region, 1, strlen($region) - ($closed ? 2 : 1)), $kind);
+    }
+
+    /**
+     * The value of a PostgreSQL '...' string, given the text between its
+     * quotes and how it reads a backslash ("plain", "escape" for E'...',
+     * "unicode" for U&'...' with the default escape character). A doubled
+     * quote is one quote in every kind.
+     */
+    private function decodePostgresString(string $inner, string $kind): string
+    {
+        if ($kind === 'plain') {
+            return str_replace("''", "'", $inner);
+        }
+
+        $pattern = $kind === 'escape'
+            ? '/\'\'|\\\\(?:[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)/s'
+            : '/\'\'|\\\\(?:[0-9A-Fa-f]{4}|\+[0-9A-Fa-f]{6}|\\\\)/';
+
+        return (string) preg_replace_callback($pattern, function (array $match) use ($kind): string {
+            $escape = $match[0];
+
+            if ($escape === "''") {
+                return "'";
+            }
+
+            $body = substr($escape, 1);
+
+            if ($kind === 'unicode') {
+                return $body === '\\' ? '\\' : (mb_chr((int) hexdec(ltrim($body, '+')), 'UTF-8') ?: '');
+            }
+
+            return match (true) {
+                preg_match('/^[0-7]+$/', $body) === 1 => chr(octdec($body) & 0xFF),
+                $body[0] === 'x' && strlen($body) > 1 => chr((int) hexdec(substr($body, 1))),
+                ($body[0] === 'u' || $body[0] === 'U') && strlen($body) > 1 => mb_chr((int) hexdec(substr($body, 1)), 'UTF-8') ?: '',
+                default => ['b' => "\x08", 'f' => "\f", 'n' => "\n", 'r' => "\r", 't' => "\t"][$body] ?? $body,
+            };
+        }, $inner);
     }
 
     /**
@@ -4975,7 +5864,7 @@ class SqlInspector
      *
      * @return list<string>
      */
-    private function forbiddenInBlockBody(string $body): array
+    private function forbiddenInBlockBody(string $body, string $label = 'DO block'): array
     {
         // Dollar quoting is NOT masked here: a nested $q$ ... $q$ region is how
         // a body spells a quoted statement, and masking it would hide exactly
@@ -5000,7 +5889,7 @@ class SqlInspector
                 if (preg_match($pattern, $fragment)) {
                     // Keyed by message so one body cannot report the same
                     // violation once per fragment.
-                    $violations[$message] = "Inside the DO block body: {$message}";
+                    $violations[$message] = "Inside the {$label} body: {$message}";
                 }
             }
         }
@@ -5132,10 +6021,42 @@ class SqlInspector
         $leading = strtoupper((string) $first->value);
 
         if (in_array($leading, [...self::PERSISTENT_SCOPES, 'SESSION', 'LOCAL'], true)) {
-            return [$leading, isset($assignment[1]) ? $this->identifierValue($assignment[1]) : null];
+            return [$leading, $this->settingNameAt($assignment, 1)];
         }
 
-        return [$statementScope, $this->identifierValue($first)];
+        return [$statementScope, $this->settingNameAt($assignment, 0)];
+    }
+
+    /**
+     * The setting name an assignment writes, starting at $index. A
+     * PostgreSQL U&"..." name reaches the lexer as three tokens — U, & and
+     * the quoted text with its escapes undecoded — and is decoded here the
+     * way PostgreSQL decodes it, so U&"session\005Freplication_role" is
+     * judged as session_replication_role. Null when there is no name, or
+     * when the escapes do not decode (PostgreSQL rejects such a name).
+     *
+     * @param  list<Token>  $assignment
+     */
+    private function settingNameAt(array $assignment, int $index): ?string
+    {
+        if (! isset($assignment[$index])) {
+            return null;
+        }
+
+        $quoted = $assignment[$index + 2] ?? null;
+
+        if (strtoupper((string) $assignment[$index]->token) === 'U'
+            && isset($assignment[$index + 1])
+            && $assignment[$index + 1]->token === '&'
+            && $quoted !== null
+            && $quoted->type === TokenType::String
+            && str_starts_with((string) $quoted->token, '"')) {
+            $decoded = $this->decodeUnicodeEscapes(str_replace('""', '"', substr((string) $quoted->token, 1, -1)), '\\');
+
+            return $decoded === null ? null : strtolower($decoded);
+        }
+
+        return $this->identifierValue($assignment[$index]);
     }
 
     /**
@@ -6288,9 +7209,12 @@ class SqlInspector
      * a backslash in it: "escape" for an E'...' string, "unicode" for a U&
      * string or identifier, "plain" for the rest.
      *
+     * With $openCommentRunsToEnd a block comment that is never closed is
+     * reported as running to the end of the text instead of yielding null.
+     *
      * @return array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}|null
      */
-    private function postgresLexicalRanges(string $sql): ?array
+    private function postgresLexicalRanges(string $sql, bool $openCommentRunsToEnd = false): ?array
     {
         $comments = [];
         $quoted = [];
@@ -6329,11 +7253,11 @@ class SqlInspector
                     }
                 }
 
-                if ($depth > 0) {
+                if ($depth > 0 && ! $openCommentRunsToEnd) {
                     return null;
                 }
 
-                $comments[] = [$offset, $cursor];
+                $comments[] = [$offset, min($cursor, $length)];
                 $offset = $cursor;
 
                 continue;

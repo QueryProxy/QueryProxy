@@ -310,7 +310,6 @@ test('a DO block is a write and really writes', function (string $sql, array $id
         ->and($this->live->label(3))->toBe($label);
 })->with([
     'static UPDATE' => ["DO \$\$ BEGIN UPDATE items SET label = 'done' WHERE id = 3; END \$\$", [1, 2, 3, 4, 5], 'done'],
-    'dynamic DELETE through EXECUTE' => ["DO \$\$ BEGIN EXECUTE 'DELETE FROM items WHERE id = ' || 5; END \$\$", [1, 2, 3, 4], 'three'],
 ]);
 
 // PRD 3.2: DO blocks are exempt from the WHERE rule. They are classified as
@@ -324,8 +323,64 @@ test('a DO block is exempt from the WHERE rule: a DELETE without a WHERE passes 
     expect($this->live->itemIds())->toBe([]);
 })->with([
     'static DELETE' => ['DO $$ BEGIN DELETE FROM items; END $$'],
-    'dynamic DELETE through EXECUTE' => ["DO \$\$ BEGIN EXECUTE 'DELETE FROM items'; END \$\$"],
 ]);
+
+test('dynamic SQL in a DO block is refused, and PostgreSQL really runs the text it builds', function (string $sql, array $ids) {
+    expectLiveRefused($this->live, $sql, 'Inside the DO block body: dynamic SQL (EXECUTE) is not allowed');
+
+    $this->live->db()->statement($sql);
+
+    expect($this->live->itemIds())->toBe($ids);
+})->with([
+    'DELETE joined at run time' => ["DO \$\$ BEGIN EXECUTE 'DELETE FROM items WHERE id = ' || 5; END \$\$", [1, 2, 3, 4]],
+    'DELETE without a WHERE' => ["DO \$\$ BEGIN EXECUTE 'DELETE FROM items'; END \$\$", []],
+]);
+
+test('a backslash before a quote in a DO body cannot hide pg_read_file, which PostgreSQL really calls', function () {
+    // PL/pgSQL reads 'a\' as a whole string (standard_conforming_strings),
+    // so pg_read_file is code and "--'" a comment; the lexer would read one
+    // long string instead. PG_VERSION sits in every data directory.
+    $sql = "DO \$\$ BEGIN INSERT INTO items (id, label) SELECT 6, 'a\\' || pg_read_file('PG_VERSION') --'\n; END \$\$";
+    expectLiveRefused($this->live, $sql, 'Inside the DO block body: Server-side file IO functions');
+
+    if (! $this->live->isSuperuser()) {
+        // Without pg_read_server_files the call is reached and refused by name.
+        expect(fn () => $this->live->db()->statement($sql))->toThrow(QueryException::class, 'pg_read_file');
+
+        return;
+    }
+
+    $this->live->db()->statement($sql);
+
+    expect($this->live->label(6))->toMatch('/^a\\\\\d+/');
+});
+
+test('a DO body PostgreSQL reads differently from the first literal is refused, and PostgreSQL really runs it', function (string $sql, string $needle, int $id) {
+    expectLiveRefused($this->live, $sql, $needle);
+
+    if (! $this->live->isSuperuser()) {
+        expect(fn () => $this->live->db()->statement($sql))->toThrow(QueryException::class, 'pg_read_file');
+
+        return;
+    }
+
+    $this->live->db()->statement($sql);
+
+    expect($this->live->label($id))->toMatch('/^\d+/');
+})->with([
+    'string continuation' => ["DO 'BEGIN INSERT INTO items (id, label) SELECT 7, pg_read_' \n 'file(''PG_VERSION''); END'", 'more than one string literal', 7],
+    'language as a trailing dollar-quoted string' => ["DO 'BEGIN INSERT INTO items (id, label) SELECT 8, pg_read_file(''PG_VERSION''); END' LANGUAGE \$\$plpgsql\$\$", 'names its language with a string literal', 8],
+    'language as a leading string' => ["DO LANGUAGE 'plpgsql' 'BEGIN INSERT INTO items (id, label) SELECT 9, pg_read_file(''PG_VERSION''); END'", 'names its language with a string literal', 9],
+    'U& quoted function name' => ["DO \$\$ BEGIN INSERT INTO items (id, label) SELECT 10, U&\"\\0070g_read_file\"('PG_VERSION'); END \$\$", 'Inside the DO block body: Server-side file IO functions', 10],
+]);
+
+test('an open block comment inside a nested dollar-quoted string is data, and the DO block runs', function () {
+    $sql = 'DO $$ BEGIN RAISE NOTICE $m$ /* $m$; END $$';
+
+    expect($this->live->guard($sql)->violations)->toBe([]);
+
+    $this->live->db()->statement($sql);
+});
 
 test('PREPARE ... AS DELETE is a write, and EXECUTE runs it', function () {
     $prepare = 'PREPARE qp_live_delete (integer) AS DELETE FROM items WHERE id = $1';
@@ -404,6 +459,138 @@ test('pg_terminate_backend is refused and really ends another session', function
 
     expect($this->live->db()->selectOne($sql.' AS terminated')->terminated)->toBeTrue()
         ->and($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('query_to_xml is refused and really runs the SQL it is given as text', function () {
+    $victim = $this->live->otherSession();
+    $pid = (int) $victim->selectOne('SELECT pg_backend_pid() AS pid')->pid;
+
+    $sql = "SELECT pg_catalog.query_to_xml('SELECT pg_terminate_backend({$pid}, 5000)', true, false, '') AS x";
+    expectLiveRefused($this->live, $sql, 'query_to_xml() is not allowed');
+
+    // The call the guard would have judged lives in a string; PostgreSQL
+    // parses and runs it, and the other session is gone.
+    expect($this->live->db()->selectOne($sql)->x)->toContain('true')
+        ->and($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('a DO body calling pg_terminate_backend is refused and really ends another session', function () {
+    $victim = $this->live->otherSession();
+    $pid = (int) $victim->selectOne('SELECT pg_backend_pid() AS pid')->pid;
+
+    $sql = "DO \$\$ BEGIN PERFORM pg_terminate_backend({$pid}, 5000); END \$\$";
+    expectLiveRefused($this->live, $sql, 'Inside the DO block body: pg_terminate_backend() is not allowed');
+
+    $this->live->db()->statement($sql);
+
+    expect($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('a single-quoted function body is refused when it would end another session, and PostgreSQL runs it', function () {
+    $victim = $this->live->otherSession();
+    $pid = (int) $victim->selectOne('SELECT pg_backend_pid() AS pid')->pid;
+
+    $create = "CREATE FUNCTION qp_live_terminate() RETURNS void LANGUAGE plpgsql AS 'BEGIN PERFORM pg_terminate_backend({$pid}, 5000); END'";
+    expectLiveRefused($this->live, $create, 'Inside the function body: pg_terminate_backend() is not allowed');
+
+    $this->live->db()->statement($create);
+    $this->live->db()->select('SELECT qp_live_terminate()');
+
+    expect($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('a dollar-quoted function body is refused when it would end another session, and PostgreSQL runs it', function () {
+    $victim = $this->live->otherSession();
+    $pid = (int) $victim->selectOne('SELECT pg_backend_pid() AS pid')->pid;
+
+    $create = "CREATE FUNCTION qp_live_terminate_dollar() RETURNS void LANGUAGE plpgsql AS \$f\$ BEGIN PERFORM pg_terminate_backend({$pid}, 5000); END \$f\$";
+    expectLiveRefused($this->live, $create, 'Inside the function body: pg_terminate_backend() is not allowed');
+
+    $this->live->db()->statement($create);
+    $this->live->db()->select('SELECT qp_live_terminate_dollar()');
+
+    expect($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('ts_rewrite is refused and really runs the SQL it is given as text', function () {
+    $victim = $this->live->otherSession();
+    $pid = (int) $victim->selectOne('SELECT pg_backend_pid() AS pid')->pid;
+
+    $sql = "SELECT ts_rewrite('a'::tsquery, 'SELECT ''a''::tsquery, ''b''::tsquery FROM (SELECT pg_terminate_backend({$pid}, 5000)) x')::text AS r";
+    expectLiveRefused($this->live, $sql, 'ts_rewrite() is not allowed');
+
+    // The query lives in a string; PostgreSQL runs it to find the rewrite
+    // rules, and the other session is gone.
+    expect($this->live->db()->selectOne($sql)->r)->toBe("'b'")
+        ->and($this->live->db()->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$pid])->n)->toBe(0);
+});
+
+test('ALTER FUNCTION ... SET of a guarded setting is refused, and PostgreSQL really applies it on every call', function () {
+    requireLiveSuperuser($this->live);
+
+    $db = $this->live->db();
+    $db->statement("CREATE FUNCTION qp_live_replication_role() RETURNS text LANGUAGE sql AS \$\$ SELECT current_setting('session_replication_role') \$\$");
+
+    $sql = 'ALTER FUNCTION qp_live_replication_role() SET session_replication_role = replica';
+    expectLiveRefused($this->live, $sql, 'SET session_replication_role is not allowed');
+
+    $db->statement($sql);
+
+    // Every call now runs with triggers and foreign keys switched off.
+    expect($db->selectOne('SELECT qp_live_replication_role() AS r')->r)->toBe('replica')
+        ->and($db->selectOne("SELECT current_setting('session_replication_role') AS r")->r)->toBe('origin');
+});
+
+test('a function in a language other than plpgsql and sql is refused, and PostgreSQL runs it', function () {
+    requireLiveSuperuser($this->live);
+
+    $sql = "CREATE FUNCTION qp_live_abs(int) RETURNS int LANGUAGE internal AS 'int4abs'";
+    expectLiveRefused($this->live, $sql, 'LANGUAGE internal is not allowed');
+
+    // An internal function is a C entry point of the server, called with
+    // whatever argument types the statement declares.
+    $this->live->db()->statement($sql);
+
+    expect($this->live->db()->selectOne('SELECT qp_live_abs(-3) AS n')->n)->toBe(3);
+});
+
+test('a quoted language name keeps its case: CREATE LANGUAGE "Sql" is refused, and PostgreSQL runs a DO block in it', function () {
+    requireLiveSuperuser($this->live);
+
+    $db = $this->live->db();
+    $create = 'CREATE LANGUAGE "Sql" HANDLER plpgsql_call_handler INLINE plpgsql_inline_handler';
+    expectLiveRefused($this->live, $create, 'CREATE LANGUAGE and ALTER LANGUAGE ... RENAME are not allowed');
+
+    // A language belongs to the database, not to the test schema.
+    $db->statement($create);
+
+    try {
+        $block = 'DO LANGUAGE "Sql" $$ BEGIN CREATE TABLE qp_live_sql_lang (id int); END $$';
+        expectLiveRefused($this->live, $block, 'LANGUAGE "Sql" is not allowed');
+
+        // "Sql" is its own language to PostgreSQL, whatever handler it has:
+        // the block runs through the one CREATE LANGUAGE gave it.
+        $db->statement($block);
+
+        expect($db->selectOne("SELECT to_regclass('qp_live_sql_lang') IS NOT NULL AS made")->made)->toBeTrue()
+            ->and($db->selectOne("SELECT count(*) AS n FROM pg_language WHERE lanname = 'Sql'")->n)->toBe(1);
+    } finally {
+        $db->statement('DROP LANGUAGE IF EXISTS "Sql" CASCADE');
+    }
+});
+
+test('an ordinary trigger function and its EXECUTE FUNCTION trigger pass the guard and run', function () {
+    $function = 'CREATE FUNCTION qp_live_upper_label() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.label := upper(NEW.label); RETURN NEW; END $$';
+    $trigger = 'CREATE TRIGGER qp_live_upper BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION qp_live_upper_label()';
+
+    foreach ([$function, $trigger] as $sql) {
+        expect($this->live->guard($sql)->violations)->toBe([]);
+        $this->live->db()->statement($sql);
+    }
+
+    $this->live->db()->insert("INSERT INTO items (id, label) VALUES (8, 'eight')");
+
+    expect($this->live->label(8))->toBe('EIGHT');
 });
 
 test('pg_cancel_backend is refused and really cancels a running query', function () {
