@@ -42,12 +42,17 @@ asynchronously on a worker, and results come back **masked, limited and fully au
     blocked outright (`GRANT`, `DROP DATABASE`, `CREATE FUNCTION ... SONAME`,
     `INTO OUTFILE`, `LOAD_FILE()`, `pg_read_file()`, `COPY ... TO PROGRAM`, ...),
   - and the ones where a dangerous use shares its syntax with an everyday one are
-    judged on the dangerous part, not the keyword: `CREATE EXTENSION` and `DO`
-    are refused only for untrusted procedural languages (`plpythonu`, `plperlu`,
-    anything matching the `pl…u` convention), and `SET` only for file-path,
-    logging, plugin and protection-related variables (persistent scopes on
-    MySQL/MariaDB; every scope on PostgreSQL). A `DO` body is scanned for the
-    blocked statements above.
+    judged on the dangerous part, not the keyword: `CREATE EXTENSION` is refused
+    only for untrusted procedural languages (`plpythonu`, `plperlu`, anything
+    matching the `pl…u` convention), and `SET` only for file-path, logging,
+    plugin and protection-related variables (persistent scopes on MySQL/MariaDB;
+    every scope on PostgreSQL, including routine, database and role `SET`).
+    On PostgreSQL, `DO` blocks and `CREATE FUNCTION` / `PROCEDURE` accept only
+    `plpgsql` and `sql`; the body is scanned for the blocked statements above, and dynamic
+    `EXECUTE` inside it is refused,
+  - a `SET` that changes MySQL / MariaDB `sql_mode` is refused, and a session
+    running with `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES` is refused before
+    anything runs (the guard reads quotes the default way).
 - **Approval workflow** — pending requests wait indefinitely until a DBA decides;
   self-approval is blocked; every decision records who, when and through which channel.
 - **ChatOps** — Slack messages with interactive **Approve / Reject** buttons and
@@ -183,8 +188,8 @@ All knobs live in `.env` (see `.env.example` for the full list):
 | `QUERYPROXY_SQLITE_ALLOWED_DIR` | — | Restrict SQLite connection files to this directory |
 | `TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs; empty means no proxy is trusted |
 | `TRUSTED_HOSTS` | — | Extra hostnames this install answers to, beyond `APP_URL`'s host |
-| `QUERYPROXY_EXTRA_UNTRUSTED_LANGUAGES` | — | Extra procedural languages the guard refuses |
-| `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` | — | Extra server variables refused in `SET GLOBAL` |
+| `QUERYPROXY_EXTRA_UNTRUSTED_LANGUAGES` | — | Extra procedural languages the guard refuses in `CREATE EXTENSION` |
+| `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` | — | Extra server variables refused in `SET` (persistent scopes on MySQL/MariaDB, every scope on PostgreSQL) and `set_config` |
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL/PostgreSQL. The queue uses the database driver by default; set
@@ -287,8 +292,8 @@ npm run dev             # Vite dev server
 The `live-pgsql` test group runs the SQL guard against a real PostgreSQL server
 and is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is set;
 [`docker-compose.test.yml`](docker-compose.test.yml) starts a throwaway server
-for it (the variables to set are listed at the top of that file, then
-`./vendor/bin/pest --group=live-pgsql`).
+for it on port `55432` (the variables to set are listed at the top of that
+file, then `./vendor/bin/pest --group=live-pgsql`).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Product requirements and architecture
 decisions live in the project's SSOT repository (PRD / ADR / MVP plan).

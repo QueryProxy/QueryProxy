@@ -4,7 +4,112 @@ All notable changes to QueryProxy are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.2.3] — Unreleased
+
+### Security
+
+- **PostgreSQL `DO` bodies were read with the MySQL lexer.** The guard scanned
+  a `DO` body for blocked functions with MySQL's string rules, so a body such
+  as `PERFORM 'a\', pg_read_file(…) --` hid the call inside what the lexer took
+  for a string, while PostgreSQL ran it. Block and routine bodies (`DO`,
+  `CREATE FUNCTION`, `CREATE PROCEDURE`) are now read with PostgreSQL's lexical
+  rules (comments, `'…'`, `E'…'`, `U&'…'`, quoted identifiers, nested
+  dollar-quoted strings) and go through the same blocked-function and
+  guarded-setting rules as top-level SQL. **Behaviour change:** the following
+  are now rejected.
+  - Dynamic SQL (`EXECUTE`) inside a `DO` body or a function or procedure body,
+    trigger functions included: the statement it runs is built at run time and
+    cannot be inspected. Trigger `EXECUTE FUNCTION|PROCEDURE` clauses are not
+    affected.
+  - Any language other than `plpgsql` and `sql` for `DO`, `CREATE FUNCTION` and
+    `CREATE PROCEDURE`. A quoted language name keeps its case, so
+    `LANGUAGE "PLPGSQL"` is refused. `CREATE LANGUAGE` and
+    `ALTER LANGUAGE … RENAME` are refused too.
+  - `BEGIN ATOMIC` bodies, and `CREATE FUNCTION` / `CREATE PROCEDURE` without
+    a body.
+  - `query_to_xml*`, `ts_stat`, `ts_rewrite`, `crosstab*` and `connectby`
+    join the blocked functions: they run SQL passed to them as a string.
+  - A `SET` clause on a routine (`CREATE/ALTER FUNCTION|PROCEDURE … SET`), a
+    database (`ALTER DATABASE … SET`) or a role (`ALTER ROLE|USER … SET`) now
+    goes through the guarded-setting rule; one whose setting cannot be resolved
+    is rejected.
+- **`sql_mode` could change how the guard's lexer and the server read quotes.**
+  `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES` change what a backslash and a double
+  quote mean, so the guard could approve SQL the server then reads differently.
+  `sql_mode` is now a guarded variable in every scope and on every driver:
+  `SET sql_mode`, `SET SESSION sql_mode`, `SET @@sql_mode`, the `@@SESSION.` /
+  `@@GLOBAL.` forms, a version comment around them and `set_config('sql_mode',
+  …)` are refused. Reading it (`SELECT @@sql_mode`) is unaffected. On `mysql`
+  and `mariadb` the executor also reads `@@SESSION.sql_mode` before running the
+  SQL and fails the request, without running anything, when it contains
+  `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES`. Today QueryProxy sets a strict
+  `sql_mode` on every connection it opens (Laravel's `strict` option), which
+  replaces the server's default, so the check only fires if that setting
+  changes or something in between alters the mode; a connection that does end
+  up with either flag is refused until the flag is removed. The `/*M!`
+  behaviour on the `mysql` driver is unchanged and now pinned by a regression
+  test.
+- **Three `SET` spellings were not judged.** `SET GLOBAL general_log := 1`
+  (a space before `:=`) read as a label and passed the dangerous-variable list;
+  `SET @@general_log = 1` (no scope) was not judged at all; and in MariaDB
+  `SET STATEMENT … FOR <statement>` the statement after `FOR` skipped every
+  rule, so `SET STATEMENT max_statement_time=1 FOR DELETE FROM t` ran without
+  a `WHERE` check. All three are now judged. The statement after `FOR` goes
+  through the same rules as a top-level one (type, denylist, `WHERE`, `LIMIT`,
+  nesting depth); `SET STATEMENT` without a statement after `FOR` is rejected.
+  **Behaviour change:** `SET @@<name>` is read as a session variable on every
+  driver, so on PostgreSQL (and when the target database is unknown)
+  `SET @@general_log = 1` is now refused.
+
+### Fixed
+
+- **A write refused by a read-only session was silently run again.** Laravel
+  counts PostgreSQL SQLSTATE `25006` and MySQL/MariaDB's `--read-only` error as
+  a lost connection, so outside a transaction it reconnected and re-ran the
+  write on a fresh, writable session. The lost-connection detector now reports
+  read-only errors as not lost and defers everything else to the framework's
+  detector. **Trade-off:** after a MySQL/Aurora failover that leaves a
+  connection on a read-only node, or on a PostgreSQL hot standby, the request
+  fails with the database's error instead of being retried on a new connection;
+  a queue worker that lands there no longer stops itself on `25006` either, so
+  restart workers after such a failover.
+- **Large SQL took seconds and hundreds of megabytes to inspect.** The guard
+  lexed the same SQL several times per inspection, kept lexer errors with their
+  backtraces and re-scanned its lexical ranges linearly. Each SQL text is now
+  lexed once per inspection, dialect ranges are kept sorted and binary-searched,
+  and the parser no longer leaves a cycle of garbage behind each request. On
+  the worst 64 KiB SQLite input that was tried (`[a],` repeated) inspection
+  went from 15.9 s and 589M of peak memory to 0.69 s and 21.5M, measured on a
+  development machine under load; the verdicts do not change. New tests pin
+  the lex count, the memory peak and a time bound relative to a bare lexer pass.
+
+### Changed
+
+- **CI and the live test setup.** `ci.yml` runs with a read-only `contents`
+  token and checks out without persisting credentials, as `live-pgsql.yml`
+  already did. PostgreSQL for the `live-pgsql` group (the workflow's service
+  and `docker-compose.test.yml`) is initialised with `--auth-host=scram-sha-256`,
+  because the image trusts loopback otherwise and the `dblink_exec` test never
+  sent the password it is meant to prove it passes. The `dblink_exec` test now
+  passes `host`, `port` and `password` in an escaped connection string
+  (`QUERYPROXY_LIVE_PGSQL_SERVER_HOST` / `_SERVER_PORT` override the address the
+  server sees itself at). The compose file listens on `55432` inside the
+  container as well, so the documented command no longer needs
+  `QUERYPROXY_LIVE_PGSQL_SERVER_PORT`, and keeps its data directory on tmpfs so
+  every container starts from a fresh `initdb`. **If you run the compose
+  example locally, recreate the container once**
+  (`docker compose -f docker-compose.test.yml down`, then `up -d --wait`).
+
+### Notes
+
+- PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
+  classified as a write and always go through human approval. Dynamic SQL
+  inside them is now refused, but a plainly written `DELETE` without `WHERE`
+  in a `DO` body still passes the guard.
+- Not covered yet: DML against system catalogs (`UPDATE pg_language`,
+  `UPDATE pg_proc SET prosrc …`; these need a superuser) and `ALTER SYSTEM SET`.
+  Multibyte character sets that change backslash handling (`SET NAMES big5`,
+  `sjis`, `gbk`) are not checked either.
 
 ## [0.2.2] — 2026-10-03
 
@@ -399,7 +504,7 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.2...HEAD
+[0.2.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.2...HEAD
 [0.2.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.2
 [0.2.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.1
 [0.2.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.0
