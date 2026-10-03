@@ -433,6 +433,17 @@ class SqlInspector
 
     private const UNREADABLE_SQL_VIOLATION = 'QueryProxy could not read this SQL: the lexer found no statement in text that is not empty.';
 
+    private const UNICODE_WHITESPACE_VIOLATION = 'SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.';
+
+    /**
+     * Characters the lexer reads as part of a name (never as whitespace)
+     * while a server may treat them as a separator: the byte-order mark /
+     * zero-width no-break space and the Unicode space and line / paragraph
+     * separators. "\u{FEFF}DROP DATABASE prod" is a single unknown word to
+     * the lexer, so the guard sees no DROP at all.
+     */
+    private const UNICODE_WHITESPACE_PATTERN = '/[\x{FEFF}\x{0085}\x{00A0}\x{1680}\x{180E}\x{2000}-\x{200B}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]/u';
+
     private const FORBIDDEN_PATTERNS = [
         '/^DROP\s+(DATABASE|SCHEMA)\b/i' => 'DROP DATABASE is not allowed through QueryProxy.',
         '/^GRANT\b/i' => 'GRANT statements are not allowed through QueryProxy.',
@@ -556,7 +567,11 @@ class SqlInspector
             $lexicalViolation = $this->dialectLexicalViolation($sql, $dialectRanges, $driver);
         }
 
-        $lexicalViolation ??= $this->unreadableTextViolation($sql, (new Lexer($sql))->list->tokens);
+        if ($lexicalViolation === null) {
+            $tokens = (new Lexer($sql))->list->tokens;
+            $lexicalViolation = $this->unicodeWhitespaceViolation($sql, $driver, $dialectRanges, $tokens)
+                ?? $this->unreadableTextViolation($sql, $tokens);
+        }
 
         return [$sql, $lexicalViolation];
     }
@@ -593,6 +608,100 @@ class SqlInspector
         $trimmed = trim($sql);
 
         return $trimmed === '' || $this->isCommentOnly($trimmed) ? null : self::UNREADABLE_SQL_VIOLATION;
+    }
+
+    /**
+     * Refuse a byte-order mark or Unicode whitespace character (see
+     * UNICODE_WHITESPACE_PATTERN) anywhere outside a string literal, a quoted
+     * identifier or a comment. Fail-closed: the lexer glues such a character
+     * to the words around it, so a server that reads it as a separator would
+     * run keywords the guard never saw. Inside a name it is refused too.
+     *
+     * On SQL Server and SQLite the strings, quoted and bracketed names and
+     * comments are those the server's own rules locate ($dialectRanges,
+     * character positions); elsewhere they are the lexer's string, quoted
+     * symbol and comment tokens, plus the dollar-quoted strings on
+     * PostgreSQL (and an unknown driver), which the lexer does not know. The
+     * body of a MySQL executable comment is tokenized by the lexer, so it is
+     * checked like any other text.
+     *
+     * Both the matches and the opaque ranges are walked once in order, so
+     * the check stays linear in the length of the SQL however many matches
+     * and ranges it holds.
+     *
+     * @param  ?array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}  $dialectRanges
+     * @param  array<int, Token>  $tokens  the lexer's tokens for $sql
+     */
+    private function unicodeWhitespaceViolation(string $sql, ?DbDriver $driver, ?array $dialectRanges, array $tokens): ?string
+    {
+        if (! preg_match_all(self::UNICODE_WHITESPACE_PATTERN, $sql, $matches, PREG_OFFSET_CAPTURE)) {
+            return null;
+        }
+
+        $positions = array_column($matches[0], 1);
+
+        if ($dialectRanges !== null) {
+            // The dialect ranges count characters; the matches count bytes.
+            // The offsets ascend, so each one is converted from the last.
+            $byteOffset = 0;
+            $charOffset = 0;
+
+            foreach ($positions as $index => $position) {
+                $charOffset += mb_strlen(substr($sql, $byteOffset, $position - $byteOffset), 'UTF-8');
+                $byteOffset = $position;
+                $positions[$index] = $charOffset;
+            }
+
+            $opaque = array_merge($dialectRanges['quoted'], $dialectRanges['comments'], $dialectRanges['brackets']);
+
+            return $this->allWithinRanges($positions, $opaque) ? null : self::UNICODE_WHITESPACE_VIOLATION;
+        }
+
+        $opaque = $driver === null || $driver === DbDriver::Pgsql ? $this->dollarQuotedRanges($sql) : [];
+
+        foreach ($this->tokensWithByteOffsets($sql, $tokens) as [$token, $offset]) {
+            $text = (string) $token->token;
+            $isQuotedName = $token->type === TokenType::Symbol
+                && (str_starts_with($text, '`') || str_starts_with($text, '"'));
+
+            if ($token->type === TokenType::String || $token->type === TokenType::Comment || $isQuotedName) {
+                $opaque[] = [$offset, $offset + strlen($text)];
+            }
+        }
+
+        return $this->allWithinRanges($positions, $opaque) ? null : self::UNICODE_WHITESPACE_VIOLATION;
+    }
+
+    /**
+     * True when every position falls inside one of the half-open ranges.
+     * The ranges may arrive unordered and may overlap; they are sorted once
+     * and then walked alongside the ascending positions.
+     *
+     * @param  list<int>  $positions  ascending
+     * @param  list<array{0: int, 1: int}>  $ranges
+     */
+    private function allWithinRanges(array $positions, array $ranges): bool
+    {
+        usort($ranges, fn (array $a, array $b): int => $a[0] <=> $b[0]);
+
+        $count = count($ranges);
+        $index = 0;
+        $reach = PHP_INT_MIN;
+
+        foreach ($positions as $position) {
+            // $reach is the furthest end among the ranges starting at or
+            // before $position, so overlapping ranges need no merge step.
+            while ($index < $count && $ranges[$index][0] <= $position) {
+                $reach = max($reach, $ranges[$index][1]);
+                $index++;
+            }
+
+            if ($position >= $reach) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -5663,11 +5772,12 @@ class SqlInspector
      * pass. The token texts add up to the SQL, so the offsets are summed;
      * should they ever not, each one is converted from the lexer position.
      *
+     * @param  ?array<int, Token>  $tokens  the lexer's tokens for $sql, when already at hand
      * @return list<array{0: Token, 1: int}>
      */
-    private function tokensWithByteOffsets(string $sql): array
+    private function tokensWithByteOffsets(string $sql, ?array $tokens = null): array
     {
-        $tokens = array_values((new Lexer($sql))->list->tokens);
+        $tokens = array_values($tokens ?? (new Lexer($sql))->list->tokens);
         $withOffsets = [];
         $offset = 0;
 

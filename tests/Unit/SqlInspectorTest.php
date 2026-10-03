@@ -2131,3 +2131,119 @@ test('TRUE and FALSE compared or tested stay constants outside SQL Server', func
         ->and(inspect('DELETE FROM t WHERE true = true', DbDriver::Mysql)->violations)
         ->toContain('Statement 1: DELETE with an always-true WHERE clause is not allowed.');
 });
+
+dataset('unicode whitespace bypasses', [
+    'byte-order mark before DROP' => ["\u{FEFF}DROP DATABASE prod"],
+    'no-break space between DELETE and FROM' => ["DELETE\u{00A0}FROM t"],
+    'ideographic space before WHERE' => ["UPDATE t SET a=1\u{3000}WHERE id=1"],
+    'no-break space in a name' => ["SELECT a\u{00A0}b FROM t"],
+]);
+
+dataset('unicode whitespace characters', [
+    'U+FEFF' => ["\u{FEFF}"],
+    'U+0085' => ["\u{0085}"],
+    'U+00A0' => ["\u{00A0}"],
+    'U+1680' => ["\u{1680}"],
+    'U+180E' => ["\u{180E}"],
+    'U+2000' => ["\u{2000}"],
+    'U+2001' => ["\u{2001}"],
+    'U+2002' => ["\u{2002}"],
+    'U+2003' => ["\u{2003}"],
+    'U+2004' => ["\u{2004}"],
+    'U+2005' => ["\u{2005}"],
+    'U+2006' => ["\u{2006}"],
+    'U+2007' => ["\u{2007}"],
+    'U+2008' => ["\u{2008}"],
+    'U+2009' => ["\u{2009}"],
+    'U+200A' => ["\u{200A}"],
+    'U+200B' => ["\u{200B}"],
+    'U+2028' => ["\u{2028}"],
+    'U+2029' => ["\u{2029}"],
+    'U+202F' => ["\u{202F}"],
+    'U+205F' => ["\u{205F}"],
+    'U+3000' => ["\u{3000}"],
+]);
+
+test('a byte-order mark or Unicode whitespace outside strings and comments is rejected', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toBe(['SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.']);
+})->with('unicode whitespace bypasses')->with('every driver');
+
+test('every Unicode whitespace character between tokens is rejected', function (string $char, ?DbDriver $driver) {
+    $result = inspect("DELETE{$char}FROM t", $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toBe(['SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.']);
+})->with('unicode whitespace characters')->with('every driver');
+
+test('Unicode whitespace inside strings and comments stays a read', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'string literal' => ["SELECT '\u{FEFF}a\u{00A0}b' AS x"],
+    'block comment' => ["SELECT 1 /* \u{FEFF}\u{3000} */"],
+    'line comment' => ["SELECT 1 -- \u{2028}\u{00A0}\n"],
+])->with('every driver');
+
+test('Unicode whitespace inside a quoted name stays a read', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'double-quoted name on pgsql' => ["SELECT 1 AS \"a\u{00A0}b\"", DbDriver::Pgsql],
+    'backtick name on mysql' => ["SELECT 1 AS `a\u{00A0}b`", DbDriver::Mysql],
+    'backtick name on mariadb' => ["SELECT 1 AS `a\u{FEFF}b`", DbDriver::Mariadb],
+    'bracketed name on sqlsrv' => ["SELECT 1 AS [a\u{00A0}b]", DbDriver::Sqlsrv],
+    'bracketed name on sqlite' => ["SELECT 1 AS [a\u{3000}b]", DbDriver::Sqlite],
+    'dollar-quoted string on pgsql' => ["SELECT \$\$a\u{00A0}b\$\$ AS x", DbDriver::Pgsql],
+    'dollar-quoted string overlapping a lexer string on pgsql' => ["SELECT \$\$ 'a' b\u{00A0}c \$\$ AS x", DbDriver::Pgsql],
+]);
+
+test('Unicode whitespace after a multibyte literal is placed by character, not by byte', function (DbDriver $driver, string $quotedName) {
+    $prefix = "SELECT '\u{1F642}\u{1F642}\u{1F642}\u{1F642}' AS x, ";
+
+    $passing = inspect($prefix.'1 AS '.$quotedName, $driver);
+    $rejected = inspect($prefix."1 AS y\u{00A0}", $driver);
+
+    expect($passing->violations)->toBe([])
+        ->and($passing->type())->toBe(StatementType::Read)
+        ->and($rejected->violations)
+        ->toBe(['SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.']);
+})->with([
+    'sqlsrv' => [DbDriver::Sqlsrv, "[a\u{00A0}b]"],
+    'sqlite' => [DbDriver::Sqlite, "[a\u{00A0}b]"],
+    'pgsql' => [DbDriver::Pgsql, "\"a\u{00A0}b\""],
+    'mysql' => [DbDriver::Mysql, "`a\u{00A0}b`"],
+]);
+
+test('Unicode whitespace between many opaque ranges is still found', function (?DbDriver $driver) {
+    $literals = implode(', ', array_fill(0, 200, "'\u{00A0}'"));
+
+    expect(inspect("SELECT {$literals}", $driver)->violations)->toBe([])
+        ->and(inspect("SELECT {$literals}, 1\u{00A0}, {$literals}", $driver)->violations)
+        ->toBe(['SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.']);
+})->with('every driver');
+
+test('Unicode whitespace in the body of a MySQL executable comment is rejected', function (DbDriver $driver) {
+    expect(inspect("SELECT 1 /*!50000 \u{FEFF}x */", $driver)->violations)
+        ->toBe(['SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.']);
+})->with([
+    'mysql' => [DbDriver::Mysql],
+    'mariadb' => [DbDriver::Mariadb],
+]);
+
+test('Unicode whitespace in a string that a dynamic-SQL command runs is rejected', function (DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toContain('Statement 1: SQL must not contain Unicode whitespace or byte-order marks outside string literals, quoted identifiers and comments.');
+})->with([
+    'mysql, EXECUTE IMMEDIATE' => [DbDriver::Mysql, "EXECUTE IMMEDIATE 'DELETE\u{00A0}FROM t'"],
+    'mariadb, EXECUTE IMMEDIATE' => [DbDriver::Mariadb, "EXECUTE IMMEDIATE 'DELETE\u{00A0}FROM t'"],
+    'sqlsrv, EXEC of a string' => [DbDriver::Sqlsrv, "EXEC('DELETE\u{00A0}FROM t')"],
+]);
