@@ -6,7 +6,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.2] — YYYY-MM-DD
+## [0.2.2] — 2026-10-03
 
 ### Security
 
@@ -399,7 +399,9 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.2
+[0.2.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.1
 [0.2.0]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.0
 [0.1.3]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.3
 [0.1.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.1.2
