@@ -14,6 +14,7 @@ use PhpMyAdmin\SqlParser\Statements\SelectStatement;
 use PhpMyAdmin\SqlParser\Statements\ShowStatement;
 use PhpMyAdmin\SqlParser\Statements\UpdateStatement;
 use PhpMyAdmin\SqlParser\Token;
+use PhpMyAdmin\SqlParser\TokensList;
 use PhpMyAdmin\SqlParser\TokenType;
 
 /**
@@ -502,6 +503,21 @@ class SqlInspector
 
     public function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
     {
+        $this->inspectDepth++;
+
+        try {
+            return $this->inspectRequest($sql, $driver);
+        } finally {
+            if (--$this->inspectDepth === 0) {
+                $this->lexedTokens = [];
+                $this->byteOffsetsSql = null;
+                $this->byteOffsets = null;
+            }
+        }
+    }
+
+    private function inspectRequest(string $sql, ?DbDriver $driver): InspectionResult
+    {
         [$sql, $lexicalViolation] = $this->lexicalView($sql, $driver);
 
         if ($lexicalViolation !== null) {
@@ -608,7 +624,7 @@ class SqlInspector
         }
 
         if ($lexicalViolation === null) {
-            $tokens = (new Lexer($sql))->list->tokens;
+            $tokens = $this->lexTokens($sql);
             $lexicalViolation = $this->unicodeWhitespaceViolation($sql, $driver, $dialectRanges, $tokens)
                 ?? $this->unreadableTextViolation($sql, $tokens);
         }
@@ -764,8 +780,8 @@ class SqlInspector
      */
     public function splitStatements(string $sql): array
     {
-        $lexer = new Lexer($sql);
-        $unreadable = $this->unreadableTextViolation($sql, $lexer->list->tokens);
+        $tokens = $this->lexTokens($sql);
+        $unreadable = $this->unreadableTextViolation($sql, $tokens);
 
         if ($unreadable !== null) {
             throw new InvalidArgumentException($unreadable);
@@ -776,7 +792,7 @@ class SqlInspector
         $segments = [];
         $start = 0;
 
-        foreach ($lexer->list->tokens as $token) {
+        foreach ($tokens as $token) {
             if ($token->type === TokenType::Delimiter && $token->token !== '' && $token->position !== null) {
                 // The dollar-quoted ranges and substr() count bytes.
                 $offset = $this->tokenByteOffset($sql, $token->position);
@@ -820,7 +836,7 @@ class SqlInspector
      */
     private function normalize(string $sql, bool $maskDollarQuoted = true): string
     {
-        $tokens = (new Lexer($maskDollarQuoted ? $this->maskDollarQuoted($sql) : $sql))->list->tokens;
+        $tokens = $this->lexTokens($maskDollarQuoted ? $this->maskDollarQuoted($sql) : $sql);
         $normalized = '';
 
         foreach ($tokens as $token) {
@@ -991,9 +1007,26 @@ class SqlInspector
             }
         }
 
-        $parser = new Parser($sql);
+        // Only whether the parser reported an error is read, so it keeps the
+        // first one: every later error would otherwise carry its own
+        // exception and backtrace, hundreds of megabytes on a maximum-size
+        // statement the parser stumbles over token after token.
+        $parser = new class(new TokensList($this->lexTokens($sql))) extends Parser
+        {
+            public function error(string $msg, ?Token $token = null, int $code = 0): void
+            {
+                if ($this->errors === []) {
+                    parent::error($msg, $token, $code);
+                }
+            }
+        };
         $statement = $parser->statements[0] ?? null;
         $parsed = $statement !== null && $parser->errors === [];
+
+        // The kept exception's backtrace references the parser and through
+        // it every token: dropping it lets the parse tree be freed when this
+        // method returns instead of lingering as cyclic garbage.
+        $parser->errors = [];
 
         $type = $this->classify($statement, $keyword, $sql, $parsed);
         $isDdl = in_array($keyword, self::DDL_KEYWORDS, true);
@@ -1084,6 +1117,28 @@ class SqlInspector
      * Tokens the constant evaluator has visited for the current WHERE clause.
      */
     private int $constantEvaluationSteps = 0;
+
+    /**
+     * The lexer's tokens for each piece of SQL text read during the current
+     * inspect() call, keyed by that text (see lexTokens()), and how deeply
+     * inspect() is nested.
+     *
+     * @var array<string, list<Token>>
+     */
+    private array $lexedTokens = [];
+
+    private int $inspectDepth = 0;
+
+    /**
+     * The SQL whose character byte offsets tokenByteOffset() last worked out,
+     * and those offsets (see characterByteOffsets()).
+     */
+    private ?string $byteOffsetsSql = null;
+
+    /**
+     * @var list<int>|false|null
+     */
+    private array|false|null $byteOffsets = null;
 
     /**
      * Whether the WHERE clause of an UPDATE / DELETE is statically always
@@ -1841,7 +1896,7 @@ class SqlInspector
 
         $tokens = [];
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if ($token->position !== null
                 && ! in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
                 $tokens[] = $token;
@@ -1868,7 +1923,7 @@ class SqlInspector
                 continue;
             }
 
-            $bracketed = $this->isWithinRange($position, $ranges['brackets']);
+            $bracketed = $this->isWithinSortedRanges($position, $ranges['brackets']);
             $isWord = ! $bracketed && $this->isWordAt($tokens, $index, $this->firstWord($token));
             $words = $isWord ? $this->tokenWords($token) : [];
             $word = $words[0] ?? '';
@@ -2087,7 +2142,7 @@ class SqlInspector
                     // GOTO takes exactly one label name.
                     if ($next === null || $nextWord === '' || in_array($nextWord, self::SQLSRV_STATEMENT_KEYWORDS, true)
                         || ! $this->isWordAt($tokens, $index + 1, $nextWord)
-                        || $this->isWithinRange((int) $next->position, $ranges['brackets'])) {
+                        || $this->isWithinSortedRanges((int) $next->position, $ranges['brackets'])) {
                         return $this->sqlsrvUnexpectedToken($next ?? $token);
                     }
 
@@ -2476,16 +2531,16 @@ class SqlInspector
         $token = $tokens[$index];
         $position = (int) $token->position;
 
-        foreach ($ranges['brackets'] as [$start, $end]) {
-            if ($position >= $start && $position < $end) {
-                $nextIndex = $index + 1;
+        [$start, $end] = $ranges['brackets'][$this->firstRangeEndingAfter($ranges['brackets'], $position)] ?? [-1, -1];
 
-                while (isset($tokens[$nextIndex]) && (int) $tokens[$nextIndex]->position < $end) {
-                    $nextIndex++;
-                }
+        if ($position >= $start && $position < $end) {
+            $nextIndex = $index + 1;
 
-                return [$this->sqlsrvExpressionStep($expression, 'name', '', '', $this->sqlsrvIsCallable($tokens, $nextIndex)), -1, $end];
+            while (isset($tokens[$nextIndex]) && (int) $tokens[$nextIndex]->position < $end) {
+                $nextIndex++;
             }
+
+            return [$this->sqlsrvExpressionStep($expression, 'name', '', '', $this->sqlsrvIsCallable($tokens, $nextIndex)), -1, $end];
         }
 
         $next = $tokens[$index + 1] ?? null;
@@ -3548,7 +3603,7 @@ class SqlInspector
     {
         $tokens = [];
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if (! in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
                 $tokens[] = $token;
             }
@@ -3680,7 +3735,7 @@ class SqlInspector
     {
         $tokens = [];
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if (! in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
                 $tokens[] = $token;
             }
@@ -4219,7 +4274,7 @@ class SqlInspector
         $defaultLimit = (int) config('queryproxy.select_default_limit', 1000);
         $hardLimit = (int) config('queryproxy.select_hard_limit', 10000);
 
-        $tokens = (new Lexer($sql))->list->tokens;
+        $tokens = $this->lexTokens($sql);
 
         $depth = 0;
         $limitIndex = null;
@@ -6245,7 +6300,7 @@ class SqlInspector
     {
         $tokens = [];
 
-        foreach ((new Lexer($this->maskDollarQuoted($sql)))->list->tokens as $token) {
+        foreach ($this->lexTokens($this->maskDollarQuoted($sql)) as $token) {
             if (in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
                 continue;
             }
@@ -6627,7 +6682,7 @@ class SqlInspector
     {
         $depth = 0;
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if ($token->type !== TokenType::Comment) {
                 continue;
             }
@@ -6876,7 +6931,7 @@ class SqlInspector
      */
     private function tokensWithByteOffsets(string $sql, ?array $tokens = null): array
     {
-        $tokens = array_values($tokens ?? (new Lexer($sql))->list->tokens);
+        $tokens = array_values($tokens ?? $this->lexTokens($sql));
         $withOffsets = [];
         $offset = 0;
 
@@ -6911,7 +6966,7 @@ class SqlInspector
             return null;
         }
 
-        $tokens = (new Lexer($sql))->list->tokens;
+        $tokens = $this->lexTokens($sql);
         $dialect = $driver === DbDriver::Sqlite ? 'SQLite' : 'SQL Server';
 
         foreach ($tokens as $index => $token) {
@@ -7001,9 +7056,10 @@ class SqlInspector
 
         $chars = mb_str_split($sql);
         $opaque = array_merge($ranges['quoted'], $ranges['comments']);
+        usort($opaque, fn (array $a, array $b): int => $a[0] <=> $b[0]);
 
         foreach ($chars as $position => $char) {
-            if ($char === '#' && ! $this->isWithinRange($position, $opaque)) {
+            if ($char === '#' && ! $this->isWithinSortedRanges($position, $opaque)) {
                 $chars[$position] = self::TEMPORARY_TABLE_SENTINEL;
             }
         }
@@ -7028,6 +7084,10 @@ class SqlInspector
      * Null when any of them is never closed, or when a line comment holds a
      * carriage return that is not part of a CR LF pair (where the comment
      * ends is then not certain).
+     *
+     * Each list holds disjoint ranges ordered by their start, and callers
+     * binary-search them (isWithinSortedRanges, firstRangeEndingAfter), so
+     * any change here must keep that order.
      *
      * @return array{quoted: list<array{0: int, 1: int}>, comments: list<array{0: int, 1: int}>, brackets: list<array{0: int, 1: int}>}|null
      */
@@ -7157,18 +7217,28 @@ class SqlInspector
         $violation = "QueryProxy reads a string, quoted name or comment in this SQL differently from {$dialect} (a backslash escape, a backtick, or a quote inside a [bracketed] name), so it cannot inspect it safely.";
 
         $serverRanges = [];
+        $chars = $ranges['comments'] === [] ? [] : mb_str_split($sql);
 
         foreach (['quoted', 'comments', 'brackets'] as $kind) {
             foreach ($ranges[$kind] as [$start, $end]) {
                 if ($kind === 'comments') {
-                    $end = $start + mb_strlen(rtrim(mb_substr($sql, $start, $end - $start)));
+                    // rtrim()'s whitespace is all single-byte, so trimming
+                    // characters off the end trims the same text.
+                    while ($end > $start && str_contains(" \t\n\r\0\x0B", $chars[$end - 1])) {
+                        $end--;
+                    }
                 }
 
                 $serverRanges[] = [$start, $end, $kind];
             }
         }
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        // The server ranges never overlap, so ordered by start they are
+        // ordered by end too, and a token's overlapping ranges are one run.
+        usort($serverRanges, fn (array $a, array $b): int => $a[0] <=> $b[0]);
+        $rangeCount = count($serverRanges);
+
+        foreach ($this->lexTokens($sql) as $token) {
             $text = (string) $token->token;
 
             if ($token->position === null || $text === '') {
@@ -7181,9 +7251,11 @@ class SqlInspector
             $isQuoted = $token->type === TokenType::String || strpbrk($text, '\'"`') !== false;
             $matched = false;
 
-            foreach ($serverRanges as [$rangeStart, $rangeEnd, $kind]) {
-                if ($start >= $rangeEnd || $end <= $rangeStart) {
-                    continue;
+            for ($index = $this->firstRangeEndingAfter($serverRanges, $start); $index < $rangeCount; $index++) {
+                [$rangeStart, $rangeEnd, $kind] = $serverRanges[$index];
+
+                if ($end <= $rangeStart) {
+                    break;
                 }
 
                 if ($start === $rangeStart && $end === $rangeEnd
@@ -7352,7 +7424,7 @@ class SqlInspector
      */
     private function hasUnterminatedBlockComment(string $sql): bool
     {
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if ($token->type !== TokenType::Comment || ! str_starts_with($token->token, '/*')) {
                 continue;
             }
@@ -7525,7 +7597,7 @@ class SqlInspector
     {
         $ranges = [];
 
-        foreach ((new Lexer($sql))->list->tokens as $token) {
+        foreach ($this->lexTokens($sql) as $token) {
             if ($token->type !== TokenType::Comment || $token->position === null || str_starts_with($token->token, '#')) {
                 continue;
             }
@@ -7566,6 +7638,41 @@ class SqlInspector
     }
 
     /**
+     * The lexer's tokens for $sql. Within an inspect() call the same text is
+     * read by many checks, so its tokens are worked out once and shared; the
+     * lexer is a pure function of the text and no check modifies a token.
+     *
+     * @return list<Token>
+     */
+    private function lexTokens(string $sql): array
+    {
+        if ($this->inspectDepth === 0) {
+            return $this->lex($sql);
+        }
+
+        return $this->lexedTokens[$sql] ??= $this->lex($sql);
+    }
+
+    /**
+     * Runs the lexer on $sql. No check reads the lexer's errors, so they are
+     * not kept: each one would otherwise carry its own exception and
+     * backtrace, hundreds of megabytes on a maximum-size request the lexer
+     * stumbles over character after character (an unclosed "[", say).
+     * Protected only so that a test can count the lexer passes.
+     *
+     * @return list<Token>
+     */
+    protected function lex(string $sql): array
+    {
+        $lexer = new class($sql) extends Lexer
+        {
+            public function error(string $msg, string $str = '', int $pos = 0, int $code = 0): void {}
+        };
+
+        return $lexer->list->tokens;
+    }
+
+    /**
      * Turn a lexer token position into a byte offset into the same SQL.
      *
      * The lexer reads multibyte SQL as a UtfString, so its token positions
@@ -7577,11 +7684,51 @@ class SqlInspector
     {
         $position = (int) $position;
 
-        if (strlen($sql) === mb_strlen($sql, 'UTF-8')) {
+        if ($this->byteOffsetsSql !== $sql) {
+            $this->byteOffsetsSql = $sql;
+            $this->byteOffsets = $this->characterByteOffsets($sql);
+        }
+
+        if ($this->byteOffsets === null) {
             return $position;
         }
 
-        return strlen(mb_substr($sql, 0, $position, 'UTF-8'));
+        if ($position < 0 || $this->byteOffsets === false) {
+            return strlen(mb_substr($sql, 0, $position, 'UTF-8'));
+        }
+
+        return $this->byteOffsets[$position] ?? strlen($sql);
+    }
+
+    /**
+     * The byte offset of every character of $sql, and the byte length after
+     * the last one: null when every character is one byte (the offsets are
+     * the positions themselves), false when $sql is not valid UTF-8 (the
+     * offsets are then left to mb_substr()).
+     *
+     * @return list<int>|false|null
+     */
+    private function characterByteOffsets(string $sql): array|false|null
+    {
+        if (strlen($sql) === mb_strlen($sql, 'UTF-8')) {
+            return null;
+        }
+
+        if (! mb_check_encoding($sql, 'UTF-8')) {
+            return false;
+        }
+
+        $offsets = [];
+        $offset = 0;
+
+        foreach (mb_str_split($sql, 1, 'UTF-8') as $char) {
+            $offsets[] = $offset;
+            $offset += strlen($char);
+        }
+
+        $offsets[] = $offset;
+
+        return $offsets;
     }
 
     /**
@@ -7599,13 +7746,51 @@ class SqlInspector
     }
 
     /**
+     * isWithinRange() for ranges that do not overlap and are ordered by
+     * start, in logarithmic time.
+     *
+     * @param  list<array{0: int, 1: int}>  $ranges
+     */
+    private function isWithinSortedRanges(int $position, array $ranges): bool
+    {
+        $index = $this->firstRangeEndingAfter($ranges, $position);
+
+        return $index < count($ranges) && $ranges[$index][0] <= $position;
+    }
+
+    /**
+     * The index of the first range that ends after $position (count($ranges)
+     * when none does), found by binary search: the ranges must not overlap
+     * and must be ordered by start, so their ends are ordered too.
+     *
+     * @param  list<array{0: int, 1: int, 2?: string}>  $ranges
+     */
+    private function firstRangeEndingAfter(array $ranges, int $position): int
+    {
+        $low = 0;
+        $high = count($ranges);
+
+        while ($low < $high) {
+            $middle = intdiv($low + $high, 2);
+
+            if ($ranges[$middle][1] <= $position) {
+                $low = $middle + 1;
+            } else {
+                $high = $middle;
+            }
+        }
+
+        return $low;
+    }
+
+    /**
      * True when a data-modifying keyword appears anywhere in the statement,
      * at any nesting depth — CTE bodies are always parenthesised, so a
      * depth-0-only scan would miss WITH x AS (INSERT ...) entirely.
      */
     private function hasWriteKeyword(string $sql): bool
     {
-        $tokens = (new Lexer($sql))->list->tokens;
+        $tokens = $this->lexTokens($sql);
 
         foreach ($tokens as $token) {
             if (in_array($token->type, [TokenType::Whitespace, TokenType::Comment, TokenType::String], true)) {

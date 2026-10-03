@@ -2621,6 +2621,152 @@ test('many MariaDB executable comments are resolved in linear time', function (s
     'versioned' => '/*M!100000*/',
 ]);
 
+test('a maximum-size SQLite or SQL Server statement full of strings and comments is lexed in linear time', function (DbDriver $driver, string $unit) {
+    // As many server ranges and lexer tokens as the 65535-byte input limit
+    // allows: every token used to be held against every range, so a quarter
+    // of the input took about a sixteenth of the time instead of a quarter.
+    $statement = fn (int $bytes): string => 'SELECT 1 '.str_repeat($unit, intdiv($bytes - 9, strlen($unit)));
+    $passes = true;
+    $elapsed = function (string $sql) use ($driver, &$passes): float {
+        $best = INF;
+
+        // Tens of thousands of short-lived lexer tokens would otherwise trigger
+        // fruitless cycle collections that keep raising the collector's
+        // threshold for the rest of the suite, letting garbage pile up past
+        // memory_limit. Their freed memory is then returned to the
+        // system, so it does not stay fragmented for the tests that follow.
+        gc_disable();
+
+        try {
+            foreach (range(1, 3) as $run) {
+                $start = hrtime(true);
+                $passes = inspect($sql, $driver)->passes() && $passes;
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    $baseline = $elapsed($statement(intdiv(65535, 4)));
+    $maximum = $elapsed($statement(65535));
+
+    expect($passes)->toBeTrue()
+        ->and($maximum)->toBeLessThan($baseline * 8 + 0.5);
+})->with([
+    'sqlite, block comments' => [DbDriver::Sqlite, '/**/'],
+    'sqlite, strings between comments' => [DbDriver::Sqlite, ",''/**/"],
+    'sqlite, multibyte comments' => [DbDriver::Sqlite, '/*é*/'],
+    'sqlsrv, block comments' => [DbDriver::Sqlsrv, '/**/'],
+    'sqlsrv, strings between comments' => [DbDriver::Sqlsrv, ",''/**/"],
+    'sqlsrv, comments holding a temporary table marker' => [DbDriver::Sqlsrv, '/*#*/'],
+]);
+
+test('the byte offsets of a maximum-size SQLite or SQL Server batch of delimiters after multibyte text are measured once', function (DbDriver $driver) {
+    // Every delimiter's character position is turned into a byte offset; with
+    // one multibyte character ahead of them, re-measuring the prefix for each
+    // delimiter made an eighth of the input take about a sixty-fourth of the
+    // time instead of an eighth.
+    $statement = fn (int $bytes): string => 'SELECT 1 /*é*/'.str_repeat(';', $bytes - 15);
+    $passes = true;
+    $elapsed = function (string $sql) use ($driver, &$passes): float {
+        $best = INF;
+
+        // See the linear-time lexing test above.
+        gc_disable();
+
+        try {
+            foreach (range(1, 3) as $run) {
+                $start = hrtime(true);
+                $passes = inspect($sql, $driver)->passes() && $passes;
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    $baseline = $elapsed($statement(intdiv(65535, 8)));
+    $maximum = $elapsed($statement(65535));
+
+    expect($passes)->toBeTrue()
+        ->and($maximum)->toBeLessThan($baseline * 16 + 0.5);
+})->with([
+    'sqlite' => [DbDriver::Sqlite],
+    'sqlsrv' => [DbDriver::Sqlsrv],
+]);
+
+test('a maximum-size SQLite or SQL Server request is lexed about once', function (DbDriver $driver, string $prefix, string $unit, string $suffix) {
+    // Every pipeline step used to run its own lexer over the request, and the
+    // lexer and parser kept an exception with a stack trace for every token
+    // they could not read: a request of "[a]," names took seconds and ran a
+    // SQLite worker out of memory. The tokens are now lexed once per request
+    // text and shared by every step.
+    $sql = $prefix.str_repeat($unit, intdiv(65535 - strlen($prefix) - strlen($suffix), strlen($unit))).$suffix;
+    $inspector = new class extends SqlInspector
+    {
+        /** @var list<string> */
+        public array $lexed = [];
+
+        protected function lex(string $sql): array
+        {
+            $this->lexed[] = $sql;
+
+            return parent::lex($sql);
+        }
+    };
+
+    // See the linear-time lexing test above. The collector stays off for the
+    // whole test as well: tens of thousands of live tokens would otherwise
+    // fill its root buffer to no avail and raise its threshold for every
+    // test that runs after this one.
+    gc_disable();
+
+    try {
+        gc_collect_cycles();
+        memory_reset_peak_usage();
+        $memory = memory_get_usage();
+        $passes = $inspector->inspect($sql, $driver)->passes();
+        $peak = memory_get_peak_usage() - $memory;
+        // Guards the cycle break in analyzeStatement() ("$parser->errors =
+        // []"): the exception the parser keeps for its first error holds a
+        // backtrace through the parser to every token, so without the break
+        // the whole parse tree is left behind as cyclic garbage, which the
+        // collector, its threshold raised by these tokens, would keep long
+        // after the request.
+        $garbage = gc_collect_cycles();
+    } finally {
+        gc_enable();
+        gc_collect_cycles();
+        gc_mem_caches();
+    }
+
+    // Stripping comments or splitting a transaction hands the checks a second
+    // text, which is lexed once in turn: no text may be lexed twice.
+    expect($passes)->toBeTrue()
+        ->and($inspector->lexed)->toHaveCount(count(array_unique($inspector->lexed)))
+        ->and(count($inspector->lexed))->toBeLessThanOrEqual(2)
+        ->and($peak)->toBeLessThan(64 * 1024 * 1024)
+        ->and($garbage)->toBe(0);
+})->with([
+    'sqlite, bracketed names' => [DbDriver::Sqlite, 'SELECT ', '[a],', '1'],
+    'sqlite, line comments' => [DbDriver::Sqlite, 'SELECT 1 ', "--\n", ''],
+    'sqlite, statements in a transaction' => [DbDriver::Sqlite, 'BEGIN;', 'SELECT 1;', 'COMMIT;'],
+    'sqlite, strings, names and comments' => [DbDriver::Sqlite, 'SELECT 1', ",'a',[b]/**/", ''],
+    'sqlsrv, bracketed names' => [DbDriver::Sqlsrv, 'SELECT ', '[a],', '1'],
+    'sqlsrv, line comments' => [DbDriver::Sqlsrv, 'SELECT 1 ', "--\n", ''],
+    'sqlsrv, statements in a transaction' => [DbDriver::Sqlsrv, 'BEGIN;', 'SELECT 1;', 'COMMIT;'],
+    'sqlsrv, strings, names and comments' => [DbDriver::Sqlsrv, 'SELECT 1', ",'a',[b]/**/", ''],
+]);
+
 dataset('invalid utf-8 bypasses', [
     'bad byte in a block comment' => ["DROP DATABASE prod /* \xC3\xA9\xFF */"],
     'bad byte in a string literal' => ["DROP DATABASE prod; SELECT '\xC3\xA9\xFF'"],
