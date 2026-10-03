@@ -21,9 +21,12 @@ use Throwable;
  * A read-only error is a verdict about the statement, not about the
  * connection, so this detector reports it as "not lost" and lets the
  * exception reach the caller. Every other message is left to the framework
- * detector it wraps. The trade-off: a MySQL primary that was demoted to a
- * read-only replica during a failover no longer gets a transparent reconnect;
- * the statement fails instead of being retried.
+ * detector it wraps. The trade-off: a server that turned read-only under an
+ * open connection (a MySQL primary demoted to a replica during a failover, a
+ * PostgreSQL writer that became a hot standby) no longer gets a transparent
+ * reconnect; the statement fails instead of being retried. Long-lived
+ * processes such as queue workers are no longer stopped by that error either,
+ * so they do not recover on their own after a failover and need a restart.
  */
 final class ReadOnlyAwareLostConnectionDetector implements LostConnectionDetector
 {

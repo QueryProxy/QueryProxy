@@ -2,11 +2,15 @@
 
 use App\Database\ReadOnlyAwareLostConnectionDetector;
 use Illuminate\Contracts\Database\LostConnectionDetector;
-use Illuminate\Database\QueryException;
 
-function readOnlyAwareDetectorError(string $message): QueryException
+/**
+ * The framework hands the detector the driver exception, not the
+ * QueryException wrapping it (Connection::tryAgainIfCausedByLostConnection
+ * passes $e->getPrevious()), so the fixture is the bare PDOException.
+ */
+function readOnlyAwareDetectorError(string $message): PDOException
 {
-    return new QueryException('pgsql', 'insert into items (id) values (?)', [6], new PDOException($message));
+    return new PDOException($message);
 }
 
 test('read-only errors are not a lost connection, so Laravel does not retry them', function (string $message) {

@@ -10,7 +10,6 @@ use App\Models\User;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Database\LostConnectionDetector as LostConnectionDetectorContract;
-use Illuminate\Database\LostConnectionDetector;
 use Illuminate\Http\Middleware\TrustProxies;
 use Illuminate\Http\Request;
 use Illuminate\Queue\Events\WorkerStarting;
@@ -38,11 +37,11 @@ class AppServiceProvider extends ServiceProvider
 
     public function register(): void
     {
-        // Replaces the framework's binding (DatabaseServiceProvider registers
-        // first): a read-only error must surface, not trigger a reconnect and
-        // a silent retry of the write on a fresh, writable session.
-        $this->app->singleton(LostConnectionDetectorContract::class, function () {
-            return new ReadOnlyAwareLostConnectionDetector(new LostConnectionDetector);
+        // Wraps whatever detector is bound (the framework's, registered by
+        // DatabaseServiceProvider): a read-only error must surface, not trigger
+        // a reconnect and a silent retry of the write on a fresh, writable session.
+        $this->app->extend(LostConnectionDetectorContract::class, function (LostConnectionDetectorContract $detector) {
+            return new ReadOnlyAwareLostConnectionDetector($detector);
         });
     }
 
