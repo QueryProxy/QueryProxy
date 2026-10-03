@@ -44,9 +44,10 @@ asynchronously on a worker, and results come back **masked, limited and fully au
   - and the ones where a dangerous use shares its syntax with an everyday one are
     judged on the dangerous part, not the keyword: `CREATE EXTENSION` and `DO`
     are refused only for untrusted procedural languages (`plpythonu`, `plperlu`,
-    anything matching the `pl…u` convention), and `SET GLOBAL` / `SET @@GLOBAL` /
-    `SET PERSIST` only for file-path, logging and plugin variables. A `DO` body
-    is scanned for the blocked statements above.
+    anything matching the `pl…u` convention), and `SET` only for file-path,
+    logging, plugin and protection-related variables (persistent scopes on
+    MySQL/MariaDB; every scope on PostgreSQL). A `DO` body is scanned for the
+    blocked statements above.
 - **Approval workflow** — pending requests wait indefinitely until a DBA decides;
   self-approval is blocked; every decision records who, when and through which channel.
 - **ChatOps** — Slack messages with interactive **Approve / Reject** buttons and
@@ -282,6 +283,12 @@ php artisan test        # Pest suite
 ./vendor/bin/pint       # code style
 npm run dev             # Vite dev server
 ```
+
+The `live-pgsql` test group runs the SQL guard against a real PostgreSQL server
+and is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is set;
+[`docker-compose.test.yml`](docker-compose.test.yml) starts a throwaway server
+for it (the variables to set are listed at the top of that file, then
+`./vendor/bin/pest --group=live-pgsql`).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Product requirements and architecture
 decisions live in the project's SSOT repository (PRD / ADR / MVP plan).

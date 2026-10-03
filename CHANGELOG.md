@@ -6,6 +6,115 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] — YYYY-MM-DD
+
+### Security
+
+- **PostgreSQL settings that load code or lift protections were not guarded.**
+  The dangerous-variable list now also names `session_preload_libraries`,
+  `local_preload_libraries`, `dynamic_library_path`,
+  `default_transaction_read_only`, `transaction_read_only`,
+  `session_replication_role`, `allow_system_table_mods`,
+  `lo_compat_privileges`, `zero_damaged_pages` and `ignore_checksum_failure`.
+  **Behaviour change:** on PostgreSQL (and when the target database is
+  unknown) these are refused in every scope: `SET <name>`, `SET LOCAL <name>`,
+  `SET SESSION <name>`, the `TO` spelling and `set_config('<name>', …)`.
+  Before this release no PostgreSQL name was on the list. On MySQL, MariaDB,
+  SQLite and SQL Server the `SET` rule is unchanged (only the persistent scopes
+  `GLOBAL`, `PERSIST` and `PERSIST_ONLY` are judged), while
+  `set_config('<name>', …)` with one of the new names is refused on every driver.
+  Harmless settings such as `work_mem` or `search_path` still pass.
+  `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` still extends the list.
+- **MariaDB `ANALYZE <statement>` ran its statement unchecked.** Like
+  `EXPLAIN ANALYZE`, MariaDB's `ANALYZE [FORMAT = x] <statement>` executes the
+  statement. It is now judged as the statement inside it (type, denylist,
+  `WHERE` rule, `LIMIT`, nesting depth). Only `SELECT`, `WITH`, `INSERT`,
+  `REPLACE`, `UPDATE`, `DELETE` or a parenthesized query may follow; anything else (`DROP`,
+  `TRUNCATE`, `SET`, a nested `ANALYZE`, …), and a parenthesized
+  `(ANALYZE <statement>)`, is rejected. The mysql driver and an unknown driver
+  are judged the same way. `ANALYZE TABLE …` (maintenance) is unchanged.
+- **Multibyte comments could hide the real statement from `EXPLAIN ANALYZE` and
+  `ANALYZE`.** The guard cut the inner statement at a character offset where a
+  byte offset was needed, so a comment with non-ASCII text in front of it
+  shifted the cut and let a `DELETE` without `WHERE` through. Offsets are now
+  converted to bytes.
+- **MariaDB executable comments were not inspected.** `/*M!100000 … */` was
+  treated as a plain comment, so its body ran on MariaDB without being checked.
+  **On the `mariadb` driver** its body is now read as SQL, whatever the version
+  condition. On the `mysql` driver `/*M!` is still a plain comment, so connect
+  a MariaDB server with the `mariadb` driver. Nesting deeper than 3 levels is
+  rejected, and when the target database is unknown a `/*M!` comment is
+  rejected outright.
+- **Version-conditional comments (`/*!NNNNN … */`) could hide a clause from the
+  guard.** A server skips the body when its version is lower than the one
+  written, so a `WHERE` or `LIMIT` inside it may or may not exist. On the
+  `mysql` and `mariadb` drivers the statement is now checked twice, once as if
+  the bodies run and once as if the server skips them, and is rejected when
+  either reading is refused or when the two readings differ in statement
+  count, transaction state, type or prepared text. **Behaviour change:** these
+  are now rejected on `mysql` and `mariadb`, which 0.2.1 accepted: different
+  versions in one request (`SELECT /*!40101 1 */, /*!50503 2 */` is one), a
+  version of other than 5 digits (5 or 6 on MariaDB), a versioned comment nested in or holding another comment, and one
+  with `*/` inside a string or line comment in its body. A request with a single
+  version and a plain body is unaffected.
+- **SQL that was not valid UTF-8 slipped past the lexer.** A stray byte inside
+  a comment (`DROP DATABASE prod /* é\xFF */`) made the guard read an empty
+  statement. SQL that is not valid UTF-8 is now rejected
+  (`SQL must be valid UTF-8.`), and so is text in which the lexer finds no
+  statement (`QueryProxy could not read this SQL: …`).
+- **`UPDATE` / `DELETE` with an always-true `WHERE` passed.** `WHERE 1 = 1`,
+  `WHERE true`, `WHERE 'a' = 'a'` or an `OR` with such an operand counted as a
+  `WHERE` clause. **Behaviour change:** these are now rejected like a missing
+  `WHERE`, in every statement the guard looks into (CTE bodies, `EXPLAIN
+  ANALYZE`, MariaDB `ANALYZE`, T-SQL batches, dynamic SQL). Detection is
+  static: literals, comparisons, `IS [NOT] NULL|TRUE|FALSE`, `AND`, `OR`,
+  `NOT` and parentheses are evaluated, and an operand it cannot evaluate never
+  counts as true. A `WHERE` clause nested too deeply or too large to evaluate
+  is rejected as well (`… too complex to verify`).
+- **A byte-order mark or Unicode whitespace could hide keywords.** The lexer
+  glues characters such as U+FEFF, U+00A0, U+2028 or U+3000 to the neighbouring
+  word while a server may read them as separators, so `\u{FEFF}DROP DATABASE
+  prod` showed no `DROP`. **Behaviour change:** these characters are rejected
+  outside string literals, quoted identifiers and comments, on every driver and
+  inside dynamic SQL.
+- **PostgreSQL reads `\` and `#` differently from the lexer.** On PostgreSQL
+  (and when the target database is unknown) a backslash is now rejected
+  anywhere except in comments, dollar-quoted bodies, `E'…'` strings and
+  well-formed `U&` strings, and `#` is rejected outside literals, quoted
+  identifiers and comments. A plain string such as `'a\'` is therefore
+  rejected on PostgreSQL even though MySQL and MariaDB behave as before.
+
+### Fixed
+
+- **The queue timing warning missed `queue:listen` and `queue:work --once`.**
+  The warning that `retry_after` is at or below the execution timeout was
+  logged only when a daemon `queue:work` started. It is now also logged when
+  `queue:listen` or `queue:work --once` starts, once per process; the
+  short-lived `queue:work --once` children that `queue:listen` spawns do not
+  repeat it.
+- **The Compose worker example hard-coded `--timeout=310`.** `docker-compose.yml`
+  now passes the timeout the image entrypoint derives
+  (`QUERYPROXY_WORKER_TIMEOUT`, `QUERYPROXY_EXECUTION_TIMEOUT` + 10), so
+  changing `QUERYPROXY_EXECUTION_TIMEOUT` in the example also moves the worker
+  timeout. The example needs the image's default entrypoint.
+
+### Added
+
+- **Live PostgreSQL guard tests.** A `live-pgsql` Pest group in `tests/Live`
+  runs the guard against a real PostgreSQL server and checks both the verdict
+  and the effect on the server (settings, `dblink_exec`,
+  `pg_terminate_backend`, `pg_cancel_backend`, `EXPLAIN ANALYZE DELETE`,
+  `DO` blocks and more). It is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is
+  set. `docker-compose.test.yml` starts a throwaway PostgreSQL 17 for local runs,
+  and the new `live-pgsql` GitHub Actions workflow runs the group in CI.
+
+### Notes
+
+- PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
+  classified as a write and always go through human approval, where the
+  reviewer sees the whole body. A `DELETE` without `WHERE` inside a
+  `DO` block therefore passes the guard.
+
 ## [0.2.1] — 2026-10-02
 
 ### Security
