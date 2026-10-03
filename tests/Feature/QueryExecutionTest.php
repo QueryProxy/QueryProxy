@@ -1,12 +1,16 @@
 <?php
 
+use App\Enums\DbDriver;
 use App\Enums\QueryRequestStatus;
 use App\Models\Connection;
 use App\Models\MaskingRule;
 use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Notifications\QueryRequestFinished;
+use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Execution\QueryExecutor;
+use Illuminate\Database\SQLiteConnection;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Storage;
 
@@ -169,4 +173,132 @@ test('a custom disk declared public is refused as well', function () {
 
     expect($request->fresh()->status)->toBe(QueryRequestStatus::Failed)
         ->and(Storage::disk('exports')->allFiles())->toBe([]);
+});
+
+/**
+ * Turns the request's target into a MySQL / MariaDB connection whose session
+ * reports $sqlMode: the configured connection answers the sql_mode read with
+ * that value and runs everything else against the SQLite target file, so a
+ * statement that reaches the database leaves a trace there.
+ */
+function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $driver, string|Throwable $sqlMode): void
+{
+    $request->connection->forceFill(['driver' => $driver])->save();
+
+    DB::extend('fake_mysql_session', function (array $config) use ($sqlMode) {
+        return new class(new PDO('sqlite:'.$config['database']), $config['database'], '', $config, $sqlMode) extends SQLiteConnection
+        {
+            public function __construct($pdo, $database, $tablePrefix, $config, private string|Throwable $sqlMode)
+            {
+                parent::__construct($pdo, $database, $tablePrefix, $config);
+            }
+
+            public function scalar($query, $bindings = [], $useReadPdo = true)
+            {
+                if ($query !== 'SELECT @@SESSION.sql_mode') {
+                    return parent::scalar($query, $bindings, $useReadPdo);
+                }
+
+                if ($this->sqlMode instanceof Throwable) {
+                    throw $this->sqlMode;
+                }
+
+                return $this->sqlMode;
+            }
+        };
+    });
+
+    test()->partialMock(DynamicConnectionFactory::class, function ($mock) use ($dbFile) {
+        $mock->shouldReceive('configure')->andReturnUsing(function ($connection) use ($dbFile) {
+            $name = 'queryproxy_target_'.$connection->id;
+
+            config(["database.connections.{$name}" => [
+                'driver' => 'fake_mysql_session',
+                'database' => $dbFile,
+                'prefix' => '',
+            ]]);
+
+            return $name;
+        });
+    });
+}
+
+test('a MySQL / MariaDB session whose sql_mode changes quoting is refused before the SQL runs', function (DbDriver $driver, string $sqlMode, string $flag) {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, $driver, $sqlMode);
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toContain($flag)
+        ->and($request->error_message)->toContain('sql_mode')
+        ->and($request->error_message)->toContain($driver->label())
+        ->and($request->affected_rows)->toBeNull();
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers WHERE active = 0')->fetchColumn())->toBe(0);
+})->with([
+    'mysql, ANSI_QUOTES' => [DbDriver::Mysql, 'ONLY_FULL_GROUP_BY,ANSI_QUOTES,STRICT_TRANS_TABLES', 'ANSI_QUOTES'],
+    'mariadb, ANSI_QUOTES alone' => [DbDriver::Mariadb, 'ANSI_QUOTES', 'ANSI_QUOTES'],
+    'mysql, NO_BACKSLASH_ESCAPES in lower case' => [DbDriver::Mysql, 'strict_trans_tables,no_backslash_escapes', 'NO_BACKSLASH_ESCAPES'],
+    'mariadb, both flags' => [DbDriver::Mariadb, 'NO_BACKSLASH_ESCAPES,ANSI_QUOTES', 'NO_BACKSLASH_ESCAPES and ANSI_QUOTES'],
+    'mysql, ANSI combination mode expanded by the server' => [DbDriver::Mysql, 'REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,ANSI', 'ANSI_QUOTES'],
+]);
+
+test('a session whose sql_mode cannot be read is refused before the SQL runs', function () {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, DbDriver::Mariadb, new RuntimeException('sql_mode read failed'));
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->affected_rows)->toBeNull();
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers WHERE active = 0')->fetchColumn())->toBe(0);
+});
+
+test('a read on a refused session writes no result file', function () {
+    [$request, $dbFile] = executionSetup('SELECT id, name FROM customers ORDER BY id LIMIT 10');
+    fakeMysqlSession($request, $dbFile, DbDriver::Mysql, 'ANSI_QUOTES');
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->result_path)->toBeNull()
+        ->and(Storage::disk('local')->allFiles())->toBe([]);
+});
+
+test('a MySQL / MariaDB session in the default quoting mode runs the request', function (DbDriver $driver, string $sqlMode) {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, $driver, $sqlMode);
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->affected_rows)->toBe(2);
+})->with([
+    'mysql, Laravel strict mode' => [DbDriver::Mysql, 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'],
+    'mariadb, empty mode' => [DbDriver::Mariadb, ''],
+    'mysql, a flag that only looks similar' => [DbDriver::Mysql, 'ANSI_QUOTES_X,NO_BACKSLASH_ESCAPES_LEGACY'],
+]);
+
+test('drivers without a quoting sql_mode are not asked for one', function () {
+    [$request] = executionSetup('SELECT id FROM customers LIMIT 5');
+
+    DB::listen(function ($query) {
+        expect($query->sql)->not->toContain('sql_mode');
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed);
 });

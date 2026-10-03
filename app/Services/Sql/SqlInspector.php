@@ -56,13 +56,14 @@ use PhpMyAdmin\SqlParser\TokenType;
  *    DROP DATABASE or a GRANT the guard refuses on its own.
  *  - SET is judged by the variable name. Variables that name a file path,
  *    load code or switch a protection off are rejected; max_connections,
- *    wait_timeout, sql_mode, work_mem and the rest pass. On MySQL / MariaDB
+ *    wait_timeout, work_mem and the rest pass. On MySQL / MariaDB
  *    only the persistent scopes are guarded (GLOBAL / PERSIST / PERSIST_ONLY,
  *    in both the keyword and the "@@scope." spelling) and SESSION-scoped
- *    writes are never touched. PostgreSQL has no persistent SET scope — a
- *    session setting is the whole door — so on PostgreSQL, and when the
- *    driver is unknown, a listed name is rejected in every scope: plain SET,
- *    SET SESSION and SET LOCAL alike.
+ *    writes are not touched — except for sql_mode, which is refused in every
+ *    scope and spelling ({@see self::LEXER_MODE_VARIABLES}). PostgreSQL has
+ *    no persistent SET scope — a session setting is the whole door — so on
+ *    PostgreSQL, and when the driver is unknown, a listed name is rejected
+ *    in every scope: plain SET, SET SESSION and SET LOCAL alike.
  *
  * Those two lists live in config/queryproxy.php and can only be extended from
  * the environment, never shortened. {@see self::UNTRUSTED_LANGUAGES} and
@@ -270,6 +271,12 @@ class SqlInspector
      * ignore_checksum_failure). Settings only a reload or a restart can
      * change are left out: no SET can reach them.
      *
+     * sql_mode is listed for a different reason: NO_BACKSLASH_ESCAPES and
+     * ANSI_QUOTES change how the server reads string literals, and the guard
+     * reads SQL with the default mode. It is refused in every scope on every
+     * driver ({@see self::LEXER_MODE_VARIABLES}); QueryExecutor refuses to run
+     * on a MySQL / MariaDB session whose mode already carries either flag.
+     *
      * Configuration is merged on top of this list and can only extend it;
      * these entries are the floor.
      *
@@ -289,6 +296,7 @@ class SqlInspector
         'plugin_load_add',
         'secure_file_priv',
         'local_infile',
+        'sql_mode',
         // PostgreSQL
         'session_preload_libraries',
         'local_preload_libraries',
@@ -447,6 +455,18 @@ class SqlInspector
      * @var list<string>
      */
     private const PERSISTENT_SCOPES = ['GLOBAL', 'PERSIST', 'PERSIST_ONLY'];
+
+    /**
+     * Settings that change how the server tokenizes SQL — which quotes delimit
+     * a string, whether a backslash escapes — and so would make the guard,
+     * which reads SQL with the server defaults, see different statements than
+     * the server runs. A write to one of them is refused in every scope on
+     * every driver, SESSION included. Each entry is also listed in
+     * {@see self::DANGEROUS_VARIABLES}.
+     *
+     * @var list<string>
+     */
+    private const LEXER_MODE_VARIABLES = ['sql_mode'];
 
     private const INVALID_UTF8_VIOLATION = 'SQL must be valid UTF-8.';
 
@@ -909,6 +929,12 @@ class SqlInspector
 
         if ($keyword === 'WITH') {
             array_push($violations, ...$this->commonTableExpressionViolations($sql, $tokens, $wrappingParens, $position, $driver, $depth));
+        }
+
+        // MariaDB's SET STATEMENT ... FOR <statement> runs the statement
+        // after FOR; it is judged like a top-level statement of its own.
+        if ($keyword === 'SET' && $this->isSetStatement($tokens, $wrappingParens)) {
+            return $this->analyzeSetStatement($sql, $tokens, $wrappingParens, $position, $driver, $depth, $violations);
         }
 
         // Only a statement that runs has function-call effects; a plain
@@ -2832,6 +2858,96 @@ class SqlInspector
     }
 
     /**
+     * Whether the SET statement whose keyword sits at $keywordIndex is
+     * MariaDB's SET STATEMENT ... FOR form.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function isSetStatement(array $tokens, int $keywordIndex): bool
+    {
+        $next = $tokens[$keywordIndex + 1] ?? null;
+
+        return $next !== null
+            && $next->type !== TokenType::Symbol
+            && strtoupper((string) $next->value) === 'STATEMENT';
+    }
+
+    /**
+     * MariaDB's SET STATEMENT a = 1, ... FOR <statement>. The assignment
+     * list has already been judged by serverVariableViolations(); the
+     * statement after FOR is what actually runs, so it goes through every
+     * rule a top-level statement gets (a nested SET STATEMENT included,
+     * within MAX_NESTING_DEPTH) and lends the whole its type and LIMIT.
+     * A form the guard cannot split that way is refused.
+     *
+     * @param  list<Token>  $tokens
+     * @param  list<string>  $violations
+     * @return array{0: StatementInfo, 1: list<string>}
+     */
+    private function analyzeSetStatement(
+        string $sql,
+        array $tokens,
+        int $wrappingParens,
+        int $position,
+        ?DbDriver $driver,
+        int $depth,
+        array $violations,
+    ): array {
+        $label = "Statement {$position}";
+
+        // The token positions are offsets into the dollar-quote-masked text,
+        // which is shorter than $sql once a $tag$...$tag$ string is masked;
+        // no dialect that runs SET STATEMENT reads dollar quotes, so such a
+        // statement is refused rather than cut at a shifted offset.
+        if ($this->maskDollarQuoted($sql) !== $sql) {
+            $violations[] = "{$label}: SET STATEMENT with a dollar-quoted string is not allowed.";
+
+            return [new StatementInfo($sql, $sql, StatementType::Write, false), $violations];
+        }
+
+        $forIndex = $wrappingParens === 0 ? $this->topLevelForIndex($tokens, 2) : null;
+        $body = '';
+        $innerOffset = 0;
+
+        if ($forIndex !== null) {
+            // "FOR" may open a compound keyword token ("FOR UPDATE"), so the
+            // statement starts right after the word itself, not the token.
+            $rest = substr($sql, $this->tokenByteOffset($sql, $tokens[$forIndex]->position) + strlen('FOR'));
+            $body = trim($rest);
+            $innerOffset = strlen($sql) - strlen(ltrim($rest));
+        }
+
+        if ($body === '') {
+            $violations[] = "{$label}: SET STATEMENT without a statement after a top-level FOR is not allowed.";
+
+            return [new StatementInfo($sql, $sql, StatementType::Write, false), $violations];
+        }
+
+        // The assignment values are evaluated too: a state-changing call in
+        // one of them makes the whole a write.
+        [$functionViolations, $functionWrites] = $this->functionCallEffects(array_slice($tokens, 0, $forIndex));
+
+        foreach ($functionViolations as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        [$inner, $innerViolations] = $this->analyzeNestedStatement($body, $position, $driver, $depth);
+
+        return [
+            new StatementInfo(
+                $sql,
+                substr($sql, 0, $innerOffset).$inner->preparedSql,
+                $functionWrites ? StatementType::Write : $inner->type,
+                $inner->parsed,
+                $inner->limitInjected,
+                $inner->limitClamped,
+                $inner->isDdl,
+            ),
+            array_merge($violations, $innerViolations),
+        ];
+    }
+
+    /**
      * Inspect a statement that another statement will execute on its behalf,
      * with exactly the rules a top-level statement gets. The nesting depth is
      * bounded; past it the statement is rejected instead of being read
@@ -4000,7 +4116,7 @@ class SqlInspector
         $name = strtolower(trim((string) $argument->value));
 
         if (in_array($name, $this->dangerousVariables(), true)) {
-            return ["set_config('{$name}') is not allowed through QueryProxy: {$name} controls server-side file paths, code loading or a protection switch."];
+            return ["set_config('{$name}') is not allowed through QueryProxy: ".$this->dangerousVariableReason($name)];
         }
 
         return [];
@@ -5909,6 +6025,11 @@ class SqlInspector
      * library or a replication role takes effect. On PostgreSQL, and when the
      * driver is unknown, a listed name is therefore rejected in every scope.
      *
+     * The settings in LEXER_MODE_VARIABLES are the exception: they change how
+     * the guard's own reading of later SQL lines up with the server's, so
+     * they are rejected in every scope on every driver, including the
+     * "@@x" session spelling and MariaDB's SET STATEMENT ... FOR form.
+     *
      * When the statement carries a leading scope keyword it is applied to
      * every bare assignment in the list, which is the conservative reading:
      * servers differ on whether SET GLOBAL a = 1, b = 2 scopes b globally too,
@@ -5932,6 +6053,21 @@ class SqlInspector
             $index = 2;
         }
 
+        // MariaDB's "SET STATEMENT a = 1, b = 2 FOR <statement>": the
+        // assignments end at the top-level FOR, and the statement after it
+        // is not part of the assignment list.
+        if ($statementScope === null
+            && isset($tokens[1])
+            && $tokens[1]->type !== TokenType::Symbol
+            && strtoupper((string) $tokens[1]->value) === 'STATEMENT') {
+            $index = 2;
+            $forIndex = $this->topLevelForIndex($tokens, $index);
+
+            if ($forIndex !== null) {
+                $tokens = array_slice($tokens, 0, $forIndex);
+            }
+        }
+
         $violations = [];
         $dangerous = $this->dangerousVariables();
 
@@ -5942,13 +6078,52 @@ class SqlInspector
                 continue;
             }
 
-            if (in_array($scope, self::PERSISTENT_SCOPES, true) || $everyScope) {
-                $written = $scope === null ? 'SET' : "SET {$scope}";
-                $violations[] = "{$written} {$name} is not allowed through QueryProxy: {$name} controls server-side file paths, code loading or a protection switch.";
+            $written = $scope === null ? 'SET' : "SET {$scope}";
+
+            if (in_array($name, self::LEXER_MODE_VARIABLES, true)
+                || in_array($scope, self::PERSISTENT_SCOPES, true)
+                || $everyScope) {
+                $violations[] = "{$written} {$name} is not allowed through QueryProxy: ".$this->dangerousVariableReason($name);
             }
         }
 
         return $violations;
+    }
+
+    /**
+     * Why writing the dangerous setting $name is refused.
+     */
+    private function dangerousVariableReason(string $name): string
+    {
+        return in_array($name, self::LEXER_MODE_VARIABLES, true)
+            ? "{$name} changes how quotes and backslashes are read, which the guard cannot follow."
+            : "{$name} controls server-side file paths, code loading or a protection switch.";
+    }
+
+    /**
+     * The index of the top-level FOR keyword that ends a SET STATEMENT's
+     * assignment list, or null when there is none. A FOR inside parentheses
+     * (a subquery's FOR UPDATE) does not count.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function topLevelForIndex(array $tokens, int $index): ?int
+    {
+        $depth = 0;
+
+        for ($count = count($tokens); $index < $count; $index++) {
+            $token = $tokens[$index];
+
+            if ($token->type === TokenType::Operator && $token->token === '(') {
+                $depth++;
+            } elseif ($token->type === TokenType::Operator && $token->token === ')') {
+                $depth--;
+            } elseif ($depth === 0 && $token->type === TokenType::Keyword && ($this->tokenWords($token)[0] ?? '') === 'FOR') {
+                return $index;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -6005,9 +6180,10 @@ class SqlInspector
                 $offset = 2;
             }
 
-            // "@@x" with no qualifying dot is a session variable.
+            // "@@x" with no qualifying dot is a session variable, and the
+            // word read as the scope is in fact its name.
             if (! isset($assignment[$offset]) || $assignment[$offset]->token !== '.') {
-                return [null, null];
+                return $scope === '' ? [null, null] : ['SESSION', $this->identifierValue($assignment[$offset - 1])];
             }
 
             return [$scope, isset($assignment[$offset + 1]) ? $this->identifierValue($assignment[$offset + 1]) : null];
@@ -6084,11 +6260,12 @@ class SqlInspector
      * Bare, case-folded name behind an identifier token: the lexer has already
      * stripped the quotes of `x`, "x" and 'x' into the token value, and the
      * trailing colon of the ":=" assignment form is dropped here — the lexer
-     * reports "general_log:=1" as a label token named "general_log:".
+     * reports "general_log:=1" as a label token named "general_log:", and
+     * "general_log := 1" as one named "general_log :", whitespace included.
      */
     private function identifierValue(Token $token): string
     {
-        return strtolower(rtrim((string) $token->value, ':'));
+        return strtolower(rtrim((string) $token->value, ": \t\n\r\v\f"));
     }
 
     /**

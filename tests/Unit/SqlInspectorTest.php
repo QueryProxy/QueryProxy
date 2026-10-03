@@ -353,6 +353,7 @@ test('persistent writes to file / code / protection variables are rejected', fun
     'backtick-quoted variable name' => 'SET GLOBAL `general_log` = 1',
     'double-quoted variable name' => 'SET GLOBAL "general_log" = 1',
     'the := assignment form' => 'SET GLOBAL general_log:=1',
+    'the := assignment form after a space' => 'SET GLOBAL general_log := 1',
     'PERSIST_ONLY scope' => 'SET PERSIST_ONLY general_log = 1',
     'hidden behind a harmless first assignment' => 'SET GLOBAL max_connections = 500, general_log = 1',
 ]);
@@ -1172,6 +1173,124 @@ test('MySQL and MariaDB still guard only the persistent SET scopes', function (D
         ->and(inspect('SET GLOBAL general_log = 1', $driver)->passes())->toBeFalse()
         ->and(inspect('SET GLOBAL session_replication_role = 1', $driver)->passes())->toBeFalse();
 })->with([
+    'mysql' => DbDriver::Mysql,
+    'mariadb' => DbDriver::Mariadb,
+]);
+
+dataset('sql_mode writes', [
+    'plain SET' => "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    'SET SESSION' => "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    'SET GLOBAL' => "SET GLOBAL sql_mode = 'ANSI_QUOTES'",
+    'SET LOCAL' => "SET LOCAL sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    'SET PERSIST' => "SET PERSIST sql_mode = 'ANSI_QUOTES'",
+    '@@ session spelling' => "SET @@sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    '@@ session spelling with loose spacing' => "SET @@ sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    '@@SESSION. spelling' => "SET @@SESSION.sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    '@@GLOBAL. spelling' => "SET @@GLOBAL.sql_mode = 'ANSI_QUOTES'",
+    '@@LOCAL. spelling' => "SET @@local.sql_mode = 'ANSI_QUOTES'",
+    'upper case and :=' => "SET SQL_MODE := 'NO_BACKSLASH_ESCAPES'",
+    'backtick-quoted name' => "SET `sql_mode` = 'NO_BACKSLASH_ESCAPES'",
+    'behind a harmless first assignment' => "SET time_zone = '+00:00', sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    'scope inside a MySQL executable comment' => "SET /*!40101 SESSION sql_mode */ = 'NO_BACKSLASH_ESCAPES'",
+    'assignment inside a MySQL executable comment' => "SET /*!40101 sql_mode = 'NO_BACKSLASH_ESCAPES' */",
+    '@@ spelling inside a MySQL executable comment' => "SET /*!50000 @@SESSION.sql_mode = 'ANSI_QUOTES' */",
+    'MariaDB SET STATEMENT ... FOR' => "SET STATEMENT sql_mode = 'NO_BACKSLASH_ESCAPES' FOR SELECT 1",
+    'second assignment of SET STATEMENT' => "SET STATEMENT max_statement_time = 5, sql_mode = 'ANSI_QUOTES' FOR SELECT 1",
+    'ahead of the statement it would hide' => "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'; SELECT 'a\\', load_file('/etc/passwd') -- '",
+    'SET as the statement of SET STATEMENT ... FOR' => "SET STATEMENT max_statement_time = 1 FOR SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    'SET in a nested SET STATEMENT ... FOR' => "SET STATEMENT max_statement_time = 1 FOR SET STATEMENT lock_wait_timeout = 1 FOR SET SESSION sql_mode = 'ANSI_QUOTES'",
+    'SET STATEMENT ... FOR SET ahead of the statement it would hide' => "BEGIN; SET STATEMENT max_statement_time = 1 FOR SET sql_mode = 'NO_BACKSLASH_ESCAPES'; UPDATE t SET a = 'x\\', b = load_file('/etc/passwd') -- ' WHERE id = 1; COMMIT;",
+]);
+
+test('a write to sql_mode is refused in every scope on MySQL and MariaDB', function (string $sql, DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('sql_mode')
+        ->and(implode("\n", $result->violations))->toContain('quotes and backslashes');
+})->with('sql_mode writes')->with([
+    'mysql' => DbDriver::Mysql,
+    'mariadb' => DbDriver::Mariadb,
+]);
+
+test('a write to sql_mode is refused on every other driver as well', function (?DbDriver $driver) {
+    expect(inspect("SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'", $driver)->passes())->toBeFalse()
+        ->and(inspect("SET @@sql_mode = 'ANSI_QUOTES'", $driver)->passes())->toBeFalse();
+})->with([
+    'pgsql' => DbDriver::Pgsql,
+    'sqlsrv' => DbDriver::Sqlsrv,
+    'sqlite' => DbDriver::Sqlite,
+    'unknown driver' => null,
+]);
+
+test('a MariaDB executable comment carrying a sql_mode write is refused on MariaDB', function () {
+    expect(inspect("SET /*M! sql_mode = 'NO_BACKSLASH_ESCAPES' */", DbDriver::Mariadb)->passes())->toBeFalse();
+});
+
+test('the statement after SET STATEMENT ... FOR is held to the rules of a top-level statement', function (string $sql, string $violation, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($violation);
+})->with([
+    'a persistent dangerous SET' => ['SET STATEMENT max_statement_time = 1 FOR SET GLOBAL general_log = 1', 'general_log'],
+    'a DELETE without WHERE' => ['SET STATEMENT max_statement_time = 1 FOR DELETE FROM t', 'DELETE without a WHERE clause'],
+    'an UPDATE with an always-true WHERE' => ['SET STATEMENT max_statement_time = 1 FOR UPDATE t SET a = 1 WHERE 1 = 1', 'always-true WHERE'],
+    'a nested SET STATEMENT' => ['SET STATEMENT max_statement_time = 1 FOR SET STATEMENT lock_wait_timeout = 1 FOR DELETE FROM t', 'DELETE without a WHERE clause'],
+    'a parenthesised FOR in the value' => ['SET STATEMENT max_statement_time = (SELECT 1 FROM dual FOR UPDATE) FOR DELETE FROM t', 'DELETE without a WHERE clause'],
+    'nesting past the bound' => ['SET STATEMENT a = 1 FOR SET STATEMENT b = 1 FOR SET STATEMENT c = 1 FOR SET STATEMENT d = 1 FOR SELECT 1', 'nested more than'],
+    'no FOR at all' => ['SET STATEMENT max_statement_time = 1', 'SET STATEMENT without'],
+    'FOR with no statement after it' => ['SET STATEMENT max_statement_time = 1 FOR', 'SET STATEMENT without'],
+])->with([
+    'mysql' => DbDriver::Mysql,
+    'mariadb' => DbDriver::Mariadb,
+    'unknown driver' => null,
+]);
+
+test('a SET STATEMENT carrying a dollar-quoted string is refused', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with([
+    'ahead of a DELETE without WHERE' => 'SET STATEMENT x = $$ab$$ FOR DELETE FROM t',
+    'before FOR' => 'SET STATEMENT x = $$ab$$ FOR DELETE FROM t WHERE id = 1',
+    'hiding a comment before FOR' => 'SET STATEMENT x = $$ SELECT 1 -- $$ FOR DELETE FROM t WHERE id = 1',
+    'tagged, before FOR' => 'SET STATEMENT x = $tag$long text$tag$ FOR SELECT 1',
+])->with([
+    'pgsql' => DbDriver::Pgsql,
+    'unknown driver' => null,
+]);
+
+test('the statement after SET STATEMENT ... FOR keeps its own type and LIMIT', function () {
+    $read = inspect('SET STATEMENT max_statement_time = 5 FOR SELECT * FROM users', DbDriver::Mariadb);
+    $write = inspect('SET STATEMENT max_statement_time = 5 FOR UPDATE users SET a = 1 WHERE id = 1', DbDriver::Mariadb);
+
+    expect($read->violations)->toBe([])
+        ->and($read->type())->toBe(StatementType::Read)
+        ->and($read->statements[0]->limitInjected)->toBeTrue()
+        ->and($read->preparedSql())->toBe("SET STATEMENT max_statement_time = 5 FOR SELECT * FROM users\nLIMIT 1000")
+        ->and($write->violations)->toBe([])
+        ->and($write->type())->toBe(StatementType::Write)
+        ->and($write->preparedSql())->toBe('SET STATEMENT max_statement_time = 5 FOR UPDATE users SET a = 1 WHERE id = 1');
+});
+
+test('set_config on sql_mode is refused with the lexer-mode reason', function () {
+    $result = inspect("SELECT set_config('sql_mode', 'x', false)", DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('quotes and backslashes')
+        ->and(implode("\n", $result->violations))->not->toContain('server-side file paths');
+});
+
+test('reading sql_mode and setting other session variables still pass', function (string $sql, DbDriver $driver) {
+    expect(inspect($sql, $driver)->violations)->toBe([]);
+})->with([
+    'SELECT @@sql_mode' => 'SELECT @@sql_mode',
+    'SELECT @@SESSION.sql_mode' => 'SELECT @@SESSION.sql_mode',
+    'SELECT @@GLOBAL.sql_mode' => 'SELECT @@GLOBAL.sql_mode',
+    'SHOW VARIABLES' => "SHOW VARIABLES LIKE 'sql_mode'",
+    'SET @@ session spelling of another variable' => "SET @@time_zone = '+00:00'",
+    'SET STATEMENT with another variable' => 'SET STATEMENT max_statement_time = 5 FOR SELECT 1',
+    'a user variable named sql_mode' => "SET @sql_mode = 'ANSI_QUOTES'",
+])->with([
     'mysql' => DbDriver::Mysql,
     'mariadb' => DbDriver::Mariadb,
 ]);
@@ -2416,6 +2535,20 @@ test('a "/*M!" comment stays a plain comment on MySQL', function (string $sql, S
     'ANALYZE DROP TABLE' => ['ANALYZE /*M!100000 DROP TABLE t*/', StatementType::Write],
     'harmless body' => ['SELECT 1 /*M!100000 , SLEEP(1) */', StatementType::Read],
 ]);
+
+test('a "/*M!" body is a comment on MySQL and a statement on MariaDB', function () {
+    $sql = 'SELECT 1 /*M! ; DELETE FROM t */';
+
+    $mysql = inspect($sql, DbDriver::Mysql);
+    $mariadb = inspect($sql, DbDriver::Mariadb);
+
+    expect($mysql->violations)->toBe([])
+        ->and($mysql->statements)->toHaveCount(1)
+        ->and($mysql->type())->toBe(StatementType::Read)
+        ->and($mysql->preparedSql())->toContain('/*M! ; DELETE FROM t */')
+        ->and($mariadb->statements)->toHaveCount(2)
+        ->and($mariadb->violations)->toContain('Statement 2: DELETE without a WHERE clause is not allowed.');
+});
 
 test('a MariaDB executable comment that is never closed is rejected', function (string $sql, ?DbDriver $driver) {
     expect(inspect($sql, $driver)->violations)->toBe(['A block comment that is never closed is not allowed.']);

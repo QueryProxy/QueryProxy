@@ -2,8 +2,10 @@
 
 namespace App\Services\Execution;
 
+use App\Enums\DbDriver;
 use App\Enums\QueryRequestStatus;
 use App\Enums\StatementType;
+use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Connections\DynamicConnectionFactory;
@@ -25,6 +27,17 @@ use Throwable;
  */
 class QueryExecutor
 {
+    /**
+     * MySQL / MariaDB sql_mode flags that change how the server reads string
+     * literals: NO_BACKSLASH_ESCAPES stops a backslash from escaping a quote
+     * and ANSI_QUOTES turns "..." from a string into an identifier. The guard
+     * reads SQL with the default mode, so on a session carrying either flag
+     * the statements the guard approved are not the statements that run.
+     *
+     * @var list<string>
+     */
+    private const LEXER_ALTERING_SQL_MODES = ['NO_BACKSLASH_ESCAPES', 'ANSI_QUOTES'];
+
     public function __construct(
         private DynamicConnectionFactory $factory,
         private SqlInspector $inspector,
@@ -59,6 +72,8 @@ class QueryExecutor
         $settled = false;
 
         try {
+            $this->assertDefaultQuoting($connection, $connectionName);
+
             $statements = $this->inspector->splitStatements($request->sql_prepared);
 
             if ($statements === []) {
@@ -230,6 +245,38 @@ class QueryExecutor
         $status = QueryRequest::whereKey($request->id)->value('status');
 
         return $status instanceof QueryRequestStatus ? $status->value : $status;
+    }
+
+    /**
+     * Refuse to run on a MySQL / MariaDB session whose sql_mode changes how
+     * quotes and backslashes are read. The session's mode is read on the very
+     * connection the request then runs on; it is never changed here — the
+     * server's or the connection user's default is what has to be fixed.
+     * Other drivers have no such mode and are not checked.
+     *
+     * @throws RuntimeException when the session's sql_mode carries a flag in
+     *                          LEXER_ALTERING_SQL_MODES
+     */
+    private function assertDefaultQuoting(Connection $connection, string $connectionName): void
+    {
+        if (! in_array($connection->driver, [DbDriver::Mysql, DbDriver::Mariadb], true)) {
+            return;
+        }
+
+        $sqlMode = (string) DB::connection($connectionName)->scalar('SELECT @@SESSION.sql_mode');
+        $flags = array_map(fn (string $flag) => strtoupper(trim($flag)), explode(',', $sqlMode));
+        $found = array_values(array_intersect(self::LEXER_ALTERING_SQL_MODES, $flags));
+
+        if ($found !== []) {
+            throw new RuntimeException(sprintf(
+                'Refusing to run: the %s session sql_mode includes %s, which changes how quotes and backslashes are read, '.
+                'so QueryProxy cannot vouch that the SQL it checked is the SQL the server would run. '.
+                'Remove %s from the server\'s or the connection user\'s default sql_mode and re-run the request.',
+                $connection->driver->label(),
+                implode(' and ', $found),
+                count($found) > 1 ? 'these flags' : 'the flag',
+            ));
+        }
     }
 
     /**
