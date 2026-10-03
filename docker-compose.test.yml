@@ -1,0 +1,29 @@
+# Throwaway PostgreSQL for the live guard tests (tests/Live, Pest group
+# "live-pgsql"). Test-only: fixed credentials, no volume, published on 55432 so
+# it does not collide with a local PostgreSQL on 5432.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   QUERYPROXY_LIVE_PGSQL_HOST=127.0.0.1 QUERYPROXY_LIVE_PGSQL_PORT=55432 \
+#   QUERYPROXY_LIVE_PGSQL_DATABASE=queryproxy_test \
+#   QUERYPROXY_LIVE_PGSQL_USERNAME=queryproxy_test \
+#   QUERYPROXY_LIVE_PGSQL_PASSWORD=queryproxy_test \
+#   ./vendor/bin/pest --group=live-pgsql
+#   docker compose -f docker-compose.test.yml down
+#
+# The image's POSTGRES_USER is a superuser, which the tests need: most of the
+# settings the guard refuses can only be changed by one, and so can dblink.
+
+services:
+  pgsql:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: queryproxy_test
+      POSTGRES_USER: queryproxy_test
+      POSTGRES_PASSWORD: queryproxy_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queryproxy_test -d queryproxy_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

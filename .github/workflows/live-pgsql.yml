@@ -1,0 +1,70 @@
+name: Live PostgreSQL guard
+
+# Runs the tests/Live group against a real PostgreSQL server, proving that
+# what SqlInspector lets through as a read is harmless there and that what it
+# refuses or counts as a write really has that side effect.
+#
+# Actions are pinned to commit SHAs rather than mutable tags, as in ci.yml.
+# Dependabot (github-actions ecosystem) keeps the SHAs current; when bumping
+# one, re-resolve the SHA — never edit the version comment alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-pgsql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: queryproxy_test
+          POSTGRES_USER: queryproxy_test
+          POSTGRES_PASSWORD: queryproxy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U queryproxy_test -d queryproxy_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      QUERYPROXY_LIVE_PGSQL_HOST: 127.0.0.1
+      QUERYPROXY_LIVE_PGSQL_PORT: 5432
+      QUERYPROXY_LIVE_PGSQL_DATABASE: queryproxy_test
+      QUERYPROXY_LIVE_PGSQL_USERNAME: queryproxy_test
+      QUERYPROXY_LIVE_PGSQL_PASSWORD: queryproxy_test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite, pdo_pgsql, intl, zip, bcmath
+          coverage: none
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare application
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Live PostgreSQL guard tests
+        run: ./vendor/bin/pest --group=live-pgsql
