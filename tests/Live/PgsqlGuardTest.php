@@ -225,10 +225,9 @@ test('default_transaction_read_only = off lifts a read-only session default', fu
     $sql = 'SET default_transaction_read_only = off';
     expectLiveRefused($this->live, $sql, 'default_transaction_read_only');
 
-    // Raw PDO throughout, on purpose: Laravel treats SQLSTATE 25006 as a lost
-    // connection and retries outside a transaction on a fresh, writable
-    // session, so an INSERT through Laravel would succeed with or without the
-    // SET under test. The PID check proves every step ran on one session.
+    // Raw PDO throughout, on purpose: this test is about what PostgreSQL does
+    // with the SET, independent of Laravel's reconnect logic (covered by the
+    // next test). The PID check proves every step ran on one session.
     $pdo = $this->live->db()->getPdo();
     $pid = $this->live->backendPid();
     $insert = "INSERT INTO items (id, label) VALUES (6, 'six')";
@@ -243,6 +242,25 @@ test('default_transaction_read_only = off lifts a read-only session default', fu
 
     expect($this->live->backendPid())->toBe($pid)
         ->and($this->live->label(6))->toBe('six');
+});
+
+test('a read-only session refuses a write through Laravel instead of retrying it on a fresh session', function () {
+    // Laravel's own detector counts SQLSTATE 25006 as a lost connection, so
+    // outside a transaction it reconnects and re-runs the INSERT on a new,
+    // writable session. ReadOnlyAwareLostConnectionDetector stops that: the
+    // error reaches the caller and the session stays the same.
+    $db = $this->live->db();
+    $pid = $this->live->backendPid();
+
+    $db->statement('SET default_transaction_read_only = on');
+
+    expect(fn () => $db->statement("INSERT INTO items (id, label) VALUES (6, 'six')"))
+        ->toThrow(QueryException::class, 'read-only transaction');
+
+    expect($this->live->backendPid())->toBe($pid)
+        ->and($this->live->setting('default_transaction_read_only'))->toBe('on')
+        ->and($this->live->label(6))->toBeNull()
+        ->and($this->live->itemIds())->toBe([1, 2, 3, 4, 5]);
 });
 
 // --- What the guard counts as a write really writes ---
