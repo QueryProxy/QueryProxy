@@ -45,13 +45,16 @@ return [
     | its name only follows PostgreSQL's "pl...u" convention for an untrusted
     | language, so this list does not have to name every one of them.
     |
-    | `dangerous_variables` names the server variables whose persistent value
-    | writes a file, loads code into the server process or turns a protection
-    | off. SET GLOBAL / PERSIST on one of them is refused; max_connections,
-    | wait_timeout, sql_mode and the rest pass, and SESSION-scoped writes are
-    | never guarded. Names are matched exactly, case-insensitively — there is
-    | no wildcard, so related variables (`general_log`, `general_log_file`)
-    | are listed one by one.
+    | `dangerous_variables` names the server settings whose value writes a
+    | file, loads code into the server process or turns a protection off. On
+    | MySQL / MariaDB, SET GLOBAL / PERSIST on one of them is refused and
+    | SESSION-scoped writes are not guarded; on PostgreSQL, and when the
+    | driver is unknown, SET in any scope (plain, SESSION, LOCAL) is refused.
+    | set_config() with a listed name is refused on every driver.
+    | max_connections, wait_timeout, sql_mode, work_mem and the rest pass.
+    | Names are matched exactly, case-insensitively — there is no wildcard,
+    | so related variables (`general_log`, `general_log_file`) are listed
+    | one by one.
     |
     | The three function lists judge a call by its effect. A call to one of
     | `blocked_functions` (server control, dblink) is refused. A call to one

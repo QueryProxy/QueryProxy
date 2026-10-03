@@ -559,6 +559,76 @@ test('set_config is judged like SET', function (string $sql, bool $passes) {
     'concatenated name' => ["SELECT set_config('local_' || 'infile', 'on', false)", false],
 ]);
 
+dataset('pg dangerous settings', [
+    'session_preload_libraries',
+    'local_preload_libraries',
+    'dynamic_library_path',
+    'default_transaction_read_only',
+    'transaction_read_only',
+    'session_replication_role',
+    'allow_system_table_mods',
+    'lo_compat_privileges',
+    'zero_damaged_pages',
+    'ignore_checksum_failure',
+]);
+
+test('set_config rejects every PostgreSQL setting that loads code or lifts a protection', function (string $name) {
+    foreach ([
+        "SELECT set_config('{$name}', 'x', false)",
+        "SELECT set_config('{$name}', 'x', true)",
+        'SELECT set_config(\''.strtoupper($name)."', 'x', false)",
+    ] as $sql) {
+        $result = inspect($sql, DbDriver::Pgsql);
+
+        expect($result->passes())->toBeFalse()
+            ->and($result->violations[0])->toContain($name);
+    }
+})->with('pg dangerous settings');
+
+test('SET rejects a listed setting in every scope on PostgreSQL and on an unknown driver', function (string $name) {
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        foreach ([
+            "SET {$name} = 'x'",
+            "SET {$name} TO 'x'",
+            "SET LOCAL {$name} = 'x'",
+            "SET SESSION {$name} = 'x'",
+            'SET "'.$name."\" = 'x'",
+            'SET/**/SESSION '.strtoupper($name)." TO 'x'",
+        ] as $sql) {
+            $result = inspect($sql, $driver);
+
+            expect($result->passes())->toBeFalse("{$sql} passed on ".($driver->value ?? 'an unknown driver'))
+                ->and($result->violations[0])->toContain($name);
+        }
+    }
+})->with('pg dangerous settings');
+
+test('MySQL and MariaDB still guard only the persistent SET scopes', function (DbDriver $driver) {
+    expect(inspect('SET SESSION general_log = 1', $driver)->passes())->toBeTrue()
+        ->and(inspect('SET general_log = 1', $driver)->passes())->toBeTrue()
+        ->and(inspect('SET @@SESSION.general_log = 1', $driver)->passes())->toBeTrue()
+        ->and(inspect('SET GLOBAL general_log = 1', $driver)->passes())->toBeFalse()
+        ->and(inspect('SET GLOBAL session_replication_role = 1', $driver)->passes())->toBeFalse();
+})->with([
+    'mysql' => DbDriver::Mysql,
+    'mariadb' => DbDriver::Mariadb,
+]);
+
+test('a user variable is not mistaken for a server setting', function () {
+    expect(inspect('SET @general_log = 1')->passes())->toBeTrue();
+});
+
+test('harmless PostgreSQL settings still pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeTrue();
+})->with([
+    'SET work_mem' => "SET work_mem = '64MB'",
+    'SET LOCAL work_mem' => "SET LOCAL work_mem = '64MB'",
+    'SET SESSION search_path' => 'SET SESSION search_path = public',
+    'set_config application_name' => "SELECT set_config('application_name', 'report', false)",
+    'set_config search_path' => "SELECT set_config('search_path', 'public', true)",
+    'set_config statement_timeout' => "SELECT set_config('statement_timeout', '0', false)",
+]);
+
 test('state-changing functions make a SELECT a write', function (string $sql) {
     $result = inspect($sql, DbDriver::Pgsql);
 

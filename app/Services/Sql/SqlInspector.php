@@ -48,11 +48,15 @@ use PhpMyAdmin\SqlParser\TokenType;
  *    plpgsql, which passes, as does an explicit trusted language. The body is
  *    then scanned with the unconditional denylist, so a block cannot carry a
  *    DROP DATABASE or a GRANT the guard refuses on its own.
- *  - SET is judged by the variable name, and only in its persistent scopes
- *    (GLOBAL / PERSIST / PERSIST_ONLY, in both the keyword and the "@@scope."
- *    spelling). Variables that name a file path, load code or switch a
- *    protection off are rejected; max_connections, wait_timeout, sql_mode and
- *    the rest pass, and SESSION-scoped writes are never touched.
+ *  - SET is judged by the variable name. Variables that name a file path,
+ *    load code or switch a protection off are rejected; max_connections,
+ *    wait_timeout, sql_mode, work_mem and the rest pass. On MySQL / MariaDB
+ *    only the persistent scopes are guarded (GLOBAL / PERSIST / PERSIST_ONLY,
+ *    in both the keyword and the "@@scope." spelling) and SESSION-scoped
+ *    writes are never touched. PostgreSQL has no persistent SET scope — a
+ *    session setting is the whole door — so on PostgreSQL, and when the
+ *    driver is unknown, a listed name is rejected in every scope: plain SET,
+ *    SET SESSION and SET LOCAL alike.
  *
  * Those two lists live in config/queryproxy.php and can only be extended from
  * the environment, never shortened. {@see self::UNTRUSTED_LANGUAGES} and
@@ -209,10 +213,27 @@ class SqlInspector
     ];
 
     /**
-     * Server variables whose persistent (GLOBAL / PERSIST) value names a file
-     * path, loads code into the server process, or switches a protection off.
-     * Matching is on the exact name, case-insensitively: "general_log" and
-     * "general_log_file" are two separate doors and both are listed.
+     * Server settings whose value names a file path, loads code into the
+     * server process, or switches a protection off. Matching is on the exact
+     * name, case-insensitively: "general_log" and "general_log_file" are two
+     * separate doors and both are listed.
+     *
+     * The list carries the names of both dialects, and the connection's
+     * driver — not the dialect a name belongs to — decides how SET is judged:
+     * on MySQL / MariaDB a listed name is refused only in the persistent
+     * scopes (GLOBAL / PERSIST / PERSIST_ONLY); on PostgreSQL, and when the
+     * driver is unknown, it is refused in every scope (plain SET, SET SESSION,
+     * SET LOCAL). A literal name passed to set_config() is refused on every
+     * driver. The PostgreSQL entries are the settings a session can change
+     * with SET — as an ordinary user or as a superuser — that load a shared
+     * library (session_preload_libraries, local_preload_libraries,
+     * dynamic_library_path), lift a read-only guard
+     * (default_transaction_read_only, transaction_read_only), stop triggers
+     * and foreign keys from firing (session_replication_role), or switch off
+     * a catalog, large-object or page-integrity check
+     * (allow_system_table_mods, lo_compat_privileges, zero_damaged_pages,
+     * ignore_checksum_failure). Settings only a reload or a restart can
+     * change are left out: no SET can reach them.
      *
      * Configuration is merged on top of this list and can only extend it;
      * these entries are the floor.
@@ -220,6 +241,7 @@ class SqlInspector
      * @var list<string>
      */
     public const DANGEROUS_VARIABLES = [
+        // MySQL / MariaDB
         'general_log',
         'general_log_file',
         'slow_query_log',
@@ -232,6 +254,17 @@ class SqlInspector
         'plugin_load_add',
         'secure_file_priv',
         'local_infile',
+        // PostgreSQL
+        'session_preload_libraries',
+        'local_preload_libraries',
+        'dynamic_library_path',
+        'default_transaction_read_only',
+        'transaction_read_only',
+        'session_replication_role',
+        'allow_system_table_mods',
+        'lo_compat_privileges',
+        'zero_damaged_pages',
+        'ignore_checksum_failure',
     ];
 
     /**
@@ -619,7 +652,7 @@ class SqlInspector
             }
         }
 
-        foreach ($this->targetedViolations($sql) as $message) {
+        foreach ($this->targetedViolations($sql, $driver) as $message) {
             $violations[] = "{$label}: {$message}";
         }
 
@@ -829,7 +862,7 @@ class SqlInspector
             }
         }
 
-        foreach ($this->targetedViolations($sql) as $message) {
+        foreach ($this->targetedViolations($sql, DbDriver::Sqlsrv) as $message) {
             $violations[] = "{$label}: {$message}";
         }
 
@@ -3522,7 +3555,7 @@ class SqlInspector
      *
      * @return list<string>
      */
-    private function targetedViolations(string $sql): array
+    private function targetedViolations(string $sql, ?DbDriver $driver): array
     {
         $tokens = $this->significantTokens($sql);
 
@@ -3537,7 +3570,7 @@ class SqlInspector
         }
 
         if ($keyword === 'SET') {
-            return $this->serverVariableViolations($tokens);
+            return $this->serverVariableViolations($tokens, $driver);
         }
 
         if ($keyword === 'CREATE' && isset($tokens[1]) && strtoupper((string) $tokens[1]->value) === 'EXTENSION') {
@@ -4149,9 +4182,15 @@ class SqlInspector
 
     /**
      * SET is judged by the variable being written and by the scope it is
-     * written in. Only the persistent scopes are guarded, in both the keyword
-     * form (SET GLOBAL x = ...) and the variable form (SET @@GLOBAL.x = ...);
-     * a SESSION-scoped write changes nothing for anyone else.
+     * written in. On MySQL / MariaDB only the persistent scopes are guarded,
+     * in both the keyword form (SET GLOBAL x = ...) and the variable form
+     * (SET @@GLOBAL.x = ...); a SESSION-scoped write changes nothing for
+     * anyone else.
+     *
+     * PostgreSQL has no persistent scope to guard: SET, SET SESSION and
+     * SET LOCAL all change the running session, and that is where a preload
+     * library or a replication role takes effect. On PostgreSQL, and when the
+     * driver is unknown, a listed name is therefore rejected in every scope.
      *
      * When the statement carries a leading scope keyword it is applied to
      * every bare assignment in the list, which is the conservative reading:
@@ -4161,8 +4200,9 @@ class SqlInspector
      * @param  list<Token>  $tokens
      * @return list<string>
      */
-    private function serverVariableViolations(array $tokens): array
+    private function serverVariableViolations(array $tokens, ?DbDriver $driver): array
     {
+        $everyScope = $driver === null || $driver === DbDriver::Pgsql;
         $statementScope = null;
         $index = 1;
 
@@ -4181,12 +4221,13 @@ class SqlInspector
         foreach ($this->splitAssignments($tokens, $index) as $assignment) {
             [$scope, $name] = $this->variableReference($assignment, $statementScope);
 
-            if ($name === null || ! in_array($scope, self::PERSISTENT_SCOPES, true)) {
+            if ($name === null || ! in_array($name, $dangerous, true)) {
                 continue;
             }
 
-            if (in_array($name, $dangerous, true)) {
-                $violations[] = "SET {$scope} {$name} is not allowed through QueryProxy: {$name} controls server-side file paths, code loading or a protection switch.";
+            if (in_array($scope, self::PERSISTENT_SCOPES, true) || $everyScope) {
+                $written = $scope === null ? 'SET' : "SET {$scope}";
+                $violations[] = "{$written} {$name} is not allowed through QueryProxy: {$name} controls server-side file paths, code loading or a protection switch.";
             }
         }
 
@@ -4253,6 +4294,11 @@ class SqlInspector
             }
 
             return [$scope, isset($assignment[$offset + 1]) ? $this->identifierValue($assignment[$offset + 1]) : null];
+        }
+
+        // "@x" is a user variable, never a server setting.
+        if ($first->type === TokenType::Symbol && str_starts_with($first->token, '@')) {
+            return [null, null];
         }
 
         $leading = strtoupper((string) $first->value);
