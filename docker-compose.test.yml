@@ -1,6 +1,9 @@
 # Throwaway PostgreSQL for the live guard tests (tests/Live, Pest group
-# "live-pgsql"). Test-only: fixed credentials, no volume, published on 55432 so
-# it does not collide with a local PostgreSQL on 5432. The server listens on
+# "live-pgsql"). Test-only: fixed credentials, published on 55432 so it does
+# not collide with a local PostgreSQL on 5432. The data directory is a tmpfs,
+# so every container starts from a fresh initdb: the image declares a VOLUME
+# there, and a recreated container would otherwise inherit the old cluster
+# and skip POSTGRES_INITDB_ARGS. The server listens on
 # 55432 inside the container too (PGPORT), so the dblink test, which connects
 # from the server itself, reaches it at the same host and port as the tests.
 #
@@ -28,6 +31,8 @@ services:
       POSTGRES_PASSWORD: queryproxy_test
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
       PGPORT: "55432"
+    tmpfs:
+      - /var/lib/postgresql/data
     ports:
       - "127.0.0.1:55432:55432"
     healthcheck:
