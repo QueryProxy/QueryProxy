@@ -31,7 +31,11 @@ use PhpMyAdmin\SqlParser\TokenType;
  * All pattern checks run against a normalized form of the statement (comments
  * stripped, whitespace collapsed, string literals — dollar-quoted bodies
  * included — blanked) so that comment tricks like "DROP/**\/DATABASE" cannot
- * smuggle a forbidden statement past the anchored patterns.
+ * smuggle a forbidden statement past the anchored patterns. Executable
+ * comments are not comments to the server and are not stripped: the body of
+ * a MySQL "/*!...*\/" comment, and on MariaDB (or an unknown driver) of a
+ * MariaDB "/*M!...*\/" comment, is inspected as the SQL it is, whatever
+ * version condition it carries.
  *
  * Three statements are not judged by their syntax but by the dangerous part
  * inside them, because the syntax itself has ordinary DBA uses that the guard
@@ -153,6 +157,18 @@ class SqlInspector
      * before the guard stops reading and rejects it.
      */
     private const MAX_NESTING_DEPTH = 3;
+
+    /**
+     * How deep MariaDB executable comments ("/*M!...*\/") may sit inside one
+     * another before the guard stops exposing them and rejects the SQL.
+     */
+    private const MAX_EXECUTABLE_COMMENT_DEPTH = 3;
+
+    /**
+     * What the guard reports for a version-conditional comment whose end it
+     * cannot place where the server does (see versionConditionalComments()).
+     */
+    private const VERSIONED_COMMENT_BOUNDARY_VIOLATION = 'A version-conditional comment ("/*!NNNNN ... */") nested in or holding another comment, or with "*/" inside a string or line comment in its body, is not allowed: the server, which may skip its body as raw text, would end it at another place than QueryProxy reads.';
 
     /**
      * What SQL Server's batch reader reports for BEGIN TRAN, COMMIT, ROLLBACK
@@ -430,14 +446,34 @@ class SqlInspector
 
     public function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
     {
-        $violations = [];
-
         [$sql, $lexicalViolation] = $this->lexicalView($sql, $driver);
 
         if ($lexicalViolation !== null) {
             return new InspectionResult([], false, [$this->unmaskTemporaryTableMarkers($lexicalViolation)]);
         }
 
+        [$skipped, $versionViolation] = $this->skippedCommentReading($sql, $driver);
+
+        if ($versionViolation !== null) {
+            return new InspectionResult([], false, [$versionViolation]);
+        }
+
+        $executed = $this->inspectView($sql, $driver);
+
+        if ($skipped === null || ! $executed->passes() || $this->splitStatements($skipped) === []) {
+            return $executed;
+        }
+
+        return $this->reconcileSkippedReading($executed, $this->inspectView($skipped, $driver), $driver);
+    }
+
+    /**
+     * Split, transaction-check and judge SQL that has already been through
+     * lexicalView(): one reading of the request as the server may run it.
+     */
+    private function inspectView(string $sql, ?DbDriver $driver): InspectionResult
+    {
+        $violations = [];
         $rawStatements = $this->splitStatements($sql);
 
         if ($rawStatements === []) {
@@ -2340,6 +2376,36 @@ class SqlInspector
             return ["{$label}: {$lexicalViolation}"];
         }
 
+        [$skipped, $versionViolation] = $this->skippedCommentReading($text, $driver);
+
+        if ($versionViolation !== null) {
+            return ["{$label}: {$versionViolation}"];
+        }
+
+        $violations = $this->dynamicSqlReadingViolations($text, $position, $driver, $depth);
+
+        // The server may skip a version-conditional comment in the text
+        // (see skippedCommentReading()); that reading has to pass as well.
+        if ($violations === [] && $skipped !== null) {
+            $violations = array_map(
+                fn (string $violation): string => "{$label}: the server skips a version-conditional comment (\"/*!NNNNN ... */\") when its own version is lower, and the SQL without the comment is not allowed: ".(str_starts_with($violation, "{$label}: ") ? substr($violation, strlen("{$label}: ")) : $violation),
+                $this->dynamicSqlReadingViolations($skipped, $position, $driver, $depth),
+            );
+        }
+
+        return $violations;
+    }
+
+    /**
+     * One reading of the dynamic SQL a statement runs, already through
+     * lexicalView(): split, judged statement by statement and checked for
+     * transaction control.
+     *
+     * @return list<string>
+     */
+    private function dynamicSqlReadingViolations(string $text, int $position, ?DbDriver $driver, int $depth): array
+    {
+        $label = "Statement {$position}";
         $statements = $this->splitStatements($text);
 
         if ($statements === []) {
@@ -4673,7 +4739,16 @@ class SqlInspector
      *    newlines kept), which is what PostgreSQL ignores anyway, so the lexer
      *    is left with nothing it could misread as a comment.
      *  - Unknown driver: the statement may run under either reading, so any
-     *    comment the two readings disagree on is rejected.
+     *    comment the two readings disagree on is rejected. That covers a
+     *    MySQL executable comment ("/*!...*\/"), which the lexer reads as SQL
+     *    and PostgreSQL as a comment, and a MariaDB one ("/*M!...*\/"), which
+     *    both read as a comment but MariaDB runs.
+     *  - MariaDB: the server runs the body of a "/*M!...*\/" comment, which
+     *    the lexer reads as a plain comment. Each one is respelled as the
+     *    "/*!...*\/" comment MariaDB treats identically (see
+     *    exposeMariadbExecutableComments()), so the lexer reads its body as
+     *    SQL and the guard judges it, whatever version condition it carries.
+     *    On MySQL "/*M!" is a plain comment and is left alone.
      *  - Every driver: a block comment that is never closed is rejected.
      *
      * A "#" comment is left to the lexer: it is a comment in MySQL only, and
@@ -4687,7 +4762,30 @@ class SqlInspector
         $unterminated = 'A block comment that is never closed is not allowed.';
 
         if ($driver !== null && $driver !== DbDriver::Pgsql) {
-            return [$sql, $this->hasUnterminatedBlockComment($sql) ? $unterminated : null];
+            // Checked on the SQL as written: a respelled opener left unclosed
+            // is no longer one comment token to the lexer.
+            if ($this->hasUnterminatedBlockComment($sql)) {
+                return [$sql, $unterminated];
+            }
+
+            if ($driver !== DbDriver::Mariadb) {
+                return [$sql, null];
+            }
+
+            // One "/*M!" comment holding another is a single token as
+            // written; once both are exposed the outer one may be left
+            // without a closing marker.
+            $exposed = $this->exposeMariadbExecutableComments($sql);
+
+            if ($exposed === null) {
+                return [$sql, 'MariaDB executable comments ("/*M!...*/") nested more than '.self::MAX_EXECUTABLE_COMMENT_DEPTH.' levels deep are not allowed.'];
+            }
+
+            if ($exposed !== $sql && $this->hasUnclosedExecutableComment($exposed)) {
+                return [$sql, $unterminated];
+            }
+
+            return [$exposed, null];
         }
 
         // An unclosed comment the lexer reports but PostgreSQL does not (one
@@ -4703,6 +4801,12 @@ class SqlInspector
 
         foreach ($postgres['quoted'] as [$start, $end]) {
             $masked = substr_replace($masked, "'".str_repeat(' ', $end - $start - 2)."'", $start, $end - $start);
+        }
+
+        // MariaDB reads "$$" as a name, not a dollar quote, so the comment is
+        // looked for in the SQL as written as well as in the masked text.
+        if ($driver === null && ($this->mariadbExecutableCommentOffsets($sql) !== [] || $this->mariadbExecutableCommentOffsets($masked) !== [])) {
+            return [$sql, 'A MariaDB executable comment ("/*M!...*/") is not allowed when the target database is unknown: MariaDB runs its body while MySQL and PostgreSQL skip it.'];
         }
 
         if ($postgres['comments'] !== $this->lexerCommentRanges($masked)) {
@@ -4722,6 +4826,334 @@ class SqlInspector
         }
 
         return [$sql, null];
+    }
+
+    /**
+     * Respell every MariaDB executable comment the lexer reads as a plain
+     * comment ("/*M!" + optional version) as the MySQL-style executable
+     * comment MariaDB reads the same way ("/*!" + the same version), so the
+     * lexer tokenizes its body as SQL.
+     *
+     * The respelled text is also the text the server runs, so it has to mean
+     * the same to MariaDB. MariaDB takes exactly five or six digits after the
+     * marker as a version and anything shorter as part of the body; the
+     * version is copied and a space is put where the "M" was dropped, so a
+     * digit the server reads as SQL is never glued to the version and the
+     * text keeps its byte length. One exception: MariaDB skips a "/*!" (but
+     * not a "/*M!") comment versioned 50700-99999 as MySQL-only, so such a
+     * version (by value: "/*M!060000" too) is blanked instead. Every MariaDB release since 10.0 is above
+     * it and runs that body unconditionally, which "/*!" with no version
+     * does as well.
+     *
+     * A version that is kept still decides whether the server runs the body;
+     * inspect() judges the request both ways (see skippedCommentReading()).
+     *
+     * Every comment the lexer reports is respelled in one pass. A body that
+     * is exposed this way may hold another "/*M!" comment, so the text is
+     * lexed again, at most MAX_EXECUTABLE_COMMENT_DEPTH times; SQL that still
+     * holds one after that is refused (null). The work stays linear in the
+     * length of the SQL however many comments it holds.
+     */
+    private function exposeMariadbExecutableComments(string $sql): ?string
+    {
+        for ($pass = 0; $pass < self::MAX_EXECUTABLE_COMMENT_DEPTH; $pass++) {
+            $offsets = $this->mariadbExecutableCommentOffsets($sql);
+
+            if ($offsets === []) {
+                return $sql;
+            }
+
+            $respelled = '';
+            $cursor = 0;
+
+            foreach ($offsets as $offset) {
+                preg_match('/\G\/\*M!(\d{5,6})?/', $sql, $match, 0, $offset);
+                $version = $match[1] ?? '';
+
+                if ($version !== '' && (int) $version >= 50700 && (int) $version <= 99999) {
+                    $version = str_repeat(' ', strlen($version));
+                }
+
+                $respelled .= substr($sql, $cursor, $offset - $cursor).'/*!'.$version.' ';
+                $cursor = $offset + strlen($match[0]);
+            }
+
+            $sql = $respelled.substr($sql, $cursor);
+        }
+
+        return $this->mariadbExecutableCommentOffsets($sql) === [] ? $sql : null;
+    }
+
+    /**
+     * True when an executable comment opener ("/*!", with or without a
+     * version) is not matched by a closing "*" + "/" token.
+     */
+    private function hasUnclosedExecutableComment(string $sql): bool
+    {
+        $depth = 0;
+
+        foreach ((new Lexer($sql))->list->tokens as $token) {
+            if ($token->type !== TokenType::Comment) {
+                continue;
+            }
+
+            if (preg_match('/^\/\*!\d*$/', $token->token)) {
+                $depth++;
+            } elseif ($token->token === '*/' && $depth > 0) {
+                $depth--;
+            }
+        }
+
+        return $depth > 0;
+    }
+
+    /**
+     * Byte offsets of every comment token that opens with "/*M!", found in
+     * one lexer pass.
+     *
+     * @return list<int>
+     */
+    private function mariadbExecutableCommentOffsets(string $sql): array
+    {
+        if (! str_contains($sql, '/*M!')) {
+            return [];
+        }
+
+        $offsets = [];
+
+        foreach ($this->tokensWithByteOffsets($sql) as [$token, $offset]) {
+            if ($token->type === TokenType::Comment && str_starts_with((string) $token->token, '/*M!')) {
+                $offsets[] = $offset;
+            }
+        }
+
+        return $offsets;
+    }
+
+    /**
+     * The reading of MySQL / MariaDB SQL in which the server skips every
+     * version-conditional comment ("/*!NNNNN ... *\/"): the body of such a
+     * comment runs only when the server's version is at least NNNNN, and
+     * MariaDB skips a five-digit one versioned 50700-99999 whatever its
+     * version. The guard reads the body as SQL, so inspect() judges this
+     * second reading too. Returns null for the reading when the SQL holds no
+     * such comment (or the driver has none), and the violation when the
+     * comments cannot be read safely (see versionConditionalComments()).
+     *
+     * @return array{0: ?string, 1: ?string} [skipped reading, violation]
+     */
+    private function skippedCommentReading(string $sql, ?DbDriver $driver): array
+    {
+        if (($driver !== DbDriver::Mysql && $driver !== DbDriver::Mariadb) || ! str_contains($sql, '/*!')) {
+            return [null, null];
+        }
+
+        [$ranges, $violation] = $this->versionConditionalComments($sql, $driver);
+
+        if ($violation !== null) {
+            return [null, $violation];
+        }
+
+        return [$ranges === [] ? null : $this->blankRanges($sql, $ranges), null];
+    }
+
+    /**
+     * Byte ranges of the version-conditional comments ("/*!NNNNN ... *\/"),
+     * opener to closing marker, as the server skips them, or the reason they
+     * cannot be located safely. Every condition below keeps the guard to two
+     * readings that cover every server version: all bodies run, or all are
+     * skipped.
+     *
+     *  - The version has five digits, or six on MariaDB. The lexer takes
+     *    every digit after "/*!" as the version while the server takes five
+     *    (six on MariaDB and recent MySQL releases), so any other count would
+     *    be read differently.
+     *  - Every such comment carries the same version. With two versions a
+     *    server between them runs one body and skips the other — a third
+     *    reading the guard does not judge.
+     *  - The comment is not opened inside another executable comment and
+     *    holds no comment itself, and the first "*" + "/" after the opener is
+     *    the one the lexer closes it at. The server skips the body as raw
+     *    text: it does not see the strings in it, and it lets one nested
+     *    comment move the end. Either one would end the comment at another
+     *    place than the guard reads.
+     *  - The comment is closed.
+     *
+     * @return array{0: list<array{0: int, 1: int}>, 1: ?string} [ranges, violation]
+     */
+    private function versionConditionalComments(string $sql, DbDriver $driver): array
+    {
+        $versionLengths = $driver === DbDriver::Mariadb ? [5, 6] : [5];
+        $ranges = [];
+        $versions = [];
+        $openers = [];
+        $versioned = null;
+
+        foreach ($this->tokensWithByteOffsets($sql) as [$token, $offset]) {
+            if ($token->type !== TokenType::Comment) {
+                continue;
+            }
+
+            $text = (string) $token->token;
+
+            if ($text === '*/') {
+                $opener = array_pop($openers);
+
+                if ($opener !== null && $opener === $versioned) {
+                    $bodyStart = $opener[1];
+
+                    if (strpos($sql, '*/', $bodyStart) !== $offset || str_contains(substr($sql, $bodyStart, $offset - $bodyStart), '/*')) {
+                        return [[], self::VERSIONED_COMMENT_BOUNDARY_VIOLATION];
+                    }
+
+                    $ranges[] = [$opener[0], $offset + 2];
+                    $versioned = null;
+                }
+
+                continue;
+            }
+
+            if ($versioned !== null) {
+                return [[], self::VERSIONED_COMMENT_BOUNDARY_VIOLATION];
+            }
+
+            if (! preg_match('/^\/\*!(\d*)$/', $text, $match)) {
+                continue;
+            }
+
+            $opener = [$offset, $offset + strlen($text)];
+
+            if ($match[1] !== '') {
+                if (! in_array(strlen($match[1]), $versionLengths, true)) {
+                    return [[], "A version-conditional comment versioned \"{$match[1]}\" is not allowed: the server and QueryProxy read a version of that many digits differently."];
+                }
+
+                if ($openers !== []) {
+                    return [[], self::VERSIONED_COMMENT_BOUNDARY_VIOLATION];
+                }
+
+                $versions[(int) $match[1]] = true;
+                $versioned = $opener;
+            }
+
+            $openers[] = $opener;
+        }
+
+        if ($versioned !== null) {
+            return [[], 'A block comment that is never closed is not allowed.'];
+        }
+
+        if (count($versions) > 1) {
+            return [[], 'Version-conditional comments ("/*!NNNNN ... */") with different versions in one request are not allowed: QueryProxy checks the SQL with every such comment run and with every one skipped.'];
+        }
+
+        return [$ranges, null];
+    }
+
+    /**
+     * Settle a request that holds a version-conditional comment: the guard
+     * judged it with the comment bodies run ($executed), and the server may
+     * skip them instead ($skipped, see skippedCommentReading()). It passes
+     * only when the skipped reading passes on its own and differs from the
+     * executed one by nothing but the skipped text: the same transaction
+     * shape and statement count, no statement that writes or changes the
+     * schema only in the skipped reading, and, statement by statement, the
+     * same prepared text once the comments are taken out of the executed
+     * one. A LIMIT the guard added or clamped inside a comment body would
+     * otherwise be lost when the server skips it.
+     *
+     * One difference is let through: the default LIMIT the skipped reading
+     * adds to a statement that the executed reading writes with. A write is
+     * not given a default LIMIT, and a request holding one goes through the
+     * write path whichever reading the server picks.
+     *
+     * The text that runs is the executed reading's, version conditions
+     * included, so the server picks between two readings the guard has both
+     * accepted and the request keeps its meaning.
+     */
+    private function reconcileSkippedReading(InspectionResult $executed, InspectionResult $skipped, DbDriver $driver): InspectionResult
+    {
+        $skippedNote = 'The server skips a version-conditional comment ("/*!NNNNN ... */") when its own version is lower';
+
+        if (! $skipped->passes()) {
+            return new InspectionResult($executed->statements, $executed->isTransaction, array_map(
+                fn (string $violation): string => "{$skippedNote}, and the SQL without the comment is not allowed: {$violation}",
+                $skipped->violations,
+            ));
+        }
+
+        $differs = $executed->isTransaction !== $skipped->isTransaction
+            || count($executed->statements) !== count($skipped->statements);
+
+        foreach ($differs ? [] : $executed->statements as $index => $statement) {
+            if (! $this->readsSameWhenSkipped($statement, $skipped->statements[$index], $driver)) {
+                $differs = true;
+
+                break;
+            }
+        }
+
+        if ($differs) {
+            return new InspectionResult($executed->statements, $executed->isTransaction, [
+                "{$skippedNote}, and QueryProxy cannot prepare the SQL so that it reads the same with and without the comment.",
+            ]);
+        }
+
+        return $executed;
+    }
+
+    /**
+     * Whether a statement of the executed reading, with its version-conditional
+     * comments skipped, is the matching statement of the skipped reading (see
+     * reconcileSkippedReading()).
+     */
+    private function readsSameWhenSkipped(StatementInfo $executed, StatementInfo $skipped, DbDriver $driver): bool
+    {
+        if (($skipped->type === StatementType::Write && $executed->type === StatementType::Read)
+            || ($skipped->isDdl && ! $executed->isDdl)) {
+            return false;
+        }
+
+        [$withoutComments, $violation] = $this->skippedCommentReading($executed->preparedSql, $driver);
+
+        if ($violation !== null) {
+            return false;
+        }
+
+        $text = $this->collapseWhitespace($withoutComments ?? $executed->preparedSql);
+
+        return $text === $this->collapseWhitespace($skipped->preparedSql)
+            || ($skipped->limitInjected && $executed->type === StatementType::Write && $text === $this->collapseWhitespace($skipped->sql));
+    }
+
+    private function collapseWhitespace(string $sql): string
+    {
+        return trim((string) preg_replace('/\s+/', ' ', $sql));
+    }
+
+    /**
+     * Every lexer token with the byte offset it starts at, from one lexer
+     * pass. The token texts add up to the SQL, so the offsets are summed;
+     * should they ever not, each one is converted from the lexer position.
+     *
+     * @return list<array{0: Token, 1: int}>
+     */
+    private function tokensWithByteOffsets(string $sql): array
+    {
+        $tokens = array_values((new Lexer($sql))->list->tokens);
+        $withOffsets = [];
+        $offset = 0;
+
+        foreach ($tokens as $token) {
+            $withOffsets[] = [$token, $offset];
+            $offset += strlen((string) $token->token);
+        }
+
+        if ($offset === strlen($sql)) {
+            return $withOffsets;
+        }
+
+        return array_map(fn (Token $token): array => [$token, $this->tokenByteOffset($sql, $token->position)], $tokens);
     }
 
     /**
@@ -5067,7 +5499,9 @@ class SqlInspector
     /**
      * True when the lexer reports a block comment with no closing marker.
      * The opening marker of a MySQL executable comment is its own token and
-     * is closed by a separate token, so it is not one.
+     * is closed by a separate token, so it is not one. A MariaDB "/*M!"
+     * comment is one token to the lexer, closing marker included, so a bare
+     * "/*M!" or "/*M!100000" token is an unclosed comment like any other.
      */
     private function hasUnterminatedBlockComment(string $sql): bool
     {
@@ -5076,7 +5510,7 @@ class SqlInspector
                 continue;
             }
 
-            if (preg_match('/^\/\*(!|M!)\d*$/', $token->token)) {
+            if (preg_match('/^\/\*!\d*$/', $token->token)) {
                 continue;
             }
 
@@ -5255,12 +5689,24 @@ class SqlInspector
      */
     private function blankRanges(string $sql, array $ranges): string
     {
+        usort($ranges, fn (array $a, array $b): int => $a[0] <=> $b[0]);
+
+        $blanked = '';
+        $cursor = 0;
+
         foreach ($ranges as [$start, $end]) {
-            $blank = (string) preg_replace('/[^\r\n]/', ' ', substr($sql, $start, $end - $start));
-            $sql = substr_replace($sql, $blank, $start, $end - $start);
+            $start = max($start, $cursor);
+
+            if ($end <= $start) {
+                continue;
+            }
+
+            $blanked .= substr($sql, $cursor, $start - $cursor)
+                .preg_replace('/[^\r\n]/', ' ', substr($sql, $start, $end - $start));
+            $cursor = $end;
         }
 
-        return $sql;
+        return $blanked.substr($sql, $cursor);
     }
 
     /**

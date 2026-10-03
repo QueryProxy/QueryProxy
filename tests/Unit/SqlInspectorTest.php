@@ -1827,3 +1827,147 @@ test('read-only WITH clauses and exec as a name keep passing as reads', function
     'pgsql, CTE with its own read-only WITH' => ['WITH d AS (WITH x AS (SELECT 1) SELECT * FROM x) SELECT * FROM d', DbDriver::Pgsql],
     'pgsql, exec as a function name' => ['SELECT exec(a) FROM t', DbDriver::Pgsql],
 ]);
+
+// --- MariaDB executable comments ("/*M!...*/") ---
+
+dataset('mariadb executable comment bypasses', [
+    'INTO OUTFILE' => 'SELECT 1 /*M!100000 INTO OUTFILE "/tmp/x" */',
+    'ANALYZE DELETE without WHERE' => 'ANALYZE /*M!100000 DELETE FROM t*/',
+    'ANALYZE DROP TABLE' => 'ANALYZE /*M!100000 DROP TABLE t*/',
+    'no version' => 'SELECT 1 /*M! INTO OUTFILE "/tmp/x" */',
+    'version MariaDB skips on "/*!"' => 'SELECT 1 /*M!50700 INTO OUTFILE "/tmp/x" */',
+    'nested inside another one' => 'SELECT 1 /*M! , 2 /*M!100000 INTO OUTFILE "/tmp/x" */ */',
+    'inside a MySQL executable comment' => 'SELECT 1 /*!50000 , 2 /*M!100000 INTO OUTFILE "/tmp/x" */ */',
+    'behind a multibyte literal' => "SELECT 'ééé' /*M!100000 INTO OUTFILE '/tmp/x' */",
+    'behind a multibyte comment' => 'ANALYZE /* éé */ /*M!100000 DROP TABLE t*/',
+]);
+
+test('a MariaDB executable comment cannot hide code from the guard', function (string $sql) {
+    expect(inspect($sql, DbDriver::Mariadb)->passes())->toBeFalse();
+})->with('mariadb executable comment bypasses');
+
+test('a MariaDB executable comment is rejected when the driver is unknown', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with('mariadb executable comment bypasses');
+
+test('a MariaDB executable comment widening a WHERE clause is judged like the plain clause', function () {
+    $commented = inspect('UPDATE t SET a = 1 WHERE id = 1 /*M! OR 1 = 1 */', DbDriver::Mariadb);
+    $plain = inspect('UPDATE t SET a = 1 WHERE id = 1  OR 1 = 1', DbDriver::Mariadb);
+
+    expect($commented->violations)->toBe($plain->violations)
+        ->and($commented->type())->toBe($plain->type())
+        ->and(inspect('UPDATE t SET a = 1 WHERE id = 1 /*M! OR 1 = 1 */')->passes())->toBeFalse();
+});
+
+test('a harmless MariaDB executable comment passes and is classified by its body', function (string $sql, StatementType $type) {
+    $result = inspect($sql, DbDriver::Mariadb);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe($type);
+})->with([
+    'extra column' => ['SELECT 1 /*M!100000 , 2 */', StatementType::Read],
+    'state-changing call' => ['SELECT 1 /*M!100000 , SLEEP(1) */', StatementType::Write],
+]);
+
+test('a MariaDB executable comment keeps its meaning to the server', function (string $sql, string $prepared) {
+    expect(inspect($sql, DbDriver::Mariadb)->preparedSql())->toBe($prepared);
+})->with([
+    'six-digit version' => ['SELECT 1 /*M!100000 , 2 */', "SELECT 1 /*!100000  , 2 */\nLIMIT 1000"],
+    'five-digit version' => ['SELECT 1 /*M!50600 , 2 */', "SELECT 1 /*!50600  , 2 */\nLIMIT 1000"],
+    'version MariaDB skips on "/*!"' => ['SELECT 1 /*M!50700 , 2 */', "SELECT 1 /*!       , 2 */\nLIMIT 1000"],
+    'six-digit spelling of a version MariaDB skips on "/*!"' => ['SELECT 1 /*M!060000 , 2 */', "SELECT 1 /*!        , 2 */\nLIMIT 1000"],
+    'digit after the version stays code' => ['SELECT 1 /*M!1234567 */', "SELECT 1 /*!123456 7 */\nLIMIT 1000"],
+    'short number is code, not a version' => ['SELECT 1 /*M!2*/', "SELECT 1 /*! 2*/\nLIMIT 1000"],
+]);
+
+test('"/*M!" inside a string literal is left alone', function () {
+    $result = inspect("SELECT '/*M! INTO OUTFILE */' FROM t", DbDriver::Mariadb);
+
+    expect($result->violations)->toBe([])
+        ->and($result->preparedSql())->toContain("'/*M! INTO OUTFILE */'");
+});
+
+test('a "/*M!" comment stays a plain comment on MySQL', function (string $sql, StatementType $type) {
+    $result = inspect($sql, DbDriver::Mysql);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe($type)
+        ->and($result->preparedSql())->toContain('/*M!');
+})->with([
+    'INTO OUTFILE' => ['SELECT 1 /*M!100000 INTO OUTFILE "/tmp/x" */', StatementType::Read],
+    'widened WHERE' => ['UPDATE t SET a = 1 WHERE id = 1 /*M! OR 1 = 1 */', StatementType::Write],
+    'ANALYZE DELETE' => ['ANALYZE /*M!100000 DELETE FROM t*/', StatementType::Write],
+    'ANALYZE DROP TABLE' => ['ANALYZE /*M!100000 DROP TABLE t*/', StatementType::Write],
+    'harmless body' => ['SELECT 1 /*M!100000 , SLEEP(1) */', StatementType::Read],
+]);
+
+test('a MariaDB executable comment that is never closed is rejected', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->violations)->toBe(['A block comment that is never closed is not allowed.']);
+})->with([
+    'mariadb, with a body' => ['SELECT 1 /*M!100000 , 2', DbDriver::Mariadb],
+    'mariadb, bare opener' => ['SELECT 1 /*M!100000', DbDriver::Mariadb],
+    'mariadb, nested opener' => ['SELECT 1 /*M! , 2 /*M!100000 , 3 */', DbDriver::Mariadb],
+    'mysql, bare opener' => ['SELECT 1 /*M!100000', DbDriver::Mysql],
+    'unknown driver' => ['SELECT 1 /*M!100000 , 2', null],
+]);
+
+// --- Version-conditional comments ("/*!NNNNN ... */", "/*M!NNNNNN ... */") ---
+
+dataset('version-conditional comment bypasses', [
+    'mariadb, DELETE WHERE in a skipped "/*M!"' => ['DELETE FROM t /*M!999999 WHERE id = 1 */', DbDriver::Mariadb],
+    'unknown driver, DELETE WHERE in a skipped "/*M!"' => ['DELETE FROM t /*M!999999 WHERE id = 1 */', null],
+    'mariadb, UPDATE WHERE in a skipped "/*M!"' => ['UPDATE t SET a = 1 /*M!120000 WHERE id = 1 */', DbDriver::Mariadb],
+    'mariadb, inside a transaction' => ['BEGIN; DELETE FROM t /*M!999999 WHERE id = 1 */; COMMIT;', DbDriver::Mariadb],
+    'mariadb, LIMIT in a skipped "/*M!"' => ['SELECT * FROM t /*M!999999 LIMIT 1 */', DbDriver::Mariadb],
+    'mariadb, nested "/*M!"' => ['UPDATE t SET a = 1 /*M!999999 /*M! WHERE id = 1 */ */', DbDriver::Mariadb],
+    'mysql, DELETE WHERE in a skipped "/*!"' => ['DELETE FROM t /*!99999 WHERE id = 1 */', DbDriver::Mysql],
+    'mariadb, "/*!" MariaDB always skips' => ['DELETE FROM t /*!60000 WHERE id = 1 */', DbDriver::Mariadb],
+    'mysql, clamped LIMIT in a skipped "/*!"' => ['SELECT * FROM t /*!99999 LIMIT 5000 */', DbDriver::Mysql],
+    'mysql, different versions' => ['SELECT 1 /*!40101 , 2 */ FROM t /*!50000 WHERE 1 = 1 */', DbDriver::Mysql],
+    'mysql, six-digit version' => ['SELECT 1 /*!100000 , 2 */', DbDriver::Mysql],
+    'mariadb, seven-digit version' => ['SELECT 1 /*!1000000 , 2 */', DbDriver::Mariadb],
+    'mysql, "*/" inside a string in the body' => ["DELETE FROM t /*!50000 WHERE a = '*/' */", DbDriver::Mysql],
+    'mysql, comment inside the body' => ['DELETE FROM t /*!50000 WHERE id = 1 /* x */ */', DbDriver::Mysql],
+    'mysql, never closed' => ['SELECT 1 /*!50000 , 2', DbDriver::Mysql],
+    'mysql, dynamic SQL' => ["PREPARE s FROM 'DELETE FROM t /*!99999 WHERE id = 1 */'", DbDriver::Mysql],
+    'mariadb, "/*M!" nested too deep' => ['SELECT 1 /*M! /*M! /*M! /*M! , 2 */ */ */ */', DbDriver::Mariadb],
+    'unknown driver, "/*M!" inside "$$"' => ["SELECT a $$ /*M! , b INTO OUTFILE '/tmp/x' */ FROM t ORDER BY $$", null],
+]);
+
+test('a version-conditional comment the server may skip cannot hide a clause from the guard', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with('version-conditional comment bypasses');
+
+test('a version-conditional comment that reads the same run or skipped passes as written', function (string $sql, DbDriver $driver, string $prepared) {
+    $result = inspect($sql, $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->preparedSql())->toBe($prepared);
+})->with([
+    'mysql, extra column' => ['SELECT 1 /*!50000 , 2 */ FROM t', DbDriver::Mysql, "SELECT 1 /*!50000 , 2 */ FROM t\nLIMIT 1000"],
+    'mysql, same version twice' => ['SELECT 1 /*!50000 , 2 */ FROM t /*!50000 WHERE 1 = 1 */', DbDriver::Mysql, "SELECT 1 /*!50000 , 2 */ FROM t /*!50000 WHERE 1 = 1 */\nLIMIT 1000"],
+    'mysql, extra LIMIT on a DELETE with WHERE' => ['DELETE FROM t WHERE id = 1 /*!50000 LIMIT 5 */', DbDriver::Mysql, 'DELETE FROM t WHERE id = 1 /*!50000 LIMIT 5 */'],
+    'mariadb, extra column' => ['SELECT 1 /*!100000 , 2 */', DbDriver::Mariadb, "SELECT 1 /*!100000 , 2 */\nLIMIT 1000"],
+]);
+
+test('many MariaDB executable comments are resolved in linear time', function (string $comment) {
+    $elapsed = function (string $sql): float {
+        $best = INF;
+
+        foreach (range(1, 3) as $run) {
+            $start = hrtime(true);
+            inspect($sql, DbDriver::Mariadb);
+            $best = min($best, (hrtime(true) - $start) / 1e9);
+        }
+
+        return $best;
+    };
+
+    $count = 5000;
+    $baseline = $elapsed('SELECT 1 '.str_repeat('/*!*/', $count));
+
+    expect($elapsed('SELECT 1 '.str_repeat($comment, $count)))->toBeLessThan($baseline * 5 + 0.5);
+})->with([
+    'unversioned' => '/*M!*/',
+    'versioned' => '/*M!100000*/',
+]);
