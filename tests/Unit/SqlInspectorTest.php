@@ -2040,3 +2040,94 @@ test('text the lexer returns no token for is unreadable, not empty', function (s
     'blank' => ['   ', null],
     'comment only' => ['/* x */', null],
 ]);
+
+dataset('always-true where clauses', [
+    'UPDATE ... WHERE 1=1' => ['UPDATE t SET a=1 WHERE 1=1', 'UPDATE'],
+    'DELETE ... WHERE true' => ['DELETE FROM t WHERE true', 'DELETE'],
+    'DELETE ... OR 1=1' => ['DELETE FROM t WHERE id=1 OR 1=1', 'DELETE'],
+    'UPDATE ... WHERE ((\'x\'=\'x\'))' => ["UPDATE t SET a=1 WHERE (('x'='x'))", 'UPDATE'],
+]);
+
+test('an always-true WHERE clause counts as missing on every driver', function (string $sql, string $verb, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toContain("Statement 1: {$verb} with an always-true WHERE clause is not allowed.");
+})->with('always-true where clauses')->with('every driver');
+
+test('literal tautologies are recognised as always true', function (string $where) {
+    expect(inspect("DELETE FROM t WHERE {$where}")->violations)
+        ->toContain('Statement 1: DELETE with an always-true WHERE clause is not allowed.');
+})->with([
+    '1 = 1', "'a'='a'", '1<>2', '2>1', 'TRUE', '1', 'not false', 'NOT 0', '1 IS NOT NULL',
+    'NULL IS NULL', '((1=1))', '1=1 AND true', 'id = 1 OR (2 > 1 AND true)', 'NULL <=> NULL',
+    '1 = 1 IS TRUE', 'NULL IS NOT TRUE', 'id = 1 || 1 = 1', '1=1 && 2=2',
+]);
+
+test('an always-true WHERE clause is caught on the paths that judge an inner statement', function (string $sql, ?DbDriver $driver, string $violation) {
+    expect(inspect($sql, $driver)->violations)->toContain($violation);
+})->with([
+    'mariadb, executable comment' => ['UPDATE t SET a=1 WHERE id=1 /*M! OR 1=1 */', DbDriver::Mariadb, 'Statement 1: UPDATE with an always-true WHERE clause is not allowed.'],
+    'pgsql, DML inside a CTE' => ['WITH x AS (DELETE FROM t WHERE 1=1 RETURNING *) SELECT * FROM x', DbDriver::Pgsql, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+    'pgsql, EXPLAIN ANALYZE' => ['EXPLAIN ANALYZE DELETE FROM t WHERE 1=1', DbDriver::Pgsql, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+    'pgsql, WITH ... DELETE' => ['WITH a AS (SELECT 1) DELETE FROM t WHERE true RETURNING *', DbDriver::Pgsql, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+    'mariadb, ANALYZE' => ['ANALYZE DELETE FROM t WHERE 1=1', DbDriver::Mariadb, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+    'sqlsrv, batch' => ['SELECT 1 DELETE FROM t WHERE 1=1', DbDriver::Sqlsrv, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+    'sqlsrv, EXEC literal' => ["EXEC('UPDATE t SET a = 1 WHERE 1 = 1')", DbDriver::Sqlsrv, 'Statement 1: UPDATE with an always-true WHERE clause is not allowed.'],
+    'mysql, ORDER BY and LIMIT after the clause' => ['DELETE FROM t WHERE 1=1 ORDER BY id LIMIT 5', DbDriver::Mysql, 'Statement 1: DELETE with an always-true WHERE clause is not allowed.'],
+]);
+
+test('a WHERE clause with a real condition passes', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe(StatementType::Write);
+})->with([
+    'DELETE FROM t WHERE id=1',
+    'UPDATE t SET a=1 WHERE 1=1 AND id=5',
+    'UPDATE t SET a=1 WHERE 1=0 OR id=5',
+    'DELETE FROM t WHERE false',
+    'DELETE FROM t WHERE NULL = NULL',
+    "DELETE FROM t WHERE 'a'='b'",
+    'DELETE FROM t WHERE id BETWEEN 1 AND 5',
+    'UPDATE t SET a = (SELECT 1 FROM u WHERE 1=1) WHERE id = 2',
+    // a = a is false where a is NULL, so it is not always true.
+    'DELETE FROM t WHERE a=a',
+])->with('every driver');
+
+test('a WHERE clause too deeply nested to evaluate is refused, not exhausting memory', function (?DbDriver $driver) {
+    // 1000 nested ORs (~10 KB) once copied the token list at every level
+    // and exhausted a 128M memory_limit with a fatal error.
+    $sql = 'DELETE FROM t WHERE '.str_repeat('(id=1 OR ', 1000).'id=2'.str_repeat(')', 1000);
+
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toContain('Statement 1: DELETE with a WHERE clause too complex to verify is not allowed.');
+})->with('every driver');
+
+test('a moderately nested or long WHERE clause is still evaluated', function () {
+    $nested = str_repeat('(id=1 OR ', 30).'id=2'.str_repeat(')', 30);
+    $list = implode(',', range(1, 5000));
+
+    expect(inspect("DELETE FROM t WHERE {$nested}")->passes())->toBeTrue()
+        ->and(inspect("DELETE FROM t WHERE {$nested} OR 1=1")->violations)
+        ->toContain('Statement 1: DELETE with an always-true WHERE clause is not allowed.')
+        ->and(inspect("DELETE FROM t WHERE a=1 AND (b=2 OR (c=3 AND id IN ({$list})))")->passes())->toBeTrue();
+});
+
+test('TRUE and FALSE compared or tested on SQL Server may name a column and pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Sqlsrv)->passes())->toBeTrue();
+})->with([
+    'DELETE FROM t WHERE true IS NOT NULL',
+    'DELETE FROM t WHERE false IS NOT NULL',
+    'DELETE FROM t WHERE true = true',
+    'DELETE FROM t WHERE (true) = 1',
+]);
+
+test('TRUE and FALSE compared or tested stay constants outside SQL Server', function () {
+    expect(inspect('DELETE FROM t WHERE true IS NOT NULL', DbDriver::Pgsql)->violations)
+        ->toContain('Statement 1: DELETE with an always-true WHERE clause is not allowed.')
+        ->and(inspect('DELETE FROM t WHERE true = true', DbDriver::Mysql)->violations)
+        ->toContain('Statement 1: DELETE with an always-true WHERE clause is not allowed.');
+});

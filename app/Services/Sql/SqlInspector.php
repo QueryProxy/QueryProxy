@@ -5,6 +5,7 @@ namespace App\Services\Sql;
 use App\Enums\DbDriver;
 use App\Enums\StatementType;
 use InvalidArgumentException;
+use OverflowException;
 use PhpMyAdmin\SqlParser\Lexer;
 use PhpMyAdmin\SqlParser\Parser;
 use PhpMyAdmin\SqlParser\Statements\DeleteStatement;
@@ -858,14 +859,25 @@ class SqlInspector
             $type = StatementType::Write;
         }
 
-        // WHERE guard for UPDATE / DELETE.
+        // WHERE guard for UPDATE / DELETE. A WHERE clause that is statically
+        // always true ("WHERE 1=1", "WHERE id=1 OR true") counts as missing.
+        $hasWhere = null;
+
         if ($statement instanceof UpdateStatement || $statement instanceof DeleteStatement) {
-            if ($statement->where === null || $statement->where === []) {
-                $violations[] = "{$label}: ".strtoupper($keyword).' without a WHERE clause is not allowed.';
-            }
+            $hasWhere = $statement->where !== null && $statement->where !== [];
         } elseif (! $parsed && in_array($keyword, ['UPDATE', 'DELETE'], true)) {
-            if (! preg_match('/\bWHERE\b/i', $normalized)) {
-                $violations[] = "{$label}: {$keyword} without a WHERE clause is not allowed.";
+            $hasWhere = (bool) preg_match('/\bWHERE\b/i', $normalized);
+        }
+
+        if ($hasWhere === false) {
+            $violations[] = "{$label}: ".strtoupper($keyword).' without a WHERE clause is not allowed.';
+        } elseif ($hasWhere === true) {
+            $alwaysTrue = $this->whereIsAlwaysTrue($tokens, $wrappingParens, $driver);
+
+            if ($alwaysTrue === null) {
+                $violations[] = "{$label}: ".strtoupper($keyword).' with a WHERE clause too complex to verify is not allowed.';
+            } elseif ($alwaysTrue) {
+                $violations[] = "{$label}: ".strtoupper($keyword).' with an always-true WHERE clause is not allowed.';
             }
         }
 
@@ -888,6 +900,463 @@ class SqlInspector
             new StatementInfo($sql, $preparedSql, $type, $parsed, $limitInjected, $limitClamped, $isDdl),
             $violations,
         ];
+    }
+
+    /**
+     * Clause keywords that end the WHERE clause of an UPDATE or DELETE.
+     */
+    private const WHERE_CLAUSE_TERMINATORS = [
+        'ORDER', 'LIMIT', 'RETURNING', 'OPTION', 'OFFSET', 'FETCH', 'GROUP', 'HAVING', 'WINDOW',
+        'FOR', 'UNION', 'EXCEPT', 'INTERSECT', 'INTO',
+    ];
+
+    /**
+     * Comparison operators a constant WHERE operand is judged with.
+     */
+    private const CONSTANT_COMPARISON_OPERATORS = ['=', '<>', '!=', '<', '>', '<=', '>=', '<=>'];
+
+    /**
+     * How deep the constant evaluator may recurse into a WHERE clause, and
+     * how many tokens it may visit in all. A clause past either bound is
+     * not judged "not always true": it is refused (fail closed), so a
+     * deeply nested clause can neither exhaust the worker nor slip through.
+     */
+    private const CONSTANT_EVALUATION_MAX_DEPTH = 128;
+
+    private const CONSTANT_EVALUATION_MAX_STEPS = 500_000;
+
+    /**
+     * Tokens the constant evaluator has visited for the current WHERE clause.
+     */
+    private int $constantEvaluationSteps = 0;
+
+    /**
+     * Whether the WHERE clause of an UPDATE / DELETE is statically always
+     * true, so that it filters nothing: "1=1", "true", "'a'='a'", "NOT 0",
+     * "NULL IS NULL", an OR with such an operand, or an AND whose operands
+     * all are. The check is best-effort: only literals (numbers, plain
+     * single-quoted strings, TRUE / FALSE / NULL) are evaluated; a column,
+     * a function call, a subquery, a cast or any other operator leaves the
+     * operand unknown, and an unknown operand never makes the clause true.
+     * "a = a" is not judged: a NULL in the column makes it false there.
+     *
+     * Null means the clause is too deeply nested or too long to evaluate
+     * within the evaluator's bounds; the caller refuses the statement.
+     *
+     * The clause is read from the token stream at the statement's own
+     * nesting level, so a WHERE inside a subquery of SET is not taken for
+     * the statement's.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function whereIsAlwaysTrue(array $tokens, int $wrappingParens, ?DbDriver $driver): ?bool
+    {
+        $level = 0;
+        $start = null;
+        $count = count($tokens);
+
+        for ($index = 0; $index < $count; $index++) {
+            $token = $tokens[$index];
+
+            if ($this->isOperator($token, '(')) {
+                $level++;
+
+                continue;
+            }
+
+            if ($this->isOperator($token, ')')) {
+                $level--;
+
+                if ($start !== null && $level < $wrappingParens) {
+                    break;
+                }
+
+                continue;
+            }
+
+            // RETURNING and other words the lexer does not know lex as a
+            // bare name, so the clause keywords are matched on both types.
+            if ($level !== $wrappingParens || ! in_array($token->type, [TokenType::Keyword, TokenType::None], true)) {
+                continue;
+            }
+
+            $word = $this->firstWord($token);
+
+            if ($start === null) {
+                if ($word === 'WHERE') {
+                    $start = $index + 1;
+                }
+
+                continue;
+            }
+
+            if (in_array($word, self::WHERE_CLAUSE_TERMINATORS, true)) {
+                break;
+            }
+        }
+
+        if ($start === null) {
+            return false;
+        }
+
+        $this->constantEvaluationSteps = 0;
+
+        try {
+            $value = $this->constantValue($tokens, $start, $index, $driver);
+        } catch (OverflowException) {
+            return null;
+        }
+
+        return $value !== null && $this->constantTruth($value) === true;
+    }
+
+    /**
+     * Count $steps visited tokens against the evaluator's budget and check
+     * the recursion depth.
+     *
+     * @throws OverflowException when either bound is passed
+     */
+    private function chargeConstantEvaluation(int $steps, int $depth): void
+    {
+        $this->constantEvaluationSteps += $steps;
+
+        if ($depth > self::CONSTANT_EVALUATION_MAX_DEPTH
+            || $this->constantEvaluationSteps > self::CONSTANT_EVALUATION_MAX_STEPS) {
+            throw new OverflowException('The WHERE clause is too complex to evaluate.');
+        }
+    }
+
+    /**
+     * The constant value of the expression $tokens[$from, $to), or null
+     * when it is not a constant the guard can evaluate. A value is
+     * [kind, value] with kind one of bool, number, string (its raw, quoted
+     * spelling) or null. Precedence follows MySQL and PostgreSQL: OR binds
+     * loosest, then AND, then NOT, then IS and the comparisons. MySQL's
+     * "||" and "&&" are read as OR and AND on MySQL, MariaDB and an unknown
+     * driver (also under PIPES_AS_CONCAT, where "||" concatenates: fail
+     * closed); elsewhere "||" concatenates and leaves the operand unknown.
+     *
+     * The expression is addressed by index range, never copied, so memory
+     * stays linear in the clause; $depth and the step budget bound the work
+     * (chargeConstantEvaluation()). $operand is true below a comparison or
+     * an IS test, where SQL Server reads TRUE / FALSE as column names.
+     *
+     * @param  list<Token>  $tokens
+     * @return ?array{0: string, 1: mixed}
+     *
+     * @throws OverflowException when the clause passes the evaluator's bounds
+     */
+    private function constantValue(array $tokens, int $from, int $to, ?DbDriver $driver, int $depth = 0, bool $operand = false): ?array
+    {
+        $this->chargeConstantEvaluation(0, $depth);
+
+        if ($from >= $to) {
+            return null;
+        }
+
+        $logical = $driver === null || $driver === DbDriver::Mysql || $driver === DbDriver::Mariadb;
+
+        $operands = $this->splitTopLevel($tokens, $from, $to, 'OR', $logical ? '||' : null);
+
+        if (count($operands) > 1) {
+            $allFalse = true;
+
+            foreach ($operands as [$operandFrom, $operandTo]) {
+                $value = $this->constantValue($tokens, $operandFrom, $operandTo, $driver, $depth + 1, $operand);
+                $truth = $value === null ? null : $this->constantTruth($value);
+
+                if ($truth === true) {
+                    return ['bool', true];
+                }
+
+                $allFalse = $allFalse && $truth === false;
+            }
+
+            return $allFalse ? ['bool', false] : null;
+        }
+
+        $operands = $this->splitTopLevel($tokens, $from, $to, 'AND', $logical ? '&&' : null);
+
+        if (count($operands) > 1) {
+            foreach ($operands as [$operandFrom, $operandTo]) {
+                $value = $this->constantValue($tokens, $operandFrom, $operandTo, $driver, $depth + 1, $operand);
+
+                if ($value === null || $this->constantTruth($value) !== true) {
+                    return null;
+                }
+            }
+
+            return ['bool', true];
+        }
+
+        $first = $tokens[$from];
+
+        if ($to - $from > 1 && $this->isWordAt($tokens, $from, 'NOT') && $this->tokenWords($first) === ['NOT']) {
+            $value = $this->constantValue($tokens, $from + 1, $to, $driver, $depth + 1, $operand);
+            $truth = $value === null ? null : $this->constantTruth($value);
+
+            if ($value !== null && $value[0] === 'null') {
+                return ['null', null];
+            }
+
+            return $truth === null ? null : ['bool', ! $truth];
+        }
+
+        $last = $to - 1;
+
+        if ($this->isOperator($first, '(')) {
+            $close = $this->matchingParenthesisAt($tokens, $from);
+            $this->chargeConstantEvaluation(($close ?? count($tokens)) - $from, $depth);
+
+            if ($close === $last) {
+                return $this->constantValue($tokens, $from + 1, $last, $driver, $depth + 1, $operand);
+            }
+        }
+
+        $isTest = $this->constantIsTest($tokens, $from, $to, $driver, $depth);
+
+        if ($isTest !== false) {
+            return $isTest;
+        }
+
+        $comparison = null;
+        $level = 0;
+        $this->chargeConstantEvaluation($to - $from, $depth);
+
+        for ($index = $from; $index < $to; $index++) {
+            $token = $tokens[$index];
+
+            if ($this->isOperator($token, '(')) {
+                $level++;
+            } elseif ($this->isOperator($token, ')')) {
+                $level--;
+            } elseif ($level === 0 && $token->type === TokenType::Operator
+                && in_array($token->token, self::CONSTANT_COMPARISON_OPERATORS, true)) {
+                if ($comparison !== null) {
+                    return null;
+                }
+
+                $comparison = $index;
+            }
+        }
+
+        if ($comparison !== null) {
+            $left = $this->constantValue($tokens, $from, $comparison, $driver, $depth + 1, true);
+
+            if ($left === null) {
+                return null;
+            }
+
+            $right = $this->constantValue($tokens, $comparison + 1, $to, $driver, $depth + 1, true);
+
+            if ($right === null) {
+                return null;
+            }
+
+            return $this->compareConstants($left, (string) $tokens[$comparison]->token, $right);
+        }
+
+        return $to - $from === 1 ? $this->literalValue($first, $driver, $operand) : null;
+    }
+
+    /**
+     * The value of "<operand> IS [NOT] NULL | TRUE | FALSE" over
+     * $tokens[$from, $to): null when the operand or the test cannot be
+     * evaluated, false when the range is not such a test.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: string, 1: mixed}|false|null
+     *
+     * @throws OverflowException when the clause passes the evaluator's bounds
+     */
+    private function constantIsTest(array $tokens, int $from, int $to, ?DbDriver $driver, int $depth): array|false|null
+    {
+        $is = null;
+        $level = 0;
+        $this->chargeConstantEvaluation($to - $from, $depth);
+
+        for ($index = $from; $index < $to; $index++) {
+            $token = $tokens[$index];
+
+            if ($this->isOperator($token, '(')) {
+                $level++;
+            } elseif ($this->isOperator($token, ')')) {
+                $level--;
+            } elseif ($level === 0 && $this->isWordAt($tokens, $index, 'IS')) {
+                $is = $index;
+            }
+        }
+
+        if ($is === null || $is === $from) {
+            return false;
+        }
+
+        $words = [];
+
+        for ($index = $is + 1; $index < $to; $index++) {
+            $token = $tokens[$index];
+
+            if (! in_array($token->type, [TokenType::Keyword, TokenType::Bool], true)) {
+                return null;
+            }
+
+            array_push($words, ...$this->tokenWords($token));
+        }
+
+        $negated = ($words[0] ?? null) === 'NOT';
+
+        if ($negated) {
+            array_shift($words);
+        }
+
+        if (count($words) !== 1 || ! in_array($words[0], ['NULL', 'TRUE', 'FALSE'], true)) {
+            return null;
+        }
+
+        $value = $this->constantValue($tokens, $from, $is, $driver, $depth + 1, true);
+
+        if ($value === null) {
+            return null;
+        }
+
+        if ($words[0] === 'NULL') {
+            $result = $value[0] === 'null';
+        } else {
+            $truth = $this->constantTruth($value);
+
+            if ($truth === null && $value[0] !== 'null') {
+                return null;
+            }
+
+            $result = $truth === ($words[0] === 'TRUE');
+        }
+
+        return ['bool', $negated ? ! $result : $result];
+    }
+
+    /**
+     * Split $tokens[$from, $to) at the keyword $word (or the operator
+     * $operator) where it stands outside every parenthesis. Each part is
+     * returned as its [from, to) index range.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<array{0: int, 1: int}>
+     *
+     * @throws OverflowException when the clause passes the evaluator's bounds
+     */
+    private function splitTopLevel(array $tokens, int $from, int $to, string $word, ?string $operator): array
+    {
+        $parts = [];
+        $partFrom = $from;
+        $level = 0;
+        $this->chargeConstantEvaluation($to - $from, 0);
+
+        for ($index = $from; $index < $to; $index++) {
+            $token = $tokens[$index];
+
+            if ($this->isOperator($token, '(')) {
+                $level++;
+            } elseif ($this->isOperator($token, ')')) {
+                $level--;
+            } elseif ($level === 0
+                && (($this->isWordAt($tokens, $index, $word) && $this->tokenWords($token) === [$word])
+                    || ($operator !== null && $this->isOperator($token, $operator)))) {
+                $parts[] = [$partFrom, $index];
+                $partFrom = $index + 1;
+            }
+        }
+
+        $parts[] = [$partFrom, $to];
+
+        return $parts;
+    }
+
+    /**
+     * The constant a single token spells: a decimal number, a plain
+     * single-quoted string, TRUE / FALSE or NULL. Hexadecimal and binary
+     * numbers, double-quoted text (a name in PostgreSQL and SQL Server)
+     * and prefixed strings (N'..', E'..', X'..') are not evaluated.
+     *
+     * T-SQL does not reserve TRUE and FALSE: as the operand of a
+     * comparison or an IS test ($operand) they may name a column, so SQL
+     * Server leaves them unknown there. Standing alone as a predicate
+     * ("WHERE true") they are still read as constants: no column could
+     * stand there in T-SQL, and refusing it fails closed.
+     *
+     * @return ?array{0: string, 1: mixed}
+     */
+    private function literalValue(Token $token, ?DbDriver $driver, bool $operand): ?array
+    {
+        return match (true) {
+            $token->type === TokenType::Number
+                && ($token->flags & (Token::FLAG_NUMBER_HEX | Token::FLAG_NUMBER_BINARY)) === 0
+                && (is_int($token->value) || is_float($token->value)) => ['number', $token->value],
+            $token->type === TokenType::String
+                && ($token->flags & Token::FLAG_STRING_SINGLE_QUOTES) !== 0 => ['string', (string) $token->token],
+            $token->type === TokenType::Bool => $operand && $driver === DbDriver::Sqlsrv
+                ? null
+                : ['bool', (bool) $token->value],
+            $token->type === TokenType::Keyword && $this->tokenWords($token) === ['NULL'] => ['null', null],
+            default => null,
+        };
+    }
+
+    /**
+     * Whether a constant makes a row pass a WHERE clause: true, false, or
+     * null when that depends on the dialect (a string) or is NULL's
+     * "unknown", which filters the row out like false but is not false.
+     *
+     * @param  array{0: string, 1: mixed}  $value
+     */
+    private function constantTruth(array $value): ?bool
+    {
+        return match ($value[0]) {
+            'bool' => (bool) $value[1],
+            'number' => $value[1] != 0,
+            default => null,
+        };
+    }
+
+    /**
+     * The result of comparing two constants, or null when the dialects
+     * would not agree on it: strings are only judged when they are spelled
+     * identically (collations make 'a' = 'A' true in MySQL), and values of
+     * different kinds are not compared.
+     *
+     * @param  array{0: string, 1: mixed}  $left
+     * @param  array{0: string, 1: mixed}  $right
+     * @return ?array{0: string, 1: mixed}
+     */
+    private function compareConstants(array $left, string $operator, array $right): ?array
+    {
+        if ($left[0] === 'null' || $right[0] === 'null') {
+            return $operator === '<=>'
+                ? ['bool', $left[0] === $right[0]]
+                : ['null', null];
+        }
+
+        if ($left[0] !== $right[0]) {
+            return null;
+        }
+
+        if ($left[0] === 'string') {
+            if ($left[1] !== $right[1]) {
+                return null;
+            }
+
+            $order = 0;
+        } else {
+            $order = $left[1] <=> $right[1];
+        }
+
+        return ['bool', match ($operator) {
+            '=', '<=>' => $order === 0,
+            '<>', '!=' => $order !== 0,
+            '<' => $order < 0,
+            '>' => $order > 0,
+            '<=' => $order <= 0,
+            default => $order >= 0,
+        }];
     }
 
     /**
