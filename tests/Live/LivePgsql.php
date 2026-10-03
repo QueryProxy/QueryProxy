@@ -124,10 +124,56 @@ final class LivePgsql
         return $this->db()->selectOne('SELECT label FROM items WHERE id = ?', [$id])?->label;
     }
 
-    /** A libpq connection string that reaches this database from inside the server. */
+    /**
+     * A libpq connection string that reaches this database from inside the server.
+     *
+     * dblink connects from the PostgreSQL backend, not from the test process,
+     * so the string carries everything a password-protected server needs:
+     * dbname and user, plus host, port and password when they are configured.
+     * Without a host, libpq falls back to the server's local socket.
+     *
+     * The address the tests use is not always the one the server sees itself
+     * on: a container that publishes 5432 as 55432 (docker-compose.test.yml)
+     * still listens on 5432 inside its own network.
+     * QUERYPROXY_LIVE_PGSQL_SERVER_HOST and QUERYPROXY_LIVE_PGSQL_SERVER_PORT
+     * override HOST and PORT for this string only.
+     */
     public function serverSideDsn(): string
     {
-        return sprintf("dbname='%s' user='%s'", self::env('DATABASE', 'postgres'), self::env('USERNAME', 'postgres'));
+        return self::serverSideConnectionString();
+    }
+
+    /** serverSideDsn(), read from the environment without starting a schema. */
+    public static function serverSideConnectionString(): string
+    {
+        return self::connectionString([
+            'host' => self::env('SERVER_HOST', self::env('HOST')),
+            'port' => self::env('SERVER_PORT', self::env('PORT')),
+            'dbname' => self::env('DATABASE', 'postgres'),
+            'user' => self::env('USERNAME', 'postgres'),
+            'password' => self::env('PASSWORD'),
+        ]);
+    }
+
+    /**
+     * A libpq keyword/value connection string; empty values are left out.
+     *
+     * Every value is single-quoted with backslashes and single quotes
+     * backslash-escaped, so spaces, '=' and quotes in a password survive.
+     *
+     * @param  array<string, string>  $params
+     */
+    public static function connectionString(array $params): string
+    {
+        $pairs = [];
+
+        foreach ($params as $keyword => $value) {
+            if ($value !== '') {
+                $pairs[] = $keyword."='".addcslashes($value, "\\'")."'";
+            }
+        }
+
+        return implode(' ', $pairs);
     }
 
     public function quote(string $value): string

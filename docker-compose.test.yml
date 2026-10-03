@@ -7,8 +7,12 @@
 #   QUERYPROXY_LIVE_PGSQL_DATABASE=queryproxy_test \
 #   QUERYPROXY_LIVE_PGSQL_USERNAME=queryproxy_test \
 #   QUERYPROXY_LIVE_PGSQL_PASSWORD=queryproxy_test \
+#   QUERYPROXY_LIVE_PGSQL_SERVER_PORT=5432 \
 #   ./vendor/bin/pest --group=live-pgsql
 #   docker compose -f docker-compose.test.yml down
+#
+# SERVER_PORT is the port the server listens on inside the container: the
+# dblink test connects from the server itself, where 55432 does not exist.
 #
 # The image's POSTGRES_USER is a superuser, which the tests need: most of the
 # settings the guard refuses can only be changed by one, and so can dblink.
