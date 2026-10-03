@@ -555,6 +555,7 @@ class SqlInspector
         [$sql, $lexicalViolation] = $this->resolveComments($sql, $driver);
         $lexicalViolation ??= $this->unicodeEscapeClauseViolation($sql, $driver);
         $lexicalViolation ??= $this->dollarQuoteDialectViolation($sql, $driver);
+        $lexicalViolation ??= $this->postgresLexicalViolation($sql, $driver);
         $dialectRanges = null;
 
         if ($lexicalViolation === null && ($driver === DbDriver::Sqlsrv || $driver === DbDriver::Sqlite)) {
@@ -5387,9 +5388,9 @@ class SqlInspector
      *    On MySQL "/*M!" is a plain comment and is left alone.
      *  - Every driver: a block comment that is never closed is rejected.
      *
-     * A "#" comment is left to the lexer: it is a comment in MySQL only, and
-     * its PostgreSQL reading is part of the driver-aware tokenization that is
-     * still to come.
+     * A "#" comment is left to the lexer: it is a comment in MySQL only. On
+     * PostgreSQL and an unknown driver a "#" outside a string or a comment is
+     * refused afterwards (see postgresLexicalViolation()).
      *
      * @return array{0: string, 1: ?string} [sql to inspect, violation]
      */
@@ -6134,6 +6135,117 @@ class SqlInspector
     }
 
     /**
+     * Refuse, on PostgreSQL and on an unknown driver, the backslashes and
+     * "#" signs the lexer reads differently from PostgreSQL.
+     *
+     * The lexer reads SQL as MySQL does: a backslash escapes the next
+     * character inside any string or quoted name, and "#" starts a comment.
+     * In PostgreSQL (standard_conforming_strings on) a backslash is a plain
+     * character outside an E'...' string, and "#" is the bitwise XOR
+     * operator. "SELECT 'a\', pg_read_file('/etc/passwd') --'" is one string
+     * to the lexer but a call to PostgreSQL, and "SELECT 1 # 1; DELETE ..."
+     * hides a second statement in a comment the server does not see.
+     *
+     * Fail-closed, with PostgreSQL's own reading (postgresLexicalRanges()):
+     *  - a backslash is allowed only in a comment, a dollar-quoted string, an
+     *    E'...' string, or a U& string or identifier whose escapes are all
+     *    well formed (a U& escape never stands before the closing quote, so
+     *    both sides end it at the same place);
+     *  - a "#" is allowed only in a comment, a dollar-quoted string, a string
+     *    or a quoted identifier.
+     */
+    private function postgresLexicalViolation(string $sql, ?DbDriver $driver): ?string
+    {
+        if ($driver !== null && $driver !== DbDriver::Pgsql) {
+            return null;
+        }
+
+        $hasBackslash = str_contains($sql, '\\');
+        $hasHash = str_contains($sql, '#');
+
+        if (! $hasBackslash && ! $hasHash) {
+            return null;
+        }
+
+        $postgres = $this->postgresLexicalRanges($sql);
+
+        if ($postgres === null) {
+            return 'A block comment that is never closed is not allowed.';
+        }
+
+        $target = $driver === null ? 'the target database is unknown' : 'the target is PostgreSQL';
+        $backslashAdvice = $driver === null
+            ? 'Select a connection so the SQL is read in its dialect.'
+            : "Use an E'...' string or a dollar-quoted string instead.";
+        $opaque = array_merge($postgres['comments'], $postgres['quoted']);
+        $escaping = $opaque;
+
+        foreach ($postgres['strings'] as [$start, $end, $kind]) {
+            $opaque[] = [$start, $end];
+
+            if ($kind === 'escape' || ($kind === 'unicode' && $this->hasWellFormedUnicodeEscapes(substr($sql, $start + 1, $end - $start - 2)))) {
+                $escaping[] = [$start, $end];
+            }
+        }
+
+        if ($hasBackslash && ! $this->allWithinRanges($this->bytePositions($sql, '\\'), $escaping)) {
+            return "QueryProxy reads a backslash in this SQL differently from PostgreSQL (outside an E'...' string it does not escape a quote), so it cannot inspect it safely when {$target}. {$backslashAdvice}";
+        }
+
+        if ($hasHash && ! $this->allWithinRanges($this->bytePositions($sql, '#'), $opaque)) {
+            return "\"#\" is an operator in PostgreSQL, not a comment; QueryProxy cannot read SQL that uses it outside a string or a comment when {$target}. Start a comment with \"-- \" instead.";
+        }
+
+        return null;
+    }
+
+    /**
+     * Byte offsets, ascending, of every occurrence of a single byte.
+     *
+     * @return list<int>
+     */
+    private function bytePositions(string $sql, string $byte): array
+    {
+        $positions = [];
+        $offset = 0;
+
+        while (($offset = strpos($sql, $byte, $offset)) !== false) {
+            $positions[] = $offset;
+            $offset++;
+        }
+
+        return $positions;
+    }
+
+    /**
+     * True when every backslash in the body of a U& string or identifier
+     * starts an escape PostgreSQL accepts with the default escape character:
+     * "\\", "\XXXX" or "\+XXXXXX". A malformed escape (a backslash before
+     * the closing quote among them) is an error in PostgreSQL, but the lexer
+     * would read it as escaping the next character.
+     */
+    private function hasWellFormedUnicodeEscapes(string $body): bool
+    {
+        $offset = 0;
+
+        while (($offset = strpos($body, '\\', $offset)) !== false) {
+            if (($body[$offset + 1] ?? '') === '\\') {
+                $offset += 2;
+
+                continue;
+            }
+
+            if (! preg_match('/\\\\(?:[0-9A-Fa-f]{4}|\+[0-9A-Fa-f]{6})/A', $body, $match, 0, $offset)) {
+                return false;
+            }
+
+            $offset += strlen($match[0]);
+        }
+
+        return true;
+    }
+
+    /**
      * True when the lexer reports a block comment with no closing marker.
      * The opening marker of a MySQL executable comment is its own token and
      * is closed by a separate token, so it is not one. A MariaDB "/*M!"
@@ -6171,12 +6283,18 @@ class SqlInspector
      * Plain '...' strings are read with standard_conforming_strings on, the
      * PostgreSQL default since 9.1.
      *
-     * @return array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>}|null
+     * "quoted" holds the dollar-quoted strings; "strings" holds every '...'
+     * string and "..." identifier, quotes included, with how PostgreSQL reads
+     * a backslash in it: "escape" for an E'...' string, "unicode" for a U&
+     * string or identifier, "plain" for the rest.
+     *
+     * @return array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}|null
      */
     private function postgresLexicalRanges(string $sql): ?array
     {
         $comments = [];
         $quoted = [];
+        $strings = [];
         $length = strlen($sql);
         $offset = 0;
 
@@ -6221,16 +6339,16 @@ class SqlInspector
                 continue;
             }
 
-            if ($char === "'") {
-                $escapes = ($previous === 'E' || $previous === 'e')
+            if ($char === "'" || $char === '"') {
+                $escapes = $char === "'"
+                    && ($previous === 'E' || $previous === 'e')
                     && ! $this->isPostgresIdentifierCharacter($offset > 1 ? $sql[$offset - 2] : '');
-                $offset = $this->skipPostgresQuoted($sql, $offset, $escapes);
-
-                continue;
-            }
-
-            if ($char === '"') {
-                $offset = $this->skipPostgresQuoted($sql, $offset, false);
+                $unicode = $previous === '&'
+                    && $offset > 1 && ($sql[$offset - 2] === 'U' || $sql[$offset - 2] === 'u')
+                    && ! $this->isPostgresIdentifierCharacter($offset > 2 ? $sql[$offset - 3] : '');
+                $end = $this->skipPostgresQuoted($sql, $offset, $escapes);
+                $strings[] = [$offset, $end, $escapes ? 'escape' : ($unicode ? 'unicode' : 'plain')];
+                $offset = $end;
 
                 continue;
             }
@@ -6253,7 +6371,7 @@ class SqlInspector
             $offset++;
         }
 
-        return ['comments' => $comments, 'quoted' => $quoted];
+        return ['comments' => $comments, 'quoted' => $quoted, 'strings' => $strings];
     }
 
     /**

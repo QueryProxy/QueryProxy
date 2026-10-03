@@ -222,15 +222,16 @@ test('a data-modifying CTE is classified as a write, not a read', function () {
     expect($result->type())->toBe(StatementType::Write);
 });
 
-test('a trailing line comment cannot swallow the injected limit', function (string $sql) {
-    $prepared = inspect($sql)->statements[0]->preparedSql;
+test('a trailing line comment cannot swallow the injected limit', function (string $sql, ?DbDriver $driver) {
+    $prepared = inspect($sql, $driver)->statements[0]->preparedSql;
 
     // The injected LIMIT must sit on its own line, outside the comment.
     expect($prepared)->toContain("\nLIMIT 1000")
         ->and($prepared)->toEndWith('LIMIT 1000');
 })->with([
-    'dash comment' => 'SELECT * FROM users --',
-    'hash comment' => 'SELECT * FROM users #',
+    'dash comment' => ['SELECT * FROM users --', null],
+    // "#" is a comment only in MySQL; an unknown driver refuses it.
+    'hash comment' => ['SELECT * FROM users #', DbDriver::Mysql],
 ]);
 
 test('an arithmetic or otherwise unparseable LIMIT is rejected, not left unclamped', function () {
@@ -822,7 +823,7 @@ test('an EXPLAIN option the guard does not know is rejected', function (string $
     'unknown option' => 'EXPLAIN (FROBNICATE) DELETE FROM t WHERE id=1',
     'option with an expression value' => 'EXPLAIN (COSTS (true)) DELETE FROM t WHERE id=1',
     'ANALYZE yes, not a defGetBoolean value' => 'EXPLAIN (ANALYZE yes) DELETE FROM t WHERE id=1',
-    'ANALYZE with an escaped string value' => "EXPLAIN (ANALYZE 'o\\ff') DELETE FROM t WHERE id=1",
+    'ANALYZE with an escaped string value' => "EXPLAIN (ANALYZE E'o\\ff') DELETE FROM t WHERE id=1",
     'wrapped in parentheses' => '(EXPLAIN ANALYZE DELETE FROM t WHERE id=1)',
 ]);
 
@@ -1687,15 +1688,77 @@ test('a statement after a SQL Server temporary table is still inspected', functi
     'DEL character next to a temporary table' => "SELECT 1 FROM #t\x7F",
 ]);
 
-test('# keeps its meaning in MySQL and PostgreSQL', function () {
+test('# keeps its comment meaning in MySQL and is refused as an operator in PostgreSQL', function () {
     $mysql = inspect("SELECT * FROM t # DELETE FROM t\n", DbDriver::Mysql);
     $pgsql = inspect('SELECT 5 # 3', DbDriver::Pgsql);
 
     expect($mysql->violations)->toBe([])
         ->and($mysql->type())->toBe(StatementType::Read)
-        ->and($pgsql->violations)->toBe([])
-        ->and($pgsql->type())->toBe(StatementType::Read);
+        ->and($pgsql->passes())->toBeFalse()
+        ->and($pgsql->violations[0])->toContain('"#" is an operator in PostgreSQL');
 });
+
+// --- PostgreSQL reads backslashes and "#" differently from the lexer ---
+
+test('SQL PostgreSQL reads differently because of a backslash or "#" is refused', function (string $sql, ?DbDriver $driver, string $needle) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->statements)->toBe([])
+        ->and($result->violations)->toHaveCount(1)
+        ->and($result->violations[0])->toContain($needle);
+})->with([
+    'backslash ends a string, second statement' => ["SELECT 'a\\'; DELETE FROM users; --'", DbDriver::Pgsql, 'reads a backslash'],
+    '"#" hides a second statement' => ['SELECT 1 # 1; DELETE FROM users', DbDriver::Pgsql, '"#" is an operator'],
+    'backslash hides a file IO call' => ["SELECT 'a\\', pg_read_file('/etc/passwd') --'", DbDriver::Pgsql, 'reads a backslash'],
+    'backslash in a quoted identifier' => ['SELECT "a\\b" FROM t', DbDriver::Pgsql, 'reads a backslash'],
+    'XOR operator' => ['SELECT 1 # 2', DbDriver::Pgsql, '"#" is an operator'],
+    'backslash in an N string' => ["SELECT N'a\\' AS x", DbDriver::Pgsql, 'reads a backslash'],
+    'backslash outside any string' => ['SELECT 1 \\ 2', DbDriver::Pgsql, 'reads a backslash'],
+    'malformed U& escape before the quote' => ["SELECT U&'a\\', pg_read_file('/etc/passwd') --'", DbDriver::Pgsql, 'reads a backslash'],
+    'E prefix glued to a name is not an E string' => ["SELECT nameE'a\\' AS x", DbDriver::Pgsql, 'reads a backslash'],
+    '"#" after a block comment' => ['SELECT 1 /* x */ # 2', DbDriver::Pgsql, '"#" is an operator'],
+    'unknown driver, backslash' => ["SELECT 'a\\'; DELETE FROM users; --'", null, 'when the target database is unknown'],
+    'unknown driver, "#"' => ['SELECT 1 # 1; DELETE FROM users', null, 'when the target database is unknown'],
+]);
+
+test('the backslash advice fits whether the dialect is known', function () {
+    $unknown = inspect("SELECT 'it\\'s' AS x", null)->violations[0];
+    $postgres = inspect("SELECT 'it\\'s' AS x", DbDriver::Pgsql)->violations[0];
+
+    expect($unknown)->toContain('Select a connection')
+        ->not->toContain("Use an E'...' string")
+        ->and($postgres)->toContain("Use an E'...' string")
+        ->not->toContain('Select a connection');
+});
+
+test('backslashes and "#" PostgreSQL reads like the lexer still pass', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Read);
+})->with([
+    'E string escape' => "SELECT E'a\\\\b' AS x",
+    'lower-case e string escape' => "SELECT e'it\\'s' AS x",
+    'doubled quote' => "SELECT 'it''s' AS x",
+    'dollar-quoted body' => 'SELECT $$a\\b # c$$ AS x',
+    'tagged dollar-quoted body' => 'SELECT $q$a\\b # c$q$ AS x',
+    '"#" in a line comment' => 'SELECT 1 -- # yorum',
+    'backslash and "#" in a block comment' => 'SELECT 1 /* \\ # */',
+    '"#" in a string' => "SELECT '#' AS x",
+    '"#" in a quoted identifier' => 'SELECT 1 AS "a#b"',
+    'well-formed U& string escapes' => "SELECT U&'\\0041\\+000042\\\\' AS x",
+]);
+
+test('MySQL and MariaDB keep reading backslashes and "#" as before', function (DbDriver $driver) {
+    $escaped = inspect("SELECT 'a\\'b' AS x", $driver);
+    $comment = inspect("SELECT 1 # yorum\n", $driver);
+
+    expect($escaped->violations)->toBe([])
+        ->and($escaped->type())->toBe(StatementType::Read)
+        ->and($comment->violations)->toBe([])
+        ->and($comment->type())->toBe(StatementType::Read);
+})->with([DbDriver::Mysql, DbDriver::Mariadb]);
 
 test('quoting the guard reads differently from SQL Server or SQLite is rejected', function (string $sql, DbDriver $driver) {
     expect(inspect($sql, $driver)->passes())->toBeFalse();

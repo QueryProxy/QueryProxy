@@ -418,3 +418,21 @@ test('pg_cancel_backend is refused and really cancels a running query', function
     expect(fn () => $this->live->db()->select($sql))->toThrow(QueryException::class, 'canceling statement due to user request')
         ->and(microtime(true) - $started)->toBeLessThan(10.0);
 });
+
+// --- PostgreSQL reads backslashes and "#" differently from the lexer ---
+
+test('a backslash in a plain string is refused and PostgreSQL does not read it as an escape', function () {
+    $sql = "SELECT 'a\\' AS x";
+    expectLiveRefused($this->live, $sql, 'reads a backslash');
+
+    // standard_conforming_strings is on: the string ends at the second quote
+    // and keeps its backslash, where the lexer would read an escaped quote.
+    expect($this->live->db()->selectOne($sql)->x)->toBe('a\\');
+});
+
+test('"#" is refused and PostgreSQL reads it as the XOR operator, not a comment', function () {
+    $sql = 'SELECT 1 # 3 AS x';
+    expectLiveRefused($this->live, $sql, '"#" is an operator');
+
+    expect((int) $this->live->db()->selectOne($sql)->x)->toBe(2);
+});
