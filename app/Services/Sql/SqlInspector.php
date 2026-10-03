@@ -4,6 +4,7 @@ namespace App\Services\Sql;
 
 use App\Enums\DbDriver;
 use App\Enums\StatementType;
+use InvalidArgumentException;
 use PhpMyAdmin\SqlParser\Lexer;
 use PhpMyAdmin\SqlParser\Parser;
 use PhpMyAdmin\SqlParser\Statements\DeleteStatement;
@@ -427,6 +428,10 @@ class SqlInspector
      */
     private const PERSISTENT_SCOPES = ['GLOBAL', 'PERSIST', 'PERSIST_ONLY'];
 
+    private const INVALID_UTF8_VIOLATION = 'SQL must be valid UTF-8.';
+
+    private const UNREADABLE_SQL_VIOLATION = 'QueryProxy could not read this SQL: the lexer found no statement in text that is not empty.';
+
     private const FORBIDDEN_PATTERNS = [
         '/^DROP\s+(DATABASE|SCHEMA)\b/i' => 'DROP DATABASE is not allowed through QueryProxy.',
         '/^GRANT\b/i' => 'GRANT statements are not allowed through QueryProxy.',
@@ -529,6 +534,12 @@ class SqlInspector
      */
     private function lexicalView(string $sql, ?DbDriver $driver): array
     {
+        // Checked on the text as sent: resolving the comments could drop the
+        // bytes the lexer cannot read, and the server would still get them.
+        if (! mb_check_encoding($sql, 'UTF-8')) {
+            return [$sql, self::INVALID_UTF8_VIOLATION];
+        }
+
         [$sql, $lexicalViolation] = $this->resolveComments($sql, $driver);
         $lexicalViolation ??= $this->unicodeEscapeClauseViolation($sql, $driver);
         $lexicalViolation ??= $this->dollarQuoteDialectViolation($sql, $driver);
@@ -544,7 +555,43 @@ class SqlInspector
             $lexicalViolation = $this->dialectLexicalViolation($sql, $dialectRanges, $driver);
         }
 
+        $lexicalViolation ??= $this->unreadableTextViolation($sql, (new Lexer($sql))->list->tokens);
+
         return [$sql, $lexicalViolation];
+    }
+
+    /**
+     * Why the lexer cannot read $sql, or null when it can. Fail-closed: the
+     * guard judges only the tokens the lexer produces, so text it cannot
+     * tokenize must never look like an empty request.
+     *
+     *  - The text is not valid UTF-8. The lexer stops at such a byte and
+     *    returns no tokens at all, so "DROP DATABASE prod /* \xFF *\/" would
+     *    otherwise read as nothing — while the server runs it.
+     *  - The text is not blank or comment-only, yet the lexer produced no
+     *    token beyond whitespace, comments and its closing delimiter.
+     *
+     * @param  list<Token>  $tokens  the lexer's tokens for $sql
+     */
+    private function unreadableTextViolation(string $sql, array $tokens): ?string
+    {
+        if (! mb_check_encoding($sql, 'UTF-8')) {
+            return self::INVALID_UTF8_VIOLATION;
+        }
+
+        foreach ($tokens as $token) {
+            $empty = $token->type === TokenType::Whitespace
+                || $token->type === TokenType::Comment
+                || ($token->type === TokenType::Delimiter && $token->token === '');
+
+            if (! $empty) {
+                return null;
+            }
+        }
+
+        $trimmed = trim($sql);
+
+        return $trimmed === '' || $this->isCommentOnly($trimmed) ? null : self::UNREADABLE_SQL_VIOLATION;
     }
 
     /**
@@ -558,11 +605,22 @@ class SqlInspector
      * therefore skipped: in PostgreSQL that region is a string literal, and a
      * semicolon inside a literal has never ended a statement.
      *
+     * Text the lexer cannot read (see unreadableTextViolation()) is never
+     * split: reading it as no statement at all would be fail-open.
+     *
      * @return list<string>
+     *
+     * @throws InvalidArgumentException when the lexer cannot read $sql
      */
     public function splitStatements(string $sql): array
     {
         $lexer = new Lexer($sql);
+        $unreadable = $this->unreadableTextViolation($sql, $lexer->list->tokens);
+
+        if ($unreadable !== null) {
+            throw new InvalidArgumentException($unreadable);
+        }
+
         $quoted = $this->dollarQuotedRanges($sql);
 
         $segments = [];

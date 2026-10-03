@@ -4,6 +4,8 @@ use App\Enums\DbDriver;
 use App\Enums\StatementType;
 use App\Services\Sql\InspectionResult;
 use App\Services\Sql\SqlInspector;
+use PhpMyAdmin\SqlParser\Token;
+use PhpMyAdmin\SqlParser\TokenType;
 
 function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
 {
@@ -1970,4 +1972,71 @@ test('many MariaDB executable comments are resolved in linear time', function (s
 })->with([
     'unversioned' => '/*M!*/',
     'versioned' => '/*M!100000*/',
+]);
+
+dataset('invalid utf-8 bypasses', [
+    'bad byte in a block comment' => ["DROP DATABASE prod /* \xC3\xA9\xFF */"],
+    'bad byte in a string literal' => ["DROP DATABASE prod; SELECT '\xC3\xA9\xFF'"],
+    'bad byte in an identifier' => ["DROP DATABASE prod\xC3\xA9\xFF"],
+    'lone bad byte' => ["DROP DATABASE prod \xFF"],
+    'lone bad byte in a comment' => ["DROP DATABASE prod /* \xFF */"],
+    'truncated sequence' => ["DROP DATABASE prod /* \xC3 */"],
+    'truncated sequence in a line comment' => ["DELETE FROM t -- \xE2\x80"],
+    'overlong encoding' => ["DROP DATABASE prod /* \xC0\xAF */"],
+    'overlong encoding in a string literal' => ["SELECT '\xC0\xAF'"],
+    'bad byte in a comment-only request' => ["/* \xFF */"],
+]);
+
+dataset('every driver', [
+    'pgsql' => [DbDriver::Pgsql],
+    'mysql' => [DbDriver::Mysql],
+    'mariadb' => [DbDriver::Mariadb],
+    'sqlsrv' => [DbDriver::Sqlsrv],
+    'sqlite' => [DbDriver::Sqlite],
+    'unknown driver' => [null],
+]);
+
+test('SQL that is not valid UTF-8 is rejected before the lexer reads it', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toBe(['SQL must be valid UTF-8.']);
+})->with('invalid utf-8 bypasses')->with('every driver');
+
+test('valid multibyte content passes and stays a read', function (?DbDriver $driver) {
+    $result = inspect("SELECT 'é ğ 🙂' AS x", $driver);
+
+    expect($result->violations)->toBe([])
+        ->and($result->type())->toBe(StatementType::Read);
+})->with('every driver');
+
+test('empty, blank and comment-only input keeps its rejection', function (string $sql, ?DbDriver $driver) {
+    expect(inspect($sql, $driver)->violations)->toBe(['No executable SQL statement found.']);
+})->with([
+    'empty' => [''],
+    'blank' => ["   \n\t "],
+    'line comment' => ['-- just a comment'],
+    'block comment' => ['/* block */'],
+    'multibyte comment' => ['/* é ğ 🙂 */'],
+])->with('every driver');
+
+test('splitStatements refuses text the lexer cannot read', function (string $sql) {
+    app(SqlInspector::class)->splitStatements($sql);
+})->with('invalid utf-8 bypasses')->throws(InvalidArgumentException::class, 'SQL must be valid UTF-8.');
+
+test('splitStatements still reads blank and comment-only text as no statement', function (string $sql) {
+    expect(app(SqlInspector::class)->splitStatements($sql))->toBe([]);
+})->with(['', '   ', '-- just a comment', '/* é */']);
+
+test('text the lexer returns no token for is unreadable, not empty', function (string $sql, ?string $violation) {
+    // The lexer reads all valid UTF-8, so the defence behind the encoding
+    // check is driven directly with the token list a failed lexing leaves.
+    $unreadable = new ReflectionMethod(SqlInspector::class, 'unreadableTextViolation');
+
+    expect($unreadable->invoke(app(SqlInspector::class), $sql, [new Token('', TokenType::Delimiter)]))
+        ->toBe($violation);
+})->with([
+    'statement' => ['DROP DATABASE prod', 'QueryProxy could not read this SQL: the lexer found no statement in text that is not empty.'],
+    'blank' => ['   ', null],
+    'comment only' => ['/* x */', null],
 ]);
