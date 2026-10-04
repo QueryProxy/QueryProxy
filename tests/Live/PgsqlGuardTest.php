@@ -213,9 +213,12 @@ test('transaction_read_only = off lifts a read-only transaction', function () {
 
     $db->beginTransaction();
 
+    // unprepared() on purpose: with libpq < 17, pdo_pgsql frees a prepared
+    // statement by sending DEALLOCATE, which takes a snapshot and makes
+    // PostgreSQL refuse the switch back to read-write in this transaction.
     try {
-        $db->statement('SET TRANSACTION READ ONLY');
-        $db->affectingStatement($sql);
+        $db->unprepared('SET TRANSACTION READ ONLY');
+        $db->unprepared($sql);
         $db->statement($insert);
 
         expect($this->live->label(6))->toBe('six');
