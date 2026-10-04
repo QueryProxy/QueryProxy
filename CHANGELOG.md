@@ -6,6 +6,24 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-10-04
+
+### Security
+
+- **`league/commonmark` updated to 2.10.3.** 2.10.0 is affected by
+  GHSA-3q6v-r5mr-hxv8 (high) and GHSA-97jj-33gv-5xf9 (medium). The release
+  image scan failed on them, so the container images for 0.2.1, 0.2.2 and
+  0.2.3 were never published; 0.2.4 is the first image after 0.2.0 and
+  carries all of their changes.
+
+### Fixed
+
+- The live PostgreSQL test that lifts a read-only transaction failed when
+  `pdo_pgsql` was built against libpq older than 17: the driver frees prepared
+  statements with `DEALLOCATE`, which takes a snapshot and makes PostgreSQL
+  refuse the switch back to read-write. The test's setup statements now run
+  unprepared. The guard itself is unchanged.
+
 ## [0.2.3] — 2026-10-04
 
 ### Security
@@ -506,7 +524,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.4
 [0.2.3]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.3
 [0.2.2]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.2
 [0.2.1]: https://github.com/QueryProxy/QueryProxy/releases/tag/v0.2.1
