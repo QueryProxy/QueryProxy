@@ -35,7 +35,8 @@ RUN apk add --no-cache \
 # default, so docker-php-ext-install has no module to install. The tuning in
 # docker/php.ini still applies.
 # SQL Server targets need the Microsoft ODBC driver + sqlsrv PECL extension;
-# see README ("SQL Server support") if you proxy MSSQL databases.
+# see https://queryproxy.com/docs/configuration/#sql-server-targets if you
+# proxy MSSQL databases.
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
