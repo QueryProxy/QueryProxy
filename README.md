@@ -1,6 +1,6 @@
 # QueryProxy
 
-Self-hosted database access control & query approval portal.
+Self-hosted portal for database access control, query approval and audited SQL execution.
 
 [![CI](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/QueryProxy/QueryProxy)](https://github.com/QueryProxy/QueryProxy/releases/latest)
@@ -15,14 +15,14 @@ asynchronously on a worker, and results come back masked, limited and fully audi
 Built for small and mid-sized engineering teams, DevOps engineers and DBAs. It is a
 single Laravel monolith with no external dependencies by default.
 
-![A completed request: guards injected the LIMIT, a DBA approved from Slack, and the results came back masked](.github/assets/request-result.png)
+![A completed request: guards injected the LIMIT, a DBA approved from Slack, and the results came back masked](docs/assets/request-result.png)
 
 <details>
 <summary>More screenshots: the approvals queue and the Query Studio</summary>
 
-![The DBA approvals queue with a pending write request](.github/assets/approvals.png)
+![The DBA approvals queue with a pending write request](docs/assets/approvals.png)
 
-![The Query Studio: connection picker and guarded SQL editor](.github/assets/query-studio.png)
+![The Query Studio: connection picker and guarded SQL editor](docs/assets/query-studio.png)
 
 </details>
 
@@ -277,4 +277,4 @@ Do not report security vulnerabilities through public issues; follow the [securi
 
 ## License
 
-Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+Licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
