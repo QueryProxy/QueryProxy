@@ -5,7 +5,6 @@ use App\Models\Connection;
 use App\Models\Team;
 use App\Models\User;
 use App\Services\Connections\DynamicConnectionFactory;
-use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
 use Livewire\Livewire;
 
@@ -89,8 +88,7 @@ test('grants can be toggled for team developers only', function () {
     $component->call('toggleGrant', $connection->id, $developer->id);
     expect($connection->fresh()->isGrantedTo($developer))->toBeFalse();
 
-    expect(fn () => $component->call('toggleGrant', $connection->id, $outsider->id))
-        ->toThrow(ModelNotFoundException::class);
+    $component->call('toggleGrant', $connection->id, $outsider->id)->assertNotFound();
 });
 
 test('use policy honours grants', function () {
