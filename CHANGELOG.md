@@ -6,6 +6,23 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **DDL flag on requests.** A request that contains DDL now carries a `DDL`
+  badge in the approvals queue and on the request page, and the Slack and
+  Teams "new request" messages say so, so the approving DBA sees it before
+  deciding. The flag was already computed and stored; it was never shown.
+
+### Fixed
+
+- **Auditors could not reach the Requests list from the menu.** The sidebar
+  hid the link for the auditor role although the page, the route and the
+  policy already allowed it. Auditors now see the team's requests from the
+  menu; result data stays closed to them.
+- The Slack and Teams "account not linked" replies, the chat-ops setup
+  steps and the add-member error pointed to "Admin → Users"; they now name
+  the actual screen, Teams & Users → Manage users.
+
 ## [0.2.4] — 2026-10-04
 
 ### Security

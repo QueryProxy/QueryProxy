@@ -45,7 +45,7 @@ class TeamMembers extends Component
         $user = User::where('email', $this->email)->first();
 
         if (! $user) {
-            $this->addError('email', 'No user exists with this email. Create the user first (Admin → Users).');
+            $this->addError('email', 'No user exists with this email. Create the user first (Teams & Users → Manage users).');
 
             return;
         }

@@ -14,7 +14,7 @@ use Illuminate\Support\Collection;
  * Rules are resolved per target connection (team-wide rules plus rules pinned
  * to that connection). Column-pattern rules win over content-regex rules for
  * the same value; results are masked at write time so unmasked data never
- * reaches the result store (see MVP_PLAN §Phase 6).
+ * reaches the result store.
  */
 class Masker
 {

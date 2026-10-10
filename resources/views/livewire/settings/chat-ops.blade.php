@@ -59,7 +59,7 @@
                     1. Create a Slack app with an incoming webhook and interactivity enabled.<br>
                     2. Point interactivity to <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">{{ route('webhooks.slack') }}</code>.<br>
                     3. Paste the app's signing secret above.<br>
-                    4. Link Slack member IDs to users in Admin → Users.
+                    4. Link Slack member IDs to users in Teams &amp; Users → Manage users.
                 </div>
             </div>
         </x-ui.panel>
@@ -114,7 +114,7 @@
                     with an <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">X-QueryProxy-Timestamp</code> header (unix seconds) and
                     <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">Authorization: HMAC base64(hmac_sha256("&#123;timestamp&#125;:&#123;body&#125;", secret))</code>.<br>
                     3. The body carries the approver's AAD object id as
-                    <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">actor_id</code>; link AAD ids to users in Admin → Users (Teams ID).<br>
+                    <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">actor_id</code>; link AAD ids to users in Teams &amp; Users → Manage users (Teams ID).<br>
                     4. It must also carry <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">token</code>, copied from the
                     <code class="rounded-badge bg-raised px-1 font-mono text-ink-3">queryproxy.action_token</code> field of the card QueryProxy posted.
                     Each token decides one request once, and expires after {{ \App\Models\ChatApprovalToken::LIFETIME_HOURS }} hours.

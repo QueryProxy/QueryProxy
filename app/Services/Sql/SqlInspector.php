@@ -226,9 +226,10 @@ class SqlInspector
     /**
      * Procedural languages whose functions execute outside the database's
      * permission system — installing one, or asking a DO block to run in one,
-     * is equivalent to shell access on the database host. The PostgreSQL
-     * convention is a trailing "u" for untrusted, but matching on that shape
-     * would also catch unrelated extensions, so the names are enumerated.
+     * is equivalent to shell access on the database host. The names below are
+     * the known ones; isUntrustedLanguage() additionally refuses anything
+     * shaped like PostgreSQL's "pl...u" untrusted-language convention, so a
+     * language nobody has listed yet is still caught.
      *
      * Configuration is merged on top of this list and can only extend it;
      * these entries are the floor.

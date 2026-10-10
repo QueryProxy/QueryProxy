@@ -3,6 +3,8 @@
 use App\Enums\TeamRole;
 use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
+use App\Models\Connection;
+use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Models\User;
 use Livewire\Livewire;
@@ -94,4 +96,31 @@ test('adding an unknown email surfaces an error', function () {
         ->set('role', 'developer')
         ->call('addMember')
         ->assertHasErrors('email');
+});
+
+test('an auditor sees the requests menu link and the team requests list', function () {
+    $team = Team::factory()->create();
+    $auditor = User::factory()->create();
+    $team->users()->attach($auditor, ['role' => 'auditor']);
+    $request = QueryRequest::factory()->create([
+        'team_id' => $team->id,
+        'connection_id' => Connection::factory()->create(['team_id' => $team->id])->id,
+        'user_id' => User::factory()->create()->id,
+        'title' => 'Teammate backfill',
+    ]);
+
+    // The audit page is the auditor's landing area and carries no other link
+    // to the requests list, so the href can only come from the sidebar.
+    $this->actingAs($auditor)->get(route('audit.index'))
+        ->assertOk()
+        ->assertSee('href="'.route('requests.index').'"', escape: false);
+
+    $this->actingAs($auditor)->get(route('requests.index'))
+        ->assertOk()
+        ->assertSee('Teammate backfill');
+
+    // Result data stays closed to auditors (see ResultViewerTest).
+    expect($auditor->can('view', $request))->toBeTrue()
+        ->and($auditor->can('viewResult', $request))->toBeFalse()
+        ->and($auditor->can('downloadResult', $request))->toBeFalse();
 });

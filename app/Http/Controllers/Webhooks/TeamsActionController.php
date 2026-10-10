@@ -70,7 +70,7 @@ class TeamsActionController extends Controller
         if (! $identity) {
             return response()->json([
                 'ok' => false,
-                'message' => 'This Teams user is not linked to a QueryProxy user. Ask an admin to set the Teams ID in Admin → Users.',
+                'message' => 'This Teams user is not linked to a QueryProxy user. Ask an admin to set the Teams ID in Teams & Users → Manage users.',
             ], 422);
         }
 

@@ -113,16 +113,22 @@ class ChatNotifier
         $sqlPreview = $this->sqlPreview($request);
 
         return [
-            'text' => sprintf('New query request #%d from %s', $request->id, $request->requester->name),
+            'text' => sprintf(
+                'New query request #%d from %s%s',
+                $request->id,
+                $request->requester->name,
+                $request->is_ddl ? ' (DDL)' : '',
+            ),
             'blocks' => [
                 [
                     'type' => 'section',
                     'text' => [
                         'type' => 'mrkdwn',
                         'text' => sprintf(
-                            "*New %s request #%d*\n*Requester:* %s\n*Connection:* %s%s",
+                            "*New %s request #%d*%s\n*Requester:* %s\n*Connection:* %s%s",
                             strtoupper($request->type->value),
                             $request->id,
+                            $request->is_ddl ? ' · *DDL*' : '',
                             $request->requester->name,
                             $request->connection->name,
                             $request->title ? "\n*Title:* {$request->title}" : '',
@@ -199,9 +205,14 @@ class ChatNotifier
             ],
             'type' => 'MessageCard',
             '@context' => 'https://schema.org/extensions',
-            'summary' => sprintf('New query request #%d', $request->id),
+            'summary' => sprintf('New query request #%d%s', $request->id, $request->is_ddl ? ' (DDL)' : ''),
             'themeColor' => '6366F1',
-            'title' => sprintf('New %s request #%d', strtoupper($request->type->value), $request->id),
+            'title' => sprintf(
+                'New %s request #%d%s',
+                strtoupper($request->type->value),
+                $request->id,
+                $request->is_ddl ? ' · DDL' : '',
+            ),
             'sections' => [
                 [
                     'facts' => [

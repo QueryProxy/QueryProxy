@@ -9,6 +9,9 @@
                 Request #{{ $request->id }}
                 <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
                 <x-ui.badge :tone="$request->type->tone()">{{ $request->type->label() }}</x-ui.badge>
+                @if ($request->is_ddl)
+                    <x-ui.badge tone="danger">DDL</x-ui.badge>
+                @endif
                 @if ($request->is_transaction)
                     <x-ui.badge tone="accent">transaction</x-ui.badge>
                 @endif

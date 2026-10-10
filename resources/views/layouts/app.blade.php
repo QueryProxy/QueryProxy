@@ -70,7 +70,7 @@
                 @if (Route::has('studio') && ($role === \App\Enums\TeamRole::Developer || $role === \App\Enums\TeamRole::Dba || $user->isAdmin()))
                     <x-ui.nav-item :href="route('studio')" :active="request()->routeIs('studio')" icon="terminal">Query Studio</x-ui.nav-item>
                 @endif
-                @if (Route::has('requests.index') && $role !== \App\Enums\TeamRole::Auditor)
+                @if (Route::has('requests.index'))
                     <x-ui.nav-item :href="route('requests.index')" :active="request()->routeIs('requests.*')" icon="list">Requests</x-ui.nav-item>
                 @endif
 

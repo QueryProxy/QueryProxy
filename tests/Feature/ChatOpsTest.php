@@ -525,3 +525,33 @@ test('a developer cannot remove a chat integration at all', function () {
 
     expect(ChatIntegration::where('team_id', $team->id)->where('provider', 'slack')->exists())->toBeTrue();
 });
+
+test('chat notifications mark a ddl request in both slack and teams payloads', function () {
+    Http::fake();
+
+    [, , , $request] = chatSetup();
+    $request->update(['is_ddl' => true]);
+
+    app(ChatNotifier::class)->requestSubmitted($request->fresh());
+
+    Http::assertSent(fn ($sent) => str_contains($sent->url(), 'hooks.slack.com')
+        && str_contains($sent->body(), '*DDL*')
+        && str_ends_with($sent->data()['text'], ' (DDL)'));
+    Http::assertSent(fn ($sent) => str_contains($sent->url(), 'outlook.office.com')
+        && str_ends_with($sent->data()['title'], ' · DDL')
+        && str_ends_with($sent->data()['summary'], ' (DDL)'));
+});
+
+test('chat notifications carry no ddl mark for other requests', function () {
+    Http::fake();
+
+    [, , , $request] = chatSetup();
+    $request->update(['is_ddl' => false]);
+
+    app(ChatNotifier::class)->requestSubmitted($request->fresh());
+
+    Http::assertSent(fn ($sent) => str_contains($sent->url(), 'hooks.slack.com')
+        && ! str_contains($sent->body(), 'DDL'));
+    Http::assertSent(fn ($sent) => str_contains($sent->url(), 'outlook.office.com')
+        && ! str_contains($sent->body(), 'DDL'));
+});

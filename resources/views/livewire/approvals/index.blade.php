@@ -18,6 +18,9 @@
                         <span class="truncate text-[13px] font-medium text-ink">{{ $request->title }}</span>
                     @endif
                     <x-ui.badge :tone="$request->type->tone()">{{ $request->type->label() }}</x-ui.badge>
+                    @if ($request->is_ddl)
+                        <x-ui.badge tone="danger">DDL</x-ui.badge>
+                    @endif
                     @if ($request->is_transaction)
                         <x-ui.badge tone="accent">transaction · {{ $request->statement_count }}</x-ui.badge>
                     @endif

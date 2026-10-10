@@ -85,7 +85,7 @@ class SlackInteractionController extends Controller
         if (! $identity) {
             return $this->ephemeral(
                 'Your Slack account is not linked to a QueryProxy user. '
-                .'Ask an admin to set your Slack member ID in Admin → Users.',
+                .'Ask an admin to set your Slack member ID in Teams & Users → Manage users.',
             );
         }
 

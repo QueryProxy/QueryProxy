@@ -194,3 +194,19 @@ test('an admin keeps every power the state machine still allows', function () {
 
     expect($admin->can('downloadResult', $request->fresh()))->toBeTrue();
 });
+
+test('the approvals queue and the request page flag a ddl request', function () {
+    [, $dba, , $request] = approvalSetup();
+    $request->update(['is_ddl' => true]);
+
+    Livewire::actingAs($dba)->test(Index::class)->assertSee('DDL');
+    Livewire::actingAs($dba)->test(Show::class, ['queryRequest' => $request])->assertSee('DDL');
+});
+
+test('the approvals queue and the request page show no ddl flag for other requests', function () {
+    [, $dba, , $request] = approvalSetup();
+    $request->update(['is_ddl' => false]);
+
+    Livewire::actingAs($dba)->test(Index::class)->assertDontSee('DDL');
+    Livewire::actingAs($dba)->test(Show::class, ['queryRequest' => $request])->assertDontSee('DDL');
+});
