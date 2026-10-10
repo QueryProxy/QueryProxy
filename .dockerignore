@@ -3,6 +3,7 @@
 # image's own composer/npm output via `COPY . .`.
 .git
 .github
+docs
 .env
 .env.*
 !.env.example
