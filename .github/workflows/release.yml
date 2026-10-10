@@ -1,8 +1,9 @@
 name: Release image
 
-# Pushing a v* tag publishes the container image to both registries:
+# Pushing a vX.Y.Z tag publishes the container image to both registries:
 #   docker.io/queryproxy/queryproxy:<version> and :latest
 #   ghcr.io/queryproxy/queryproxy:<version> and :latest
+# and then creates the GitHub Release from that version's CHANGELOG.md section.
 #
 # Docker Hub needs two repository secrets: DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN (an access token with Read/Write scope on the
@@ -93,3 +94,43 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Publishes the GitHub Release once the image is out, using the tag's
+  # section of CHANGELOG.md as the release notes.
+  release:
+    needs: image
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          awk -v v="${VERSION#v}" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && /^\[[^]]+\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION#v}"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            echo "Release $VERSION already exists; leaving it untouched."
+          else
+            gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md --verify-tag
+          fi
