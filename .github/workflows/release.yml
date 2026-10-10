@@ -132,5 +132,5 @@ jobs:
           if gh release view "$VERSION" > /dev/null 2>&1; then
             echo "Release $VERSION already exists; leaving it untouched."
           else
-            gh release create "$VERSION" --title "$VERSION" --notes-file release-notes.md --verify-tag
+            gh release create "$VERSION" --title "QueryProxy $VERSION" --notes-file release-notes.md --verify-tag
           fi
