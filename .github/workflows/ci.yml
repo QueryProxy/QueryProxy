@@ -10,13 +10,59 @@ on:
     branches: [main]
   pull_request:
 
+# A newer run on the same ref cancels the older one for pull requests only;
+# pushes to main always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # The jobs only read the repository; nothing here pushes, comments or publishes.
 permissions:
   contents: read
 
 jobs:
-  tests:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the job token out of .git/config, where the dependency
+          # install steps that follow could read it.
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, pdo_mysql, pdo_pgsql, intl, zip, bcmath
+          coverage: none
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Code style
+        run: ./vendor/bin/pint --test
+
+      - name: Dependency vulnerability audit
+        run: |
+          composer audit
+          npm audit --omit=dev --audit-level=high
+
+  # Matrix jobs report as "test (8.3)", "test (8.4)", ... so branch protection
+  # requires the single `test` job below, which aggregates their result.
+  tests:
+    name: test (${{ matrix.php }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -55,13 +101,14 @@ jobs:
           touch database/database.sqlite
           php artisan migrate --force
 
-      - name: Code style
-        run: ./vendor/bin/pint --test
-
-      - name: Dependency vulnerability audit
-        run: |
-          composer audit
-          npm audit --omit=dev --audit-level=high
-
       - name: Tests
         run: ./vendor/bin/pest --ci
+
+  test:
+    needs: tests
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check matrix result
+        run: test "${{ needs.tests.result }}" = "success"

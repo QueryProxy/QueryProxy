@@ -1,23 +1,24 @@
 # QueryProxy
 
-**Self-hosted database access control & query approval portal.**
+Self-hosted database access control & query approval portal.
 
+[![CI](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/QueryProxy/QueryProxy)](https://github.com/QueryProxy/QueryProxy/releases/latest)
+[![License](https://img.shields.io/github/license/QueryProxy/QueryProxy)](LICENSE)
 [![Designed & Maintained with Tan](https://muhammetsafak.com/badges/designed-maintained-with-tan.svg)](https://muhammetsafak.com/tan/)
 
 QueryProxy sits between your developers and your databases. Instead of handing out
 production credentials, developers submit SQL through a guarded editor; DBAs approve
 or reject from the web UI or straight from Slack / Teams; approved queries run
-asynchronously on a worker, and results come back **masked, limited and fully audited**.
+asynchronously on a worker, and results come back masked, limited and fully audited.
 
-> Built for small and mid-sized engineering teams, DevOps engineers and DBAs.
-> Single Laravel monolith, zero external dependencies by default. AGPLv3.
-
-**Website & docs: [queryproxy.com](https://queryproxy.com) · [Documentation](https://queryproxy.com/docs/)**
+Built for small and mid-sized engineering teams, DevOps engineers and DBAs. It is a
+single Laravel monolith with no external dependencies by default.
 
 ![A completed request: guards injected the LIMIT, a DBA approved from Slack, and the results came back masked](.github/assets/request-result.png)
 
 <details>
-<summary><strong>More screenshots</strong> — the approvals queue and the Query Studio</summary>
+<summary>More screenshots: the approvals queue and the Query Studio</summary>
 
 ![The DBA approvals queue with a pending write request](.github/assets/approvals.png)
 
@@ -25,50 +26,32 @@ asynchronously on a worker, and results come back **masked, limited and fully au
 
 </details>
 
----
-
 ## Features
 
-- **RBAC with team isolation** — Admin / DBA / Developer / Auditor roles; every
+- **RBAC with team isolation:** Admin, DBA, Developer and Auditor roles; every
   connection, request, masking rule and audit trail is scoped to a team.
-- **Connection vault** — target database credentials (PostgreSQL, MySQL, MariaDB,
+- **Connection vault:** target database credentials (PostgreSQL, MySQL, MariaDB,
   SQL Server, SQLite) are AES-256-encrypted at rest; developers only see
   connections a DBA explicitly granted them.
-- **Guarded Query Studio** — CodeMirror SQL editor with server-side AST guards:
-  - `UPDATE` / `DELETE` without `WHERE` are rejected at submission,
-  - `SELECT` without `LIMIT` gets `LIMIT 1000` injected (hard cap `10000`),
-  - multiple statements require an explicit `BEGIN; ...; COMMIT;` transaction,
-  - statements that hand out server-level code execution or file access are
-    blocked outright (`GRANT`, `DROP DATABASE`, `CREATE FUNCTION ... SONAME`,
-    `INTO OUTFILE`, `LOAD_FILE()`, `pg_read_file()`, `COPY ... TO PROGRAM`, ...),
-  - and the ones where a dangerous use shares its syntax with an everyday one are
-    judged on the dangerous part, not the keyword: `CREATE EXTENSION` is refused
-    only for untrusted procedural languages (`plpythonu`, `plperlu`, anything
-    matching the `pl…u` convention), and `SET` only for file-path, logging,
-    plugin and protection-related variables (persistent scopes on MySQL/MariaDB;
-    every scope on PostgreSQL, including routine, database and role `SET`).
-    On PostgreSQL, `DO` blocks and `CREATE FUNCTION` / `PROCEDURE` accept only
-    `plpgsql` and `sql`; the body is scanned for the blocked statements above, and dynamic
-    `EXECUTE` inside it is refused,
-  - a `SET` that changes MySQL / MariaDB `sql_mode` is refused, and a session
-    running with `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES` is refused before
-    anything runs (the guard reads quotes the default way).
-- **Approval workflow** — pending requests wait indefinitely until a DBA decides;
-  self-approval is blocked; every decision records who, when and through which channel.
-- **ChatOps** — Slack messages with interactive **Approve / Reject** buttons and
-  Microsoft Teams cards with an HMAC-verified action endpoint. Every callback is
-  checked against the HMAC signature, a replay window, and a single-use action
-  token bound to that one request; signing secrets are administrator-only.
-- **Async execution** — approved queries run on a queue worker; reads stream
+- **Guarded Query Studio:** a CodeMirror SQL editor with server-side AST guards.
+  `UPDATE` / `DELETE` without `WHERE` are rejected, `SELECT` without `LIMIT` gets
+  `LIMIT 1000` injected (hard cap `10000`), and statements that hand out
+  server-level code execution or file access are blocked outright.
+- **Approval workflow:** pending requests wait until a DBA decides; self-approval
+  is blocked; every decision records who, when and through which channel.
+- **ChatOps:** Slack messages with interactive Approve / Reject buttons and
+  Microsoft Teams cards with an HMAC-verified action endpoint.
+- **Async execution:** approved queries run on a queue worker; reads stream
   through database cursors into NDJSON files with constant memory usage.
-- **Dynamic data masking** — column-pattern and content-regex rules
-  (full / partial / hash strategies) applied *while results are written*,
-  so unmasked PII never reaches the result store.
-- **Result viewer** — paginated browser + streamed CSV export, with retention pruning.
-- **Immutable audit log** — every login, grant, submission, decision, execution and
-  download; filterable auditor UI with CSV export.
+- **Dynamic data masking:** column-pattern and content-regex rules (full, partial
+  or hash) applied while results are written, so unmasked PII never reaches the
+  result store.
+- **Immutable audit log:** every login, grant, submission, decision, execution and
+  download, with a filterable auditor UI and CSV export.
 
-## Quick start (Docker)
+## Quick Start
+
+You need Docker. Start one container that runs the whole stack:
 
 ```bash
 docker run -d --name queryproxy \
@@ -79,236 +62,219 @@ docker run -d --name queryproxy \
   queryproxy/queryproxy
 ```
 
-Open <http://localhost:7432> and log in with that address. One container runs
-the whole stack — nginx + php-fpm (as a non-root user), the queue worker that
-executes approved queries and the scheduler that prunes expired results — and
-the single volume holds the SQLite database, the generated `APP_KEY` and the
-result files.
+Open <http://localhost:7432> and log in with the address and password you set.
+The container runs nginx and php-fpm (as a non-root user), the queue worker that
+executes approved queries and the scheduler that prunes expired results. The
+single volume holds the SQLite database, the generated `APP_KEY` and the result
+files.
 
-The admin variables only take effect while the instance has no users, so
-leaving them in place across restarts is harmless; you can also drop them and
-create the account by hand:
+This setup suits evaluation. Before exposing it to a network, follow the
+[production hardening guide](https://queryproxy.com/docs/production-hardening/).
 
-```bash
-docker exec -it queryproxy php artisan queryproxy:create-admin
-```
+## Installation
 
 Images are published on release to Docker Hub (`queryproxy/queryproxy`) and
 GitHub Container Registry (`ghcr.io/queryproxy/queryproxy`), as `latest` and
 per-version tags, for `linux/amd64` and `linux/arm64`.
 
-Prefer Compose? [`docker-compose.yml`](docker-compose.yml) in this repository is
-the same single service (`docker compose up -d`), with commented blocks for
-running the worker as its own container or using MySQL/PostgreSQL for the
+**Docker Compose.** [`docker-compose.yml`](docker-compose.yml) in this repository
+is the same single service (`docker compose up -d`), with commented blocks for
+running the worker as its own container or using MySQL / PostgreSQL for the
 application database.
 
-To explore with demo data instead, set `QUERYPROXY_SEED_DEMO=true` (the seeder
-refuses to run while `APP_ENV=production` unless you also set
-`QUERYPROXY_SEED_DEMO_FORCE=true`). It creates `admin@example.com`,
-`dba@example.com`, `developer@example.com` and `auditor@example.com` sharing
-**one randomly generated password, printed once in the container logs**
-(`docker logs queryproxy`).
-
-### Container settings
-
-| Variable | Default | Meaning |
-| :-- | :-- | :-- |
-| `QUERYPROXY_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | — | First-boot administrator; ignored once any user exists |
-| `QUERYPROXY_RUN_WORKER` | `true` | Run the queue worker inside the container |
-| `QUERYPROXY_WORKER_PROCESSES` | `1` | Number of queue workers |
-| `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
-| `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
-| `TRUSTED_PROXIES` | — | Reverse proxy IPs/CIDRs allowed to set `X-Forwarded-*` |
-
-> **Before exposing QueryProxy to a network, read [Production hardening](#production-hardening).**
-
-> **Recommended production setup**
->
-> - For teams or users who only read, register a separate connection with a database user that has `SELECT` privileges only. Keep write access on a different connection, since approved writes run through the connection they were submitted on.
-> - Point that read-only connection at a replica where you can.
-> - Restrict the network path between QueryProxy and the target database.
-> - On PostgreSQL, check the transport yourself: the connection uses `sslmode=prefer` today, and a TLS setting arrives in v0.3.0.
->
-> The SQL guard is not a last line of defence. Until read-only execution on the database side arrives (v0.3.0), build the defence with database privileges as well.
-
-## Manual installation
-
-Requirements: PHP ≥ 8.3 (pdo drivers for your target databases), Composer,
-Node 20.19+ or 22.12+ (what the pinned Vite 8 needs).
+**Without Docker.** You need PHP 8.3 or newer (with the pdo drivers for your target
+databases), Composer, and Node 20.19+ or 22.12+.
 
 ```bash
 composer install
 cp .env.example .env
 php artisan key:generate
 touch database/database.sqlite
-php artisan migrate            # add --seed for the demo team
-php artisan queryproxy:create-admin   # first administrator (skip if seeding demo data)
+php artisan migrate
+php artisan queryproxy:create-admin
 npm install && npm run build
 
-php artisan serve              # dev only — use nginx + php-fpm in production
-php artisan queue:work --queue=queries,default --tries=1 --timeout=310   # worker (required!); --timeout = QUERYPROXY_EXECUTION_TIMEOUT + 10 (300 by default)
+php artisan serve              # development only
+php artisan queue:work --queue=queries,default --tries=1 --timeout=310
 php artisan schedule:work      # scheduler (optional)
 ```
 
-> The queue worker is **not optional** — approved queries execute there (ADR-002).
-> For production, serve `public/` through nginx/php-fpm (as the Docker image
-> does) rather than `php artisan serve`, and read [Production hardening](#production-hardening).
+The queue worker is not optional: approved queries execute there. The `--timeout`
+value is `QUERYPROXY_EXECUTION_TIMEOUT` plus 10 (300 by default). Serve `public/`
+through nginx and php-fpm in production. Details are in the
+[manual installation guide](https://queryproxy.com/docs/manual-installation/).
 
-## How it works
+## Usage
 
+1. A developer opens the Query Studio, picks a connection a DBA granted them and
+   submits SQL. The guards check the statement before anything runs.
+2. A DBA approves or rejects the request in the web queue or from Slack / Teams.
+3. The worker runs the approved query and writes a masked result.
+4. The developer views the result in the browser or downloads it as CSV.
+
+If you did not set the admin variables, create the first administrator by hand:
+
+```bash
+docker exec -it queryproxy php artisan queryproxy:create-admin
 ```
-Developer ──▶ Query Studio ──▶ SQL guards (AST) ──▶ pending request
-                                                        │
-                       Slack / Teams ◀── notification ──┤
-                            │                           │
-                            ▼                           ▼
-                     Approve / Reject ──────▶ queue ──▶ worker
-                     (HMAC-verified)                    │ cursor streaming
-                                                        ▼
-                                        masked NDJSON result on storage disk
-                                                        │
-                              viewer / CSV download ◀───┘   (all steps audited)
-```
+
+To explore with demo data, set `QUERYPROXY_SEED_DEMO=true`. It creates
+`admin@example.com`, `dba@example.com`, `developer@example.com` and
+`auditor@example.com`, which share one randomly generated password printed once in
+the container logs (`docker logs queryproxy`). The seeder refuses to run while
+`APP_ENV=production` unless you also set `QUERYPROXY_SEED_DEMO_FORCE=true`.
+
+## How It Works
+
+A request passes the SQL guards, waits for a DBA decision, runs on the queue worker
+with cursor streaming, and lands as a masked NDJSON file that the viewer and the CSV
+export read. Every step is written to the audit log. The
+[introduction](https://queryproxy.com/docs/#how-it-works) has the full flow diagram.
 
 ## Configuration
 
-All knobs live in `.env` (see `.env.example` for the full list):
+Settings live in `.env`; `.env.example` lists the full set.
 
 | Key | Default | Meaning |
 | :-- | :-- | :-- |
+| `QUERYPROXY_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | none | First-boot administrator; ignored once any user exists |
 | `QUERYPROXY_SELECT_DEFAULT_LIMIT` | `1000` | LIMIT injected into SELECTs without one |
 | `QUERYPROXY_SELECT_HARD_LIMIT` | `10000` | Larger LIMITs are clamped to this |
 | `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution |
-| `QUERYPROXY_RESULT_DISK` | `local` | Filesystem disk for result files (`s3` supported); a publicly visible disk is refused |
+| `QUERYPROXY_RESULT_DISK` | `local` | Disk for result files (`s3` supported) |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
-| `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none` / `admins` / `dba` / `all` |
-| `QUERYPROXY_CHAT_WEBHOOK_ALLOWED_HOSTS` | — | Extra allowed hosts for outbound chat webhooks |
+| `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none`, `admins`, `dba` or `all` |
 | `QUERYPROXY_CHAT_INCLUDE_SQL` | `true` | Embed a SQL preview in chat notifications |
-| `QUERYPROXY_CONNECTION_HOST_DENYLIST` | — | Extra hosts blocked as connection targets |
-| `QUERYPROXY_SQLITE_ALLOWED_DIR` | — | Restrict SQLite connection files to this directory |
-| `TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs; empty means no proxy is trusted |
-| `TRUSTED_HOSTS` | — | Extra hostnames this install answers to, beyond `APP_URL`'s host |
-| `QUERYPROXY_EXTRA_UNTRUSTED_LANGUAGES` | — | Extra procedural languages the guard refuses in `CREATE EXTENSION` |
-| `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` | — | Extra server variables refused in `SET` (persistent scopes on MySQL/MariaDB, every scope on PostgreSQL) and `set_config` |
+| `QUERYPROXY_RUN_WORKER` | `true` | Run the queue worker inside the container |
+| `QUERYPROXY_WORKER_PROCESSES` | `1` | Number of queue workers |
+| `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
+| `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
+| `TRUSTED_PROXIES` | none | Reverse proxy IPs / CIDRs allowed to set `X-Forwarded-*` |
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
-MySQL/PostgreSQL. The queue uses the database driver by default; set
-`QUEUE_CONNECTION=redis` if you run Redis.
+MySQL or PostgreSQL. The queue uses the database driver by default; set
+`QUEUE_CONNECTION=redis` if you run Redis. The complete reference is in the
+[configuration guide](https://queryproxy.com/docs/configuration/).
 
-## Production hardening
+## Deployment
 
-QueryProxy stores the credentials to every database it fronts, so treat the
-instance itself as sensitive.
+Mount a volume at `/var/www/html/storage/app`: it holds the SQLite database, the
+generated `APP_KEY` and the result files. The container serves plain HTTP on port
+`7432`, so put a TLS-terminating reverse proxy in front of it and set
+`TRUSTED_PROXIES` to that proxy. Set `APP_KEY` explicitly and keep it stable,
+because it encrypts every stored connection credential. Restrict the network path
+between QueryProxy and the target databases, and give read-only teams a connection
+whose database user has `SELECT` privileges only.
 
-- **Set `APP_KEY` explicitly** and keep it stable. It encrypts connection
-  credentials and chat secrets; changing it makes every stored credential
-  unreadable. Generate one with `docker run --rm queryproxy/queryproxy php artisan key:generate --show`
-  and pass it as `-e APP_KEY=...` (every container of the same instance must
-  share it). When rotating, move the old key into `APP_PREVIOUS_KEYS` so
-  existing ciphertext still decrypts. Without an explicit `APP_KEY`, the
-  container generates one on first boot and persists it to the data volume.
-- **Serve over HTTPS** behind a TLS-terminating reverse proxy (the container
-  serves plain HTTP on `:7432`). Then set `SESSION_SECURE_COOKIE=true`.
-- **Set `TRUSTED_PROXIES` to your proxy's IP or CIDR** whenever a proxy sits in
-  front of QueryProxy. No proxy is trusted by default, so until you set it the
-  app reads the connecting peer as the client: `X-Forwarded-Proto` is ignored
-  (HTTPS is not detected, so no HSTS header) and audit entries record the proxy's
-  address. Never set it to `*` — that lets any client forge `X-Forwarded-For`,
-  which both fakes the audit trail's client IP and hands out unlimited login and
-  2FA attempts, since those throttles are keyed per IP.
-- **Keep demo seeding off** (`QUERYPROXY_SEED_DEMO=false`, the default) on any
-  reachable instance.
-- **Require 2FA** for privileged roles with `QUERYPROXY_REQUIRE_2FA=admins`
-  (or `dba` / `all`). Users are funneled to enrollment on next login.
-- **Restrict connection targets** with `QUERYPROXY_CONNECTION_HOST_DENYLIST` /
-  `QUERYPROXY_SQLITE_ALLOWED_DIR` if DBAs should not reach arbitrary hosts.
-- Security response headers, CSP and the Livewire-endpoint rate limit are on by
-  default; no configuration needed.
+The [production hardening guide](https://queryproxy.com/docs/production-hardening/)
+has the full checklist. The default image ships `pdo_pgsql`, `pdo_mysql` and
+`pdo_sqlite`; for SQL Server targets see the
+[SQL Server section](https://queryproxy.com/docs/configuration/#sql-server-targets).
+Backups, upgrades and rollbacks are covered in [Upgrading](#upgrading).
 
-## Slack setup
+## Upgrading
 
-1. Create a Slack app → enable **Incoming Webhooks** (pick the approvals channel)
-   and **Interactivity**, pointing the request URL to
-   `https://your-host/webhooks/slack/interactions`.
-2. In QueryProxy: **ChatOps** → a DBA can set the webhook URL, but the app's
-   **signing secret** may only be entered or rotated by a system administrator,
-   and rotating it requires the current secret. That secret is what authenticates
-   every callback, so nobody who can submit or approve requests should be able to
-   choose it.
-3. In **Admin → Users**, fill each reviewer's **Slack member ID** (e.g. `U0123ABC`).
+The container runs `php artisan migrate --force` on start, and migrations are not
+reversed on downgrade. Back up before every upgrade, and read the
+[changelog](CHANGELOG.md) for breaking changes first.
 
-Every callback is verified with Slack's `v0` HMAC-SHA256 signature scheme within a
-±5 minute replay window; forged or stale callbacks are rejected with `401`. On top
-of the signature, each Approve / Reject button carries a single-use action token
-that is bound to that one request and expires after 24 hours, so a callback can
-only answer a message QueryProxy actually posted, and only once. Buttons from
-messages posted before this version no longer work — decide those in the web UI.
+1. Stop the container and back up the volume (and your external database, if
+   `DB_*` points to MySQL or PostgreSQL). The archive holds the `APP_KEY` next to
+   the encrypted credentials, so it is written readable by its owner only; store
+   it as carefully as the key itself:
 
-## Teams setup
-
-1. Add an **Incoming Webhook** to your channel and save it under **ChatOps** for
-   announcements.
-2. For approve/reject actions, call `POST /webhooks/teams/actions` with a
-   timestamp header and a signature over `{timestamp}:{body}` (mirrors Slack's
-   replay-protected scheme — easy to wire from a Power Automate flow):
-
-   ```
-   X-QueryProxy-Timestamp: <unix seconds>       (must be within ±5 minutes)
-   Authorization: HMAC <base64(hmac_sha256("{timestamp}:{raw_body}", secret))>
+   ```bash
+   docker stop queryproxy
+   docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
+     sh -c "umask 077 && tar czf /backup/queryproxy-data.tgz -C /data . && chown $(id -u):$(id -g) /backup/queryproxy-data.tgz"
    ```
 
-   ```json
-   { "action": "approve", "request_id": 123, "actor_id": "<AAD object id>",
-     "token": "<action token>" }
+2. Save the container's settings before you remove it. This keeps only the
+   variables you set yourself, by dropping every line the container's image already
+   defines, and writes them to a private `queryproxy.env`:
+
+   ```bash
+   (
+     umask 077
+     docker image inspect "$(docker inspect queryproxy --format '{{.Image}}')" \
+       --format '{{range .Config.Env}}{{println .}}{{end}}' > image-defaults.env
+     docker inspect queryproxy --format '{{range .Config.Env}}{{println .}}{{end}}' \
+       | grep -vxF -f image-defaults.env > queryproxy.env
+     rm image-defaults.env
+   )
    ```
 
-   `token` is required: QueryProxy puts a single-use, request-bound action token
-   in the `queryproxy` envelope of the card it sends, and the endpoint refuses any
-   call that does not echo a live one. It expires after 24 hours and is burned on
-   the first decision, so a captured call cannot be replayed.
+   Check that `queryproxy.env` lists the `APP_KEY`, `DB_*`, `QUERYPROXY_*` and other
+   values you passed with `-e`. Once the administrator account exists, you can delete
+   the `QUERYPROXY_ADMIN_*` lines; they are only used on first boot.
 
-   The approver is resolved through the admin-managed **Teams ID** mapping
-   (Admin → Users), never from a self-declared email, and must belong to the
-   integration's team. Note what the HMAC alone can and cannot prove: it shows the
-   caller knows the shared secret, not which person is acting. That is why the
-   secret is administrator-only and why the action token exists — keep the secret
-   out of the hands of anyone who submits or approves requests.
+3. Pull the new image and recreate the container.
 
-## SQL Server support
+   > [!WARNING]
+   > `docker rm` deletes the old container together with its settings. Run it only
+   > after `queryproxy.env` holds **every** variable you set, especially
+   > `APP_KEY` if you set one. A container started without its original `APP_KEY`
+   > generates a new key, and the stored connection credentials and chat secrets
+   > can no longer be decrypted.
 
-The default image ships `pdo_pgsql`, `pdo_mysql` and `pdo_sqlite`. To proxy MSSQL
-targets, extend the Dockerfile with Microsoft's ODBC driver and the `sqlsrv` /
-`pdo_sqlsrv` PECL extensions.
+   ```bash
+   docker pull queryproxy/queryproxy:latest
+   docker rm queryproxy
+   docker run -d --name queryproxy -p 7432:7432 \
+     --env-file queryproxy.env \
+     -v queryproxy-data:/var/www/html/storage/app \
+     queryproxy/queryproxy:latest
+   ```
 
-## Development
+With Compose, the settings stay in the compose file. Stop the stack with
+`docker compose stop`, back up as in step 1 with the volume name that
+`docker volume ls` shows (Compose prefixes it with the project name, for example
+`queryproxy_queryproxy-data`), then run `docker compose pull && docker compose up -d`.
+
+To roll back, restore the backup from step 1 (and your database backup) and start
+the previous version tag with the same `queryproxy.env`.
+
+> [!WARNING]
+> The second command deletes everything in the `queryproxy-data` volume before it
+> extracts the backup. Check that `queryproxy-data.tgz` is the archive you want first.
 
 ```bash
-composer install && npm install
-php artisan test        # Pest suite
-./vendor/bin/pint       # code style
-npm run dev             # Vite dev server
+docker stop queryproxy && docker rm queryproxy
+docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
+  sh -c 'find /data -mindepth 1 -delete && tar xzf /backup/queryproxy-data.tgz -C /data'
+docker run -d --name queryproxy -p 7432:7432 \
+  --env-file queryproxy.env \
+  -v queryproxy-data:/var/www/html/storage/app \
+  queryproxy/queryproxy:0.2.4
 ```
 
-The `live-pgsql` test group runs the SQL guard against a real PostgreSQL server
-and is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is set;
-[`docker-compose.test.yml`](docker-compose.test.yml) starts a throwaway server
-for it on port `55432` (the variables to set are listed at the top of that
-file, then `./vendor/bin/pest --group=live-pgsql`).
+## Documentation
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Product requirements and architecture
-decisions live in the project's SSOT repository (PRD / ADR / MVP plan).
+- [Introduction](https://queryproxy.com/docs/)
+- [Quick start](https://queryproxy.com/docs/quickstart/)
+- [Manual installation](https://queryproxy.com/docs/manual-installation/)
+- [Configuration](https://queryproxy.com/docs/configuration/)
+- [Production hardening](https://queryproxy.com/docs/production-hardening/)
+- [SQL guards](https://queryproxy.com/docs/sql-guards/)
+- [Approval workflow](https://queryproxy.com/docs/approval-workflow/)
+- [Data masking](https://queryproxy.com/docs/data-masking/)
+- [Slack integration](https://queryproxy.com/docs/slack-integration/) and
+  [Teams integration](https://queryproxy.com/docs/teams-integration/)
+
+All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
+
+## Project Status
+
+**Beta.** QueryProxy is at version 0.2.5; breaking changes can land in any 0.y release and are listed in the [changelog](CHANGELOG.md).
+
+## Contributing
+
+Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md) before opening an issue or pull request.
 
 ## Security
 
-Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
-
-Highlights: encrypted credentials at rest, TOTP two-factor authentication,
-comment-normalized SQL guards with an executor-enforced row ceiling, replay-protected
-and identity-bound chat callbacks, immutable audit logs, login/webhook/Livewire rate
-limiting, self-approval prevention, SSRF-guarded outbound webhooks, masked-at-write
-(fail-closed) result storage, and security response headers.
+Do not report security vulnerabilities through public issues; follow the [security policy](SECURITY.md) instead.
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE). If you run a modified QueryProxy
-as a network service, you must publish your modifications under the same license.
+Licensed under the [GNU Affero General Public License v3.0](LICENSE).

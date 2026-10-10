@@ -1,13 +1,38 @@
 # Security Policy
 
-## Reporting a vulnerability
+## Supported Versions
 
-Please **do not open public issues for security problems**.
-Email `info@queryproxy.com` (or use GitHub private vulnerability reporting)
-with a description, reproduction steps and impact assessment. You will get an
-acknowledgement within 72 hours.
+Only the latest release receives security fixes while the project is at `0.y.z`.
 
-## Scope highlights
+| Version | Supported |
+|---|---|
+| Latest release | Yes |
+| Older versions | No |
+
+## Reporting a Vulnerability
+
+Do not report security vulnerabilities through public issues, pull requests or discussions.
+
+Report vulnerabilities privately through GitHub Private Vulnerability Reporting:
+[open a private security advisory](https://github.com/QueryProxy/QueryProxy/security/advisories/new).
+
+If you cannot use GitHub, send an email to `info@muhammetsafak.com` with the subject line `[SECURITY] QueryProxy`.
+
+Please include:
+
+- the affected version or versions,
+- steps to reproduce the issue,
+- the impact of the vulnerability,
+- a suggested fix, if you have one.
+
+## Response Process
+
+- You will receive a response within 7 days of your report.
+- The report is assessed and you are informed of the result.
+- After a fix is released, a GitHub Security Advisory is published.
+- If you wish, you are credited for the report in the advisory.
+
+## Scope
 
 QueryProxy is a security tool; these areas are especially sensitive:
 
@@ -24,6 +49,6 @@ QueryProxy is a security tool; these areas are especially sensitive:
 - Credential storage: connection secrets must never appear in logs, audit metadata
   or error messages.
 
-## Supported versions
+The following are out of scope for this policy:
 
-Only the latest minor release receives security fixes.
+- Vulnerabilities in third-party dependencies that do not affect QueryProxy (report them to their maintainers). A vulnerable dependency version shipped in a QueryProxy release or image is in scope.

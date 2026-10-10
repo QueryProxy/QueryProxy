@@ -6,27 +6,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.5] — 2026-10-10
-
-### Security
-
-- **Error messages of failed queries are masked like result data.** Driver
-  errors echo the offending values (`Duplicate entry 'bob@x.io'`,
-  `Key (phone)=(...)`, the SQL with its bindings), and the message was stored
-  and shown unmasked in the request, the audit log and the in-app
-  notification. It now goes through the connection's masking rules first:
-  content rules mask matches in place, and when the message names a column
-  covered by a column rule every literal value in it is masked. The raw
-  message stays in the application log only. This closes the gap in ADR-014
-  for new failures. It does not rewrite history: audit entries written by
-  earlier versions (`request.execution_failed`, `execution.late_completion`)
-  keep the raw text, because the audit log is immutable. Run
-  `php artisan queryproxy:mask-error-messages` to mask the messages stored on
-  query requests and in the in-app "request failed" notifications by earlier
-  versions.
-- **The job `failed()` safety net now redacts and masks too.** It stored the
-  raw exception message; it now uses the same redact-and-mask path as the
-  executor.
+## [0.2.5] - 2026-10-10
 
 ### Added
 
@@ -63,15 +43,27 @@ All notable changes to QueryProxy are documented here. The format follows
   steps and the add-member error pointed to "Admin → Users"; they now name
   the actual screen, Teams & Users → Manage users.
 
-## [0.2.4] — 2026-10-04
-
 ### Security
 
-- **`league/commonmark` updated to 2.10.3.** 2.10.0 is affected by
-  GHSA-3q6v-r5mr-hxv8 (high) and GHSA-97jj-33gv-5xf9 (medium). The release
-  image scan failed on them, so the container images for 0.2.1, 0.2.2 and
-  0.2.3 were never published; 0.2.4 is the first image after 0.2.0 and
-  carries all of their changes.
+- **Error messages of failed queries are masked like result data.** Driver
+  errors echo the offending values (`Duplicate entry 'bob@x.io'`,
+  `Key (phone)=(...)`, the SQL with its bindings), and the message was stored
+  and shown unmasked in the request, the audit log and the in-app
+  notification. It now goes through the connection's masking rules first:
+  content rules mask matches in place, and when the message names a column
+  covered by a column rule every literal value in it is masked. The raw
+  message stays in the application log only. This closes the gap in ADR-014
+  for new failures. It does not rewrite history: audit entries written by
+  earlier versions (`request.execution_failed`, `execution.late_completion`)
+  keep the raw text, because the audit log is immutable. Run
+  `php artisan queryproxy:mask-error-messages` to mask the messages stored on
+  query requests and in the in-app "request failed" notifications by earlier
+  versions.
+- **The job `failed()` safety net now redacts and masks too.** It stored the
+  raw exception message; it now uses the same redact-and-mask path as the
+  executor.
+
+## [0.2.4] - 2026-10-04
 
 ### Fixed
 
@@ -81,7 +73,54 @@ All notable changes to QueryProxy are documented here. The format follows
   refuse the switch back to read-write. The test's setup statements now run
   unprepared. The guard itself is unchanged.
 
-## [0.2.3] — 2026-10-04
+### Security
+
+- **`league/commonmark` updated to 2.10.3.** 2.10.0 is affected by
+  GHSA-3q6v-r5mr-hxv8 (high) and GHSA-97jj-33gv-5xf9 (medium). The release
+  image scan failed on them, so the container images for 0.2.1, 0.2.2 and
+  0.2.3 were never published; 0.2.4 is the first image after 0.2.0 and
+  carries all of their changes.
+
+## [0.2.3] - 2026-10-04
+
+### Changed
+
+- **CI and the live test setup.** `ci.yml` runs with a read-only `contents`
+  token and checks out without persisting credentials, as `live-pgsql.yml`
+  already did. PostgreSQL for the `live-pgsql` group (the workflow's service
+  and `docker-compose.test.yml`) is initialised with `--auth-host=scram-sha-256`,
+  because the image trusts loopback otherwise and the `dblink_exec` test never
+  sent the password it is meant to prove it passes. The `dblink_exec` test now
+  passes `host`, `port` and `password` in an escaped connection string
+  (`QUERYPROXY_LIVE_PGSQL_SERVER_HOST` / `_SERVER_PORT` override the address the
+  server sees itself at). The compose file listens on `55432` inside the
+  container as well, so the documented command no longer needs
+  `QUERYPROXY_LIVE_PGSQL_SERVER_PORT`, and keeps its data directory on tmpfs so
+  every container starts from a fresh `initdb`. **If you run the compose
+  example locally, recreate the container once**
+  (`docker compose -f docker-compose.test.yml down`, then `up -d --wait`).
+
+### Fixed
+
+- **A write refused by a read-only session was silently run again.** Laravel
+  counts PostgreSQL SQLSTATE `25006` and MySQL/MariaDB's `--read-only` error as
+  a lost connection, so outside a transaction it reconnected and re-ran the
+  write on a fresh, writable session. The lost-connection detector now reports
+  read-only errors as not lost and defers everything else to the framework's
+  detector. **Trade-off:** after a MySQL/Aurora failover that leaves a
+  connection on a read-only node, or on a PostgreSQL hot standby, the request
+  fails with the database's error instead of being retried on a new connection;
+  a queue worker that lands there no longer stops itself on `25006` either, so
+  restart workers after such a failover.
+- **Large SQL took seconds and hundreds of megabytes to inspect.** The guard
+  lexed the same SQL several times per inspection, kept lexer errors with their
+  backtraces and re-scanned its lexical ranges linearly. Each SQL text is now
+  lexed once per inspection, dialect ranges are kept sorted and binary-searched,
+  and the parser no longer leaves a cycle of garbage behind each request. On
+  the worst 64 KiB SQLite input that was tried (`[a],` repeated) inspection
+  went from 15.9 s and 589M of peak memory to 0.69 s and 21.5M, measured on a
+  development machine under load; the verdicts do not change. New tests pin
+  the lex count, the memory peak and a time bound relative to a bare lexer pass.
 
 ### Security
 
@@ -138,46 +177,7 @@ All notable changes to QueryProxy are documented here. The format follows
   driver, so on PostgreSQL (and when the target database is unknown)
   `SET @@general_log = 1` is now refused.
 
-### Fixed
-
-- **A write refused by a read-only session was silently run again.** Laravel
-  counts PostgreSQL SQLSTATE `25006` and MySQL/MariaDB's `--read-only` error as
-  a lost connection, so outside a transaction it reconnected and re-ran the
-  write on a fresh, writable session. The lost-connection detector now reports
-  read-only errors as not lost and defers everything else to the framework's
-  detector. **Trade-off:** after a MySQL/Aurora failover that leaves a
-  connection on a read-only node, or on a PostgreSQL hot standby, the request
-  fails with the database's error instead of being retried on a new connection;
-  a queue worker that lands there no longer stops itself on `25006` either, so
-  restart workers after such a failover.
-- **Large SQL took seconds and hundreds of megabytes to inspect.** The guard
-  lexed the same SQL several times per inspection, kept lexer errors with their
-  backtraces and re-scanned its lexical ranges linearly. Each SQL text is now
-  lexed once per inspection, dialect ranges are kept sorted and binary-searched,
-  and the parser no longer leaves a cycle of garbage behind each request. On
-  the worst 64 KiB SQLite input that was tried (`[a],` repeated) inspection
-  went from 15.9 s and 589M of peak memory to 0.69 s and 21.5M, measured on a
-  development machine under load; the verdicts do not change. New tests pin
-  the lex count, the memory peak and a time bound relative to a bare lexer pass.
-
-### Changed
-
-- **CI and the live test setup.** `ci.yml` runs with a read-only `contents`
-  token and checks out without persisting credentials, as `live-pgsql.yml`
-  already did. PostgreSQL for the `live-pgsql` group (the workflow's service
-  and `docker-compose.test.yml`) is initialised with `--auth-host=scram-sha-256`,
-  because the image trusts loopback otherwise and the `dblink_exec` test never
-  sent the password it is meant to prove it passes. The `dblink_exec` test now
-  passes `host`, `port` and `password` in an escaped connection string
-  (`QUERYPROXY_LIVE_PGSQL_SERVER_HOST` / `_SERVER_PORT` override the address the
-  server sees itself at). The compose file listens on `55432` inside the
-  container as well, so the documented command no longer needs
-  `QUERYPROXY_LIVE_PGSQL_SERVER_PORT`, and keeps its data directory on tmpfs so
-  every container starts from a fresh `initdb`. **If you run the compose
-  example locally, recreate the container once**
-  (`docker compose -f docker-compose.test.yml down`, then `up -d --wait`).
-
-### Notes
+**Notes**
 
 - PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
   classified as a write and always go through human approval. Dynamic SQL
@@ -188,7 +188,31 @@ All notable changes to QueryProxy are documented here. The format follows
   Multibyte character sets that change backslash handling (`SET NAMES big5`,
   `sjis`, `gbk`) are not checked either.
 
-## [0.2.2] — 2026-10-03
+## [0.2.2] - 2026-10-03
+
+### Added
+
+- **Live PostgreSQL guard tests.** A `live-pgsql` Pest group in `tests/Live`
+  runs the guard against a real PostgreSQL server and checks both the verdict
+  and the effect on the server (settings, `dblink_exec`,
+  `pg_terminate_backend`, `pg_cancel_backend`, `EXPLAIN ANALYZE DELETE`,
+  `DO` blocks and more). It is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is
+  set. `docker-compose.test.yml` starts a throwaway PostgreSQL 17 for local runs,
+  and the new `live-pgsql` GitHub Actions workflow runs the group in CI.
+
+### Fixed
+
+- **The queue timing warning missed `queue:listen` and `queue:work --once`.**
+  The warning that `retry_after` is at or below the execution timeout was
+  logged only when a daemon `queue:work` started. It is now also logged when
+  `queue:listen` or `queue:work --once` starts, once per process; the
+  short-lived `queue:work --once` children that `queue:listen` spawns do not
+  repeat it.
+- **The Compose worker example hard-coded `--timeout=310`.** `docker-compose.yml`
+  now passes the timeout the image entrypoint derives
+  (`QUERYPROXY_WORKER_TIMEOUT`, `QUERYPROXY_EXECUTION_TIMEOUT` + 10), so
+  changing `QUERYPROXY_EXECUTION_TIMEOUT` in the example also moves the worker
+  timeout. The example needs the image's default entrypoint.
 
 ### Security
 
@@ -266,38 +290,31 @@ All notable changes to QueryProxy are documented here. The format follows
   identifiers and comments. A plain string such as `'a\'` is therefore
   rejected on PostgreSQL even though MySQL and MariaDB behave as before.
 
-### Fixed
-
-- **The queue timing warning missed `queue:listen` and `queue:work --once`.**
-  The warning that `retry_after` is at or below the execution timeout was
-  logged only when a daemon `queue:work` started. It is now also logged when
-  `queue:listen` or `queue:work --once` starts, once per process; the
-  short-lived `queue:work --once` children that `queue:listen` spawns do not
-  repeat it.
-- **The Compose worker example hard-coded `--timeout=310`.** `docker-compose.yml`
-  now passes the timeout the image entrypoint derives
-  (`QUERYPROXY_WORKER_TIMEOUT`, `QUERYPROXY_EXECUTION_TIMEOUT` + 10), so
-  changing `QUERYPROXY_EXECUTION_TIMEOUT` in the example also moves the worker
-  timeout. The example needs the image's default entrypoint.
-
-### Added
-
-- **Live PostgreSQL guard tests.** A `live-pgsql` Pest group in `tests/Live`
-  runs the guard against a real PostgreSQL server and checks both the verdict
-  and the effect on the server (settings, `dblink_exec`,
-  `pg_terminate_backend`, `pg_cancel_backend`, `EXPLAIN ANALYZE DELETE`,
-  `DO` blocks and more). It is skipped unless `QUERYPROXY_LIVE_PGSQL_HOST` is
-  set. `docker-compose.test.yml` starts a throwaway PostgreSQL 17 for local runs,
-  and the new `live-pgsql` GitHub Actions workflow runs the group in CI.
-
-### Notes
+**Notes**
 
 - PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
   classified as a write and always go through human approval, where the
   reviewer sees the whole body. A `DELETE` without `WHERE` inside a
   `DO` block therefore passes the guard.
 
-## [0.2.1] — 2026-10-02
+## [0.2.1] - 2026-10-02
+
+### Fixed
+
+- `retry_after` for the database, Beanstalkd and Redis queues no longer falls
+  back to Laravel's 90 seconds, which is below the worker's 310-second timeout
+  and let a slow query be re-reserved while it was still running and then marked
+  failed (notably with `QUEUE_CONNECTION=redis`). It is now derived from
+  `QUERYPROXY_EXECUTION_TIMEOUT` (timeout + 30 seconds, 330 by default)
+  instead of a fixed number. An explicit `*_QUEUE_RETRY_AFTER` still wins; a
+  value at or below the timeout logs a warning when a `queue:work` worker
+  starts. The Docker entrypoint derives the worker `--timeout`
+  (timeout + 10) and `stopwaitsecs` (timeout + 20) the same way.
+- **A query that finished late could turn a Failed request into Completed.** The
+  executor now moves a request to Completed only if it is still Running. A late
+  result is discarded, the result file is removed, and an
+  `execution.late_completion` audit entry is written; for a write it records
+  that the write was committed.
 
 ### Security
 
@@ -375,24 +392,7 @@ All notable changes to QueryProxy are documented here. The format follows
   with the default masking rules. Existing teams are not changed (see
   Upgrading).
 
-### Fixed
-
-- `retry_after` for the database, Beanstalkd and Redis queues no longer falls
-  back to Laravel's 90 seconds, which is below the worker's 310-second timeout
-  and let a slow query be re-reserved while it was still running and then marked
-  failed (notably with `QUEUE_CONNECTION=redis`). It is now derived from
-  `QUERYPROXY_EXECUTION_TIMEOUT` (timeout + 30 seconds, 330 by default)
-  instead of a fixed number. An explicit `*_QUEUE_RETRY_AFTER` still wins; a
-  value at or below the timeout logs a warning when a `queue:work` worker
-  starts. The Docker entrypoint derives the worker `--timeout`
-  (timeout + 10) and `stopwaitsecs` (timeout + 20) the same way.
-- **A query that finished late could turn a Failed request into Completed.** The
-  executor now moves a request to Completed only if it is still Running. A late
-  result is discarded, the result file is removed, and an
-  `execution.late_completion` audit entry is written; for a write it records
-  that the write was committed.
-
-### Upgrading
+**Upgrading**
 
 - **Remove the fixed `retry_after` lines from your `.env`.** The 0.2.0
   `.env.example` shipped `DB_QUEUE_RETRY_AFTER=330` as an active setting, and an
@@ -422,7 +422,32 @@ All notable changes to QueryProxy are documented here. The format follows
 - The full list is in the
   [SQL guards wiki page](https://github.com/QueryProxy/QueryProxy/wiki/SQL-guards).
 
-## [0.2.0] — 2026-09-18
+## [0.2.0] - 2026-09-18
+
+### Changed
+
+- **Breaking — set `TRUSTED_PROXIES` when running behind a reverse proxy.** It is
+  empty by default. Until it names your proxy, `X-Forwarded-Proto` is ignored, so
+  HTTPS is not detected and audit entries record the proxy's address rather than
+  the client's. Never use `*`.
+- **Breaking — a system administrator must set the ChatOps signing secret.** DBAs
+  keep control of the webhook URL and the enabled flag, but can no longer enter or
+  rotate the secret. Existing installations should rotate it once after upgrading:
+  any DBA who configured ChatOps already knows the current value.
+- **Breaking — Approve / Reject buttons in chat messages posted before this
+  version stop working**, because they carry no action token. Decide those
+  requests in the web UI. Teams automations must start sending the `token` field
+  from the card's `queryproxy` envelope.
+- A TOTP code is now single-use, so signing in on a second device within the same
+  30-second window requires waiting for the next code.
+- Removing a ChatOps integration is administrator-only, matching the bar for
+  setting its signing secret — a DBA could otherwise delete an integration and
+  then be unable to put it back. DBAs still untick **Enabled** to switch one off.
+- `TRUSTED_HOSTS` accepts extra hostnames for installations served under more
+  than one name, since `X-Forwarded-Host` is no longer honoured.
+- New content masking rules apply to new teams only. Run **Masking → Add
+  defaults** per team to pick them up; it is idempotent and leaves existing rules
+  untouched.
 
 ### Security
 
@@ -473,32 +498,7 @@ All notable changes to QueryProxy are documented here. The format follows
 - Third-party GitHub Actions are pinned to commit SHAs, and the release workflow
   scans the image before any registry credential is on the runner.
 
-### Changed
-
-- **Breaking — set `TRUSTED_PROXIES` when running behind a reverse proxy.** It is
-  empty by default. Until it names your proxy, `X-Forwarded-Proto` is ignored, so
-  HTTPS is not detected and audit entries record the proxy's address rather than
-  the client's. Never use `*`.
-- **Breaking — a system administrator must set the ChatOps signing secret.** DBAs
-  keep control of the webhook URL and the enabled flag, but can no longer enter or
-  rotate the secret. Existing installations should rotate it once after upgrading:
-  any DBA who configured ChatOps already knows the current value.
-- **Breaking — Approve / Reject buttons in chat messages posted before this
-  version stop working**, because they carry no action token. Decide those
-  requests in the web UI. Teams automations must start sending the `token` field
-  from the card's `queryproxy` envelope.
-- A TOTP code is now single-use, so signing in on a second device within the same
-  30-second window requires waiting for the next code.
-- Removing a ChatOps integration is administrator-only, matching the bar for
-  setting its signing secret — a DBA could otherwise delete an integration and
-  then be unable to put it back. DBAs still untick **Enabled** to switch one off.
-- `TRUSTED_HOSTS` accepts extra hostnames for installations served under more
-  than one name, since `X-Forwarded-Host` is no longer honoured.
-- New content masking rules apply to new teams only. Run **Masking → Add
-  defaults** per team to pick them up; it is idempotent and leaves existing rules
-  untouched.
-
-## [0.1.3] — 2026-09-08
+## [0.1.3] - 2026-09-08
 
 ### Changed
 
@@ -508,7 +508,16 @@ All notable changes to QueryProxy are documented here. The format follows
 - Release workflow actions updated to `docker/login-action@v4`,
   `setup-buildx-action@v4`, `setup-qemu-action@v4` and `metadata-action@v6`.
 
-## [0.1.2] — 2026-09-08
+## [0.1.2] - 2026-09-08
+
+### Added
+
+- `php artisan queryproxy:create-admin` creates the first administrator, and
+  `QUERYPROXY_ADMIN_EMAIL` / `QUERYPROXY_ADMIN_PASSWORD` / `QUERYPROXY_ADMIN_NAME`
+  create it on first boot — a fresh instance no longer needs demo seeding to
+  have an account to log in with.
+- Container `HEALTHCHECK` against `/up`, so `docker run` reports health without
+  a compose file.
 
 ### Changed
 
@@ -524,16 +533,12 @@ All notable changes to QueryProxy are documented here. The format follows
   (or `.app_key`) is still used when present.
 - Releases publish to Docker Hub (`queryproxy/queryproxy`) as well as GHCR.
 
+## [0.1.1] - 2026-09-08
+
 ### Added
 
-- `php artisan queryproxy:create-admin` creates the first administrator, and
-  `QUERYPROXY_ADMIN_EMAIL` / `QUERYPROXY_ADMIN_PASSWORD` / `QUERYPROXY_ADMIN_NAME`
-  create it on first boot — a fresh instance no longer needs demo seeding to
-  have an account to log in with.
-- Container `HEALTHCHECK` against `/up`, so `docker run` reports health without
-  a compose file.
-
-## [0.1.1] — 2026-09-08
+- `.dockerignore`, so local `docker build` uses the same clean context as CI
+  instead of copying host `vendor/`, `node_modules/` and `.env` into the image.
 
 ### Fixed
 
@@ -541,12 +546,7 @@ All notable changes to QueryProxy are documented here. The format follows
   on first boot: the seeder relied on Faker, which is a dev-only dependency and
   absent from `--no-dev` installs. The seeder no longer uses factories.
 
-### Added
-
-- `.dockerignore`, so local `docker build` uses the same clean context as CI
-  instead of copying host `vendor/`, `node_modules/` and `.env` into the image.
-
-## [0.1.0] — 2026-09-08
+## [0.1.0] - 2026-09-08
 
 The first public release.
 

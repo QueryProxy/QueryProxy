@@ -1,8 +1,5 @@
 *.log
 .DS_Store
-.env
-.env.backup
-.env.production
 .phpactor.json
 .phpunit.result.cache
 /.codex
@@ -25,3 +22,16 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+/.ssot/
+.env
+.env.*
+!.env.example
+
+# AI agent tooling
+/.claude/
+/.ai/
+/.agents/
+/AGENTS.md
+/CLAUDE.md
+/.mcp.json
+/boost.json
