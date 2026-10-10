@@ -12,7 +12,6 @@ use App\Models\Team;
 use App\Models\User;
 use App\Services\Approvals\ApprovalService;
 use Illuminate\Auth\Access\AuthorizationException;
-use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
@@ -349,7 +348,7 @@ test('a developer cannot submit through a connection owned by another team', fun
         ->set('connectionId', $foreignConnection->id)
         ->set('sql', 'SELECT 1');
 
-    expect(fn () => $component->call('submit'))->toThrow(ModelNotFoundException::class);
+    $component->call('submit')->assertNotFound();
 
     expect(QueryRequest::count())->toBe(0);
 });
