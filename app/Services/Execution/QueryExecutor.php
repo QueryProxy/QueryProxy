@@ -9,6 +9,7 @@ use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Connections\DynamicConnectionFactory;
+use App\Services\Masking\ErrorMessageSanitizer;
 use App\Services\Masking\Masker;
 use App\Services\Sql\SqlInspector;
 use Illuminate\Support\Facades\DB;
@@ -42,6 +43,7 @@ class QueryExecutor
         private DynamicConnectionFactory $factory,
         private SqlInspector $inspector,
         private Masker $masker,
+        private ErrorMessageSanitizer $errors,
     ) {}
 
     public function execute(QueryRequest $request): void
@@ -70,6 +72,7 @@ class QueryExecutor
         $connectionName = $this->factory->configure($connection);
         $start = hrtime(true);
         $settled = false;
+        $owned = false;
 
         try {
             $this->assertDefaultQuoting($connection, $connectionName);
@@ -110,6 +113,7 @@ class QueryExecutor
                 return;
             }
 
+            $owned = true;
             $request->refresh();
 
             audit()->record('request.execution_completed', actor: $request->reviewer, request: $request, metadata: [
@@ -119,9 +123,10 @@ class QueryExecutor
             ]);
         } catch (Throwable $e) {
             // Driver errors can echo the connection host / username / database
-            // (fields we encrypt at rest) — redact them before anything
-            // user- or auditor-visible; the full exception goes to the log.
-            $safeMessage = $this->factory->redactError($e->getMessage(), $connection);
+            // (fields we encrypt at rest) and the row values involved — redact
+            // and mask them like result data before anything user- or
+            // auditor-visible; the full exception goes to the log.
+            $safeMessage = $this->errors->sanitize($e, $connection);
 
             if ($settled) {
                 Log::error('Query execution finished, but recording its outcome failed.', [
@@ -158,6 +163,7 @@ class QueryExecutor
                 return;
             }
 
+            $owned = true;
             $request->refresh();
 
             audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
@@ -165,7 +171,13 @@ class QueryExecutor
             ]);
         } finally {
             $this->factory->purge($connection);
-            ApprovalNotifier::requestFinished($request->fresh());
+
+            // Only the run that settled the request announces it. When the run
+            // finished late, whoever moved the request out of Running (the
+            // job's failed() handler, another worker) already did.
+            if ($owned) {
+                ApprovalNotifier::requestFinished($request->fresh());
+            }
         }
     }
 

@@ -223,3 +223,169 @@ test('the default card rule ignores long numbers that are not card numbers', fun
         ->and($masker->maskValue('v', '2000000000000000', $rules))->toBe('2000000000000000')
         ->and($masker->maskValue('v', '41111111111111111', $rules))->toBe('41111111111111111');
 });
+
+test('maskText applies regex rules in place', function () {
+    $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/\d{3}-\d{2}-\d{4}/', 'strategy' => 'full'])]);
+
+    expect(app(Masker::class)->maskText('bad value 123-45-6789 near x', $rules))->toBe('bad value ***** near x');
+});
+
+test('maskText masks a value echoed by a postgres type error', function () {
+    $message = 'SQLSTATE[22P02]: Invalid text representation: 7 ERROR:  invalid input syntax for type integer: "alice@example.com"';
+
+    $masked = app(Masker::class)->maskText($message, defaultRules());
+
+    expect($masked)->not->toContain('alice@example.com')
+        ->and($masked)->toContain('invalid input syntax for type integer: "a***@***.com"');
+});
+
+test('maskText masks a mysql duplicate entry when the key names a sensitive column', function () {
+    // Not e-mail shaped, so only the column path can catch it.
+    $masked = app(Masker::class)->maskText("Duplicate entry '905551112233' for key 'users.phone'", defaultRules());
+
+    expect($masked)->not->toContain('905551112233')
+        ->and($masked)->toStartWith("Duplicate entry '")
+        ->and($masked)->toEndWith("' for key 'users.phone'");
+});
+
+test('maskText masks the value of a postgres key detail by its column name', function () {
+    $masked = app(Masker::class)->maskText(
+        'ERROR:  duplicate key value violates unique constraint "users_phone_key" DETAIL:  Key (phone)=(+905551112233) already exists.',
+        defaultRules(),
+    );
+
+    expect($masked)->not->toContain('5551112233')
+        ->and($masked)->toContain('Key (phone)=(')
+        ->and($masked)->toContain('users_phone_key')
+        ->and($masked)->toEndWith(') already exists.');
+});
+
+test('maskText masks every literal when a column rule matches, leaving identifiers readable', function () {
+    $rules = collect([rule(['pattern' => '*email*', 'strategy' => 'full'])]);
+
+    $masked = app(Masker::class)->maskText(
+        "Data truncated for column 'email' at row 1 near 'ada@example.com' and 'Ada Lovelace'",
+        $rules,
+    );
+
+    expect($masked)->toBe("Data truncated for column 'email' at row 1 near '*****' and '*****'");
+});
+
+test('maskText uses the strongest strategy among the matching column rules', function () {
+    $rules = collect([
+        rule(['pattern' => '*email*', 'strategy' => 'partial']),
+        rule(['pattern' => '*token*', 'strategy' => 'full']),
+        rule(['pattern' => '*phone*', 'strategy' => 'hash']),
+    ]);
+
+    $masker = app(Masker::class);
+
+    expect($masker->maskText("Duplicate entry 'abcdef' for key 'users.email_token'", $rules))
+        ->toBe("Duplicate entry '*****' for key 'users.email_token'")
+        ->and($masker->maskText("Duplicate entry 'abcdef' for key 'users.phone_email'", $rules))
+        ->toStartWith("Duplicate entry 'sha256:");
+});
+
+test('maskText matches the last part of a table.column identifier', function () {
+    $rules = collect([rule(['pattern' => 'email', 'strategy' => 'full'])]);
+
+    expect(app(Masker::class)->maskText("Duplicate entry 'zed' for key 'users.email'", $rules))
+        ->toBe("Duplicate entry '*****' for key 'users.email'");
+});
+
+test('maskText masks a failing row echo whenever any rule exists', function () {
+    $rules = collect([rule(['pattern' => '*token*', 'strategy' => 'full'])]);
+
+    expect(app(Masker::class)->maskText('null value in column "id" violates not-null constraint DETAIL:  Failing row contains (null, ada, 4111111111111111).', $rules))
+        ->toBe('null value in column "id" violates not-null constraint DETAIL:  Failing row contains (*****).');
+});
+
+test('maskText leaves non-sensitive text unchanged', function () {
+    $message = 'SQLSTATE[HY000]: General error: 1 no such table: missing_table';
+
+    expect(app(Masker::class)->maskText($message, defaultRules()))->toBe($message);
+});
+
+test('maskText returns the text unchanged when there are no rules', function () {
+    $message = "Duplicate entry 'bob@x.io' for key 'users.email'";
+
+    expect(app(Masker::class)->maskText($message, collect()))->toBe($message);
+});
+
+test('maskText is idempotent', function () {
+    $masker = app(Masker::class);
+    $once = $masker->maskText("Duplicate entry 'bob@x.io' for key 'users.email' near \"alice@example.com\"", defaultRules());
+
+    expect($masker->maskText($once, defaultRules()))->toBe($once);
+});
+
+test('maskText fails closed when a pattern cannot be evaluated', function () {
+    $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/(unclosed/', 'strategy' => 'partial'])]);
+
+    expect(app(Masker::class)->maskText('anything at all', $rules))->toBe('*****');
+});
+
+test('maskText fails closed when PCRE hits its backtrack limit', function () {
+    $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/(a+)+$/', 'strategy' => 'partial'])]);
+    $original = ini_get('pcre.backtrack_limit');
+    $originalJit = ini_get('pcre.jit');
+
+    ini_set('pcre.jit', '0');
+    ini_set('pcre.backtrack_limit', '100');
+
+    try {
+        $text = str_repeat('a', 200).'b';
+
+        // The literal scan itself survives these limits (a harmless rule leaves
+        // the text alone), so the fail-closed result below comes from the
+        // catastrophic rule.
+        $harmless = collect([rule(['match_type' => 'regex', 'pattern' => '/zzz/', 'strategy' => 'full'])]);
+        $untouched = app(Masker::class)->maskText($text, $harmless);
+        $masked = app(Masker::class)->maskText($text, $rules);
+    } finally {
+        ini_set('pcre.backtrack_limit', (string) $original);
+        ini_set('pcre.jit', (string) $originalJit);
+    }
+
+    expect($untouched)->toBe($text)
+        ->and($masked)->toBe('*****');
+});
+
+test('maskText applies an anchored regex rule to a whole echoed value', function () {
+    $message = 'SQLSTATE[22P02]: invalid input syntax for type integer: "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3" (Connection: pgsql, SQL: select note::int from notes)';
+
+    $masked = app(Masker::class)->maskText($message, defaultRules());
+
+    expect($masked)->not->toContain('aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3')
+        ->and($masked)->toContain('invalid input syntax for type integer: "*****"')
+        ->and($masked)->toContain('select note::int from notes');
+});
+
+test('maskText applies an anchored regex rule to a duplicate entry and a key detail value', function () {
+    $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/^\d{11}$/', 'strategy' => 'full'])]);
+    $masker = app(Masker::class);
+
+    expect($masker->maskText("Duplicate entry '12345678901' for key 'users.national_id'", $rules))
+        ->toBe("Duplicate entry '*****' for key 'users.national_id'")
+        ->and($masker->maskText('DETAIL:  Key (national_id)=(12345678901) already exists.', $rules))
+        ->toBe('DETAIL:  Key (national_id)=(*****) already exists.');
+});
+
+test('maskText leaves a literal alone when no anchored rule matches it', function () {
+    $rules = collect([rule(['match_type' => 'regex', 'pattern' => '/^\d{11}$/', 'strategy' => 'full'])]);
+    $message = "Duplicate entry '1234' for key 'users.national_id'";
+
+    expect(app(Masker::class)->maskText($message, $rules))->toBe($message);
+});
+
+test('maskText masks the whole message when a stray apostrophe unbalances the quotes', function () {
+    $message = "Table 'db.missing' doesn't exist (Connection: mysql, SQL: select * from missing where phone = '905551112233')";
+
+    expect(app(Masker::class)->maskText($message, defaultRules()))->toBe('*****');
+});
+
+test('maskText keeps a message with balanced and escaped quotes readable', function () {
+    $masked = app(Masker::class)->maskText("Duplicate entry 'it\\'s' for key 'users.phone'", defaultRules());
+
+    expect($masked)->toStartWith("Duplicate entry '")->and($masked)->not->toBe('*****');
+});

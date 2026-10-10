@@ -6,8 +6,38 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Error messages of failed queries are masked like result data.** Driver
+  errors echo the offending values (`Duplicate entry 'bob@x.io'`,
+  `Key (phone)=(...)`, the SQL with its bindings), and the message was stored
+  and shown unmasked in the request, the audit log and the in-app
+  notification. It now goes through the connection's masking rules first:
+  content rules mask matches in place, and when the message names a column
+  covered by a column rule every literal value in it is masked. The raw
+  message stays in the application log only. This closes the gap in ADR-014
+  for new failures. It does not rewrite history: audit entries written by
+  earlier versions (`request.execution_failed`, `execution.late_completion`)
+  keep the raw text, because the audit log is immutable. Run
+  `php artisan queryproxy:mask-error-messages` to mask the messages stored on
+  query requests and in the in-app "request failed" notifications by earlier
+  versions.
+- **The job `failed()` safety net now redacts and masks too.** It stored the
+  raw exception message; it now uses the same redact-and-mask path as the
+  executor.
+
 ### Added
 
+- `php artisan queryproxy:mask-error-messages [--dry-run]` masks the error
+  messages already stored on query requests and the copy of them inside
+  in-app "request failed" notifications, using each connection's current
+  rules (a request or connection that no longer exists gets the fixed
+  message). Safe to run repeatedly; the immutable audit log is left untouched
+  and the run is recorded as one `error_messages.masked` entry (scanned,
+  changed, replaced by the fixed message, skipped; and scanned, changed,
+  replaced by the fixed message and skipped for notifications) even when it stops halfway. A record whose connection rules
+  cannot be read is skipped, left unchanged and reported, and the command
+  exits non-zero.
 - **DDL flag on requests.** A request that contains DDL now carries a `DDL`
   badge in the approvals queue and on the request page, and the Slack and
   Teams "new request" messages say so, so the approving DBA sees it before
@@ -15,6 +45,14 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Fixed
 
+- **A request failed by the job's `failed()` handler left no trace.** It now
+  writes the `request.execution_failed` audit entry (with
+  `source: job_failed`) and notifies the requester, as a failure inside the
+  executor already did. A request that has already completed is still never
+  flipped.
+- The Teams HMAC docblock described the key as `base64_decoded_secret`; it now
+  states what the code does: the secret base64-decoded in strict mode, or the
+  raw secret when it is not valid base64.
 - **Auditors could not reach the Requests list from the menu.** The sidebar
   hid the link for the auditor role although the page, the route and the
   policy already allowed it. Auditors now see the team's requests from the

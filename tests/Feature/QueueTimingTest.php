@@ -1,6 +1,7 @@
 <?php
 
 use App\Enums\QueryRequestStatus;
+use App\Jobs\ExecuteQueryRequest;
 use App\Models\AuditLog;
 use App\Models\Connection;
 use App\Models\QueryRequest;
@@ -8,6 +9,8 @@ use App\Models\Team;
 use App\Providers\AppServiceProvider;
 use App\Services\Audit\AuditRecorder;
 use App\Services\Execution\QueryExecutor;
+use App\Services\Masking\ErrorMessageSanitizer;
+use App\Services\Masking\Masker;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Queue\Events\WorkerStarting;
@@ -465,4 +468,102 @@ describe('command-started queue processes', function () {
         'migrate' => ['migrate', []],
         'queue:work daemon (left to WorkerStarting)' => ['queue:work', []],
     ]);
+});
+
+test('a late driver error is masked in the late completion record', function () {
+    [$request] = timingSetup("UPDATE customers SET active = 0 WHERE id > 1; INSERT INTO customers (id, name) VALUES (1, 'late-secret@example.com')", ['type' => 'write']);
+    failRequestDuringExecution($request);
+
+    app(QueryExecutor::class)->execute($request);
+
+    $late = AuditLog::where('query_request_id', $request->id)->where('action', 'execution.late_completion')->first();
+
+    expect($late->metadata['failed'])->toBeTrue()
+        ->and($late->metadata['error'])->toContain('UNIQUE constraint failed')
+        ->and($late->metadata['error'])->not->toContain('late-secret@example.com');
+});
+
+test('failed() redacts and masks the stored message, audits it and notifies the requester', function () {
+    [$request] = timingSetup('SELECT 1', ['status' => QueryRequestStatus::Running]);
+    $request->connection->update(['host' => 'db-internal-7.corp']);
+
+    (new ExecuteQueryRequest($request))->failed(
+        new RuntimeException("Duplicate entry 'bob@x.io' for key 'users.email' on host db-internal-7.corp"),
+    );
+
+    $request->refresh();
+    $audit = AuditLog::where('query_request_id', $request->id)->where('action', 'request.execution_failed')->sole();
+    $notification = $request->requester->notifications()->sole();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->not->toContain('bob@x.io')
+        ->and($request->error_message)->not->toContain('db-internal-7.corp')
+        ->and($request->error_message)->toContain("Duplicate entry '")
+        ->and($audit->metadata['error'])->toBe($request->error_message)
+        ->and($audit->metadata['source'])->toBe('job_failed')
+        ->and($notification->data['message'])->not->toContain('bob@x.io');
+});
+
+test('a worker losing the race to failed() does not notify a second time', function (string $sql, array $overrides) {
+    [$request] = timingSetup($sql, $overrides);
+    $raced = false;
+
+    Event::listen(QueryExecuted::class, function (QueryExecuted $event) use ($request, &$raced) {
+        if ($raced || $event->connectionName === config('database.default')) {
+            return;
+        }
+
+        $raced = true;
+
+        (new ExecuteQueryRequest($request))->failed(new RuntimeException('Job timed out.'));
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($raced)->toBeTrue()
+        ->and($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and(AuditLog::where('query_request_id', $request->id)->where('action', 'request.execution_failed')->count())->toBe(1)
+        ->and($request->requester->notifications()->count())->toBe(1);
+})->with([
+    'late read' => ['SELECT id, name FROM customers ORDER BY id LIMIT 10', []],
+    'late write' => ['UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']],
+    'late driver error' => ['UPDATE customers SET active = 0 WHERE id > 1; UPDATE missing_table SET x = 1', ['type' => 'write']],
+]);
+
+test('failed() leaves a request that already completed alone', function () {
+    [$request] = timingSetup('SELECT 1', ['status' => QueryRequestStatus::Completed]);
+
+    (new ExecuteQueryRequest($request))->failed(new RuntimeException("Duplicate entry 'bob@x.io' for key 'users.email'"));
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->error_message)->toBeNull()
+        ->and(AuditLog::where('query_request_id', $request->id)->where('action', 'request.execution_failed')->exists())->toBeFalse()
+        ->and($request->requester->notifications()->count())->toBe(0);
+});
+
+test('failed() stores the fixed message when masking itself throws', function () {
+    [$request] = timingSetup('SELECT 1', ['status' => QueryRequestStatus::Running]);
+
+    $this->partialMock(Masker::class, fn ($mock) => $mock->shouldReceive('rulesFor')->andThrow(new RuntimeException('rules unreadable')));
+
+    (new ExecuteQueryRequest($request))->failed(new RuntimeException("Duplicate entry 'bob@x.io' for key 'users.email'"));
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toBe(ErrorMessageSanitizer::FALLBACK_MESSAGE);
+});
+
+test('failed() writes the raw exception message to the log only', function () {
+    Log::spy();
+
+    [$request] = timingSetup('SELECT 1', ['status' => QueryRequestStatus::Running]);
+
+    (new ExecuteQueryRequest($request))->failed(new RuntimeException("Duplicate entry 'bob@x.io' for key 'users.email'"));
+
+    Log::shouldHaveReceived('error')->withArgs(fn (string $message, array $context = []) => ($context['message'] ?? null) === "Duplicate entry 'bob@x.io' for key 'users.email'")->once();
 });

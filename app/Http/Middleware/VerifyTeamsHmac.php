@@ -13,7 +13,10 @@ use Symfony\Component\HttpFoundation\Response;
  * (a Power Automate flow or custom automation) sends
  *
  *   X-QueryProxy-Timestamp: <unix seconds>
- *   Authorization: HMAC <base64(HMAC_SHA256("{timestamp}:{raw_body}", base64_decoded_secret))>
+ *   Authorization: HMAC <base64(HMAC_SHA256("{timestamp}:{raw_body}", key))>
+ *
+ * `key` is the integration's signing secret base64-decoded in strict mode; if
+ * the secret is not valid base64, the raw secret is used as the key.
  *
  * The timestamp is part of the signed payload and must be within ±5 minutes,
  * so a captured request cannot be replayed later (mirrors the Slack v0 scheme).

@@ -2,6 +2,7 @@
 
 use App\Enums\DbDriver;
 use App\Enums\QueryRequestStatus;
+use App\Models\AuditLog;
 use App\Models\Connection;
 use App\Models\MaskingRule;
 use App\Models\QueryRequest;
@@ -122,6 +123,33 @@ test('invalid sql marks the request failed with the error message', function () 
 
     expect($request->status)->toBe(QueryRequestStatus::Failed)
         ->and($request->error_message)->toContain('missing_table');
+});
+
+test('a failed query stores, audits and notifies a masked error message', function () {
+    [$request] = executionSetup(
+        "INSERT INTO customers (id, name, email) VALUES (1, 'Dup', 'dup@example.com')",
+        ['type' => 'write'],
+    );
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+    $audit = AuditLog::where('query_request_id', $request->id)->where('action', 'request.execution_failed')->sole();
+    $notification = $request->requester->notifications()->sole();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toContain('UNIQUE constraint failed')
+        ->and($request->error_message)->not->toContain('dup@example.com')
+        ->and($audit->metadata['error'])->toBe($request->error_message)
+        ->and($notification->data['message'])->not->toContain('dup@example.com');
+});
+
+test('a failed query with no sensitive content keeps its readable error message', function () {
+    [$request] = executionSetup('SELECT * FROM missing_table LIMIT 10');
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->error_message)->toContain('no such table: missing_table');
 });
 
 test('execution notifies the requester on completion', function () {
