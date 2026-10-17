@@ -66,7 +66,7 @@ use PhpMyAdmin\SqlParser\TokenType;
  *    PostgreSQL, and when the driver is unknown, a listed name is rejected
  *    in every scope: plain SET, SET SESSION and SET LOCAL alike.
  *
- * Four more things are refused outright, because each one raises what the
+ * Seven more things are refused outright, because each one raises what the
  * session may do or lifts the read-only defence, and none has a use that
  * needs a person's approval to be worth the risk:
  *
@@ -86,6 +86,18 @@ use PhpMyAdmin\SqlParser\TokenType;
  *  - READ WRITE in SET TRANSACTION, SET SESSION CHARACTERISTICS AS
  *    TRANSACTION, BEGIN and START TRANSACTION. It is the spelling of
  *    transaction_read_only that is not a SET of that variable.
+ *  - A write to MySQL / MariaDB's transaction_read_only / tx_read_only in any
+ *    scope and spelling, and ALTER DATABASE | ROLE | USER ... RESET of a
+ *    dangerous setting or RESET ALL on PostgreSQL: both lift a read-only or
+ *    role defence the operator put in place. See serverVariableViolations()
+ *    and persistentResetViolations().
+ *  - On SQL Server, a change of security context: EXECUTE AS / EXEC AS,
+ *    SETUSER and REVERT as statements, in dynamic SQL (EXEC ('...'),
+ *    sp_executesql) and as the WITH EXECUTE AS clause of a module
+ *    definition. See sqlsrvImpersonationViolations().
+ *  - PostgreSQL's CREATE [OR REPLACE] RULE ... DO <action>: the action runs
+ *    later, as the rule's owner, so it is scanned with the rules a statement
+ *    of its own gets. See ruleActionViolations().
  * They are judged in every nested path the guard descends into (a DO or
  * function body, dynamic SQL, a CTE body, EXPLAIN ANALYZE, SET STATEMENT ...
  * FOR), because those paths hand the inner statement to the same rules.
@@ -306,6 +318,19 @@ class SqlInspector
      * READ WRITE, BEGIN ... READ WRITE, START TRANSACTION READ WRITE) set them
      * without naming them and are refused as statements for the same reason.
      *
+     * transaction_read_only (tx_read_only before MySQL 5.7.20) is listed on
+     * MySQL / MariaDB for the same reason as its PostgreSQL namesake: it is
+     * the session's read-only switch, and a write to it is refused in every
+     * scope and spelling ({@see self::MYSQL_READ_ONLY_VARIABLES}), where the
+     * persistent-scope-only rule would let SET SESSION through. SET
+     * TRANSACTION READ ONLY and transaction_isolation are other things and
+     * pass.
+     *
+     * A persistent default is cleared as well as set: ALTER DATABASE ... RESET
+     * <name> and RESET ALL on PostgreSQL are held to this list too, since
+     * either removes a value the operator stored (a role pin, a read-only
+     * default) for the next session.
+     *
      * sql_mode is listed for a different reason: NO_BACKSLASH_ESCAPES and
      * ANSI_QUOTES change how the server reads string literals, and the guard
      * reads SQL with the default mode. It is refused in every scope on every
@@ -504,6 +529,20 @@ class SqlInspector
      * @var list<string>
      */
     private const LEXER_MODE_VARIABLES = ['sql_mode'];
+
+    /**
+     * MySQL / MariaDB's session read-only switches. The read-only guard of
+     * QueryProxy leans on the session being read-only; SET SESSION
+     * transaction_read_only = OFF (tx_read_only before MySQL 5.7.20) turns
+     * that off for the rest of the connection. A write to either name is
+     * refused in every scope and every spelling (SET SESSION x, SET x = OFF,
+     * SET @@x, SET @@session.x, inside SET STATEMENT ... FOR and inside a
+     * comma list) on MySQL, MariaDB and an unknown driver. SET TRANSACTION
+     * READ ONLY and transaction_isolation are not these names and pass.
+     *
+     * @var list<string>
+     */
+    private const MYSQL_READ_ONLY_VARIABLES = ['transaction_read_only', 'tx_read_only'];
 
     private const INVALID_UTF8_VIOLATION = 'SQL must be valid UTF-8.';
 
@@ -1029,6 +1068,10 @@ class SqlInspector
         }
 
         foreach ($this->catalogWriteViolations($tokens, $driver) as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        foreach ($this->ruleActionViolations($tokens, $driver) as $message) {
             $violations[] = "{$label}: {$message}";
         }
 
@@ -4721,7 +4764,14 @@ class SqlInspector
             }
 
             if ($driver === DbDriver::Pgsql) {
-                $violations = array_merge($violations, $this->routineBodyViolations($sql), $this->routineClauseViolations($sql));
+                $violations = array_merge($violations, $this->routineBodyViolations($sql));
+            }
+
+            // The clause scan covers the whole statement, a '...' body
+            // included, so an ALTER DATABASE ... RESET written inside a
+            // function body is refused when the driver is not known too.
+            if ($driver === null || $driver === DbDriver::Pgsql) {
+                $violations = array_merge($violations, $this->routineClauseViolations($sql));
             }
 
             return array_values(array_unique($violations));
@@ -4729,7 +4779,7 @@ class SqlInspector
 
         // ALTER FUNCTION | PROCEDURE | ROUTINE | DATABASE | ROLE | USER ...
         // SET carries a setting into every later call or session.
-        if ($keyword === 'ALTER' && $driver === DbDriver::Pgsql) {
+        if ($keyword === 'ALTER' && ($driver === null || $driver === DbDriver::Pgsql)) {
             return $this->routineClauseViolations($sql);
         }
 
@@ -4821,6 +4871,10 @@ class SqlInspector
                 }
             }
 
+            if ($sqlsrv) {
+                array_push($violations, ...$this->sqlsrvImpersonationViolations($tokens, $index));
+            }
+
             if ($sqlsrv && $this->isWordAt($tokens, $index, 'BULK')
                 && ($this->isCommandWordAt($tokens, $index, 'BULK')
                     || (isset($tokens[$index + 1]) && $this->firstWord($tokens[$index + 1]) === 'INSERT'))) {
@@ -4846,6 +4900,66 @@ class SqlInspector
         }
 
         return array_values(array_unique($violations));
+    }
+
+    /**
+     * The SQL Server statements and clauses that change the security context
+     * a batch runs in, at $index:
+     *
+     *  - EXECUTE AS / EXEC AS (USER, LOGIN, and the unreadable rest) as a
+     *    statement, and the same words as the "WITH EXECUTE AS OWNER | CALLER
+     *    | SELF | 'user'" clause of a module definition, which makes the
+     *    module run as someone else every time it is called. The clause is
+     *    found at any position, the comma after another WITH option included
+     *    ("WITH SCHEMABINDING, EXECUTE AS OWNER");
+     *  - SETUSER, the older spelling of the same switch;
+     *  - REVERT. It is only meaningful after an impersonation, which the guard
+     *    already refuses, but it also resets a context the connection's owner
+     *    set up before QueryProxy connected (and REVERT WITH COOKIE unwinds a
+     *    cookie QueryProxy never saw). Refusing it keeps every context-switch
+     *    statement on one side of the guard; no read needs it.
+     *
+     * Text run dynamically (EXEC ('SETUSER ...'), sp_executesql
+     * N'EXECUTE AS ...') reaches this scan through the same recursion every
+     * other rule uses. A column called execute_as, a [bracketed] or
+     * qualified "execute" and the words inside a string never match.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function sqlsrvImpersonationViolations(array $tokens, int $index): array
+    {
+        foreach (['EXEC', 'EXECUTE'] as $word) {
+            if (! $this->isWordAt($tokens, $index, $word)) {
+                continue;
+            }
+
+            if (! $this->isWordAt($tokens, $index + 1, 'AS')) {
+                return [];
+            }
+
+            $target = $tokens[$index + 2] ?? null;
+            $named = $target !== null && (
+                $target->type === TokenType::String
+                || in_array($this->firstWord($target), ['USER', 'LOGIN', 'OWNER', 'CALLER', 'SELF'], true)
+            );
+
+            if ($named || $this->isCommandWordAt($tokens, $index, $word)) {
+                return ['EXECUTE AS is not allowed through QueryProxy: it switches the security context the statements run in, and the same clause in a module definition makes the module run as another principal.'];
+            }
+
+            return [];
+        }
+
+        if ($this->isCommandWordAt($tokens, $index, 'SETUSER')) {
+            return ['SETUSER is not allowed through QueryProxy: it switches the security context the statements run in.'];
+        }
+
+        if ($this->isCommandWordAt($tokens, $index, 'REVERT')) {
+            return ['REVERT is not allowed through QueryProxy: it undoes a security-context switch, and the guard refuses every switch, so there is nothing for it to revert but the connection owner\'s own context.'];
+        }
+
+        return [];
     }
 
     /**
@@ -5358,6 +5472,7 @@ class SqlInspector
             // starts right after an opening parenthesis, so a verb counts at
             // any depth here.
             $messages = array_merge($messages, $this->catalogWriteViolations($tokens, DbDriver::Pgsql, anyDepth: true));
+            $messages = array_merge($messages, $this->ruleActionViolations($tokens, DbDriver::Pgsql));
         }
 
         return array_values(array_unique(array_map(fn (string $message): string => "Inside the {$label} body: {$message}", $messages)));
@@ -5471,7 +5586,12 @@ class SqlInspector
      *    PROCEDURE | ROUTINE | DATABASE | ROLE | USER, carries its setting
      *    into every call or session, so it is held to the rule of a SET
      *    statement (serverVariableViolations()). A clause whose setting the
-     *    guard cannot read is refused.
+     *    guard cannot read is refused;
+     *  - a RESET clause of ALTER DATABASE | ROLE | USER clears a stored
+     *    default, so RESET ALL and a RESET of a dangerous setting are refused
+     *    (persistentResetViolations()). A CREATE statement runs this scan on
+     *    PostgreSQL and on an unknown driver, so a function body holding such
+     *    an ALTER is refused on both.
      *
      * The text is read as PostgreSQL reads it (see postgresBlockBodyView()),
      * with every dollar-quoted string replaced by an opaque literal: its
@@ -5704,9 +5824,11 @@ class SqlInspector
 
     /**
      * The SET-clause rule of routineClauseViolations() over one statement of
-     * a reading. ALTER FUNCTION ... SET SCHEMA and ALTER DATABASE ... SET
-     * TABLESPACE move the object rather than carry a setting, and are
-     * skipped.
+     * a reading, and its RESET twin: ALTER DATABASE | ROLE | USER ... RESET
+     * <name> | ALL clears a stored default and is held to the same list (see
+     * persistentResetViolations()). ALTER FUNCTION ... SET SCHEMA and ALTER
+     * DATABASE ... SET TABLESPACE move the object rather than carry a
+     * setting, and are skipped.
      *
      * @return list<string>
      */
@@ -5720,14 +5842,22 @@ class SqlInspector
             return [];
         }
 
+        // ALTER DATABASE / ROLE / USER store a setting for every later
+        // session of the database or role, and RESET is how one is cleared:
+        // "ALTER ROLE x IN DATABASE d RESET session_replication_role" and
+        // "ALTER ROLE ALL RESET ALL" undo a default the operator set, so
+        // they are judged like the SET that would have written it.
+        $persistent = preg_match('/ALTER\s+(?:DATABASE|ROLE|USER)$/i', $match[0][0]) === 1;
+
         // The whole statement is read, as in routineLanguageViolations().
         $rest = substr($statement, $match[0][1] + strlen($match[0][0]));
-        preg_match_all("/[()]|{$word}SET{$end}/i", $rest, $matches, PREG_OFFSET_CAPTURE);
+        preg_match_all($persistent ? "/[()]|{$word}(?:RE)?SET{$end}/i" : "/[()]|{$word}SET{$end}/i", $rest, $matches, PREG_OFFSET_CAPTURE);
 
         $violations = [];
         $depth = 0;
+        $found = $matches[0];
 
-        foreach ($matches[0] as [$token, $position]) {
+        foreach ($found as $number => [$token, $position]) {
             if ($token === '(' || $token === ')') {
                 $depth = max(0, $depth + ($token === '(' ? 1 : -1));
 
@@ -5735,6 +5865,17 @@ class SqlInspector
             }
 
             if ($depth > 0) {
+                continue;
+            }
+
+            if (strcasecmp($token, 'RESET') === 0) {
+                // The name ends at the next keyword or parenthesis, so every
+                // character is lexed once however many RESETs the text has.
+                $limit = isset($found[$number + 1]) ? $found[$number + 1][1] : strlen($rest);
+                $violations = array_merge($violations, $this->persistentResetViolations(
+                    substr($rest, $position, $limit - $position),
+                ));
+
                 continue;
             }
 
@@ -5764,6 +5905,45 @@ class SqlInspector
         }
 
         return $violations;
+    }
+
+    /**
+     * A "RESET <name>" / "RESET ALL" clause of ALTER DATABASE, ALTER ROLE or
+     * ALTER USER ($clause starts at the RESET word). The clause clears a
+     * persistent default, so RESET ALL and a RESET of any name in
+     * DANGEROUS_VARIABLES are refused in every spelling functionNameAt()
+     * reads; a name it cannot read is refused too.
+     *
+     * @return list<string>
+     */
+    private function persistentResetViolations(string $clause): array
+    {
+        $tokens = $this->significantTokens($clause);
+
+        // RESET is an unreserved word, so it can also be a database or role
+        // name (ALTER DATABASE database RESET x is valid), and a regex reading
+        // cannot place it by position; a RESET with nothing after it is
+        // refused with a message that says what the guard expects, rather
+        // than a claim about the name's spelling.
+        if (! isset($tokens[1])) {
+            return ['A RESET word with no setting name or ALL after it is not allowed through QueryProxy: the guard reads every RESET in ALTER DATABASE, ROLE and USER as a RESET clause, so a database or role that is itself called reset cannot be named in these statements.'];
+        }
+
+        [$name, , $readable] = $this->functionNameAt($tokens, 1);
+
+        if (! $readable || $name === null || $name === '') {
+            return ['A RESET clause on a database or role whose setting the guard cannot read is not allowed through QueryProxy: '.self::UNREADABLE_NAME_MESSAGE];
+        }
+
+        if ($name === 'all') {
+            return ['RESET ALL on a database or role is not allowed through QueryProxy: it clears every setting the operator has stored, the protection switches among them.'];
+        }
+
+        if (in_array($name, $this->dangerousVariables(), true) || in_array($name, self::MYSQL_READ_ONLY_VARIABLES, true)) {
+            return ["RESET {$name} on a database or role is not allowed through QueryProxy: ".$this->dangerousVariableReason($name)];
+        }
+
+        return [];
     }
 
     /**
@@ -6263,6 +6443,15 @@ class SqlInspector
                 continue;
             }
 
+            if ($name !== null
+                && $driver !== DbDriver::Pgsql
+                && in_array($name, self::MYSQL_READ_ONLY_VARIABLES, true)) {
+                $written = $scope === null ? 'SET' : "SET {$scope}";
+                $violations[] = "{$written} {$name} is not allowed through QueryProxy: {$name} is the session's read-only switch, and turning it off lets the connection write.";
+
+                continue;
+            }
+
             if ($name === null || ! in_array($name, $dangerous, true)) {
                 continue;
             }
@@ -6386,6 +6575,192 @@ class SqlInspector
         }
 
         return array_values($violations);
+    }
+
+    /**
+     * PostgreSQL's CREATE [OR REPLACE] RULE name AS ON event TO table
+     * [WHERE ...] DO [ALSO | INSTEAD] { NOTHING | command | ( command ; ... ) }
+     * stores its action and runs it, as the rule's owner, whenever the event
+     * fires, so the action is held to the rules a statement of its own gets:
+     * a write to a system catalog table (see catalogWriteViolations()), and a
+     * SET or RESET of a dangerous setting or of the role. The action starts
+     * after the DO that ruleActionStart() finds by the grammar of the rule
+     * header (not a DO that is a column or table name after a dot) and its
+     * optional ALSO / INSTEAD; the
+     * statement splitter cuts a parenthesized list at its semicolons, so the
+     * pieces after the first are judged as top-level statements and the
+     * first piece is judged here. A DO the guard cannot find refuses the
+     * statement. PostgreSQL and an unknown driver only; no other dialect has
+     * rules.
+     *
+     * The scan is linear: each SET / RESET owns the tokens up to the next
+     * one, and the catalog scan reads the action once.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function ruleActionViolations(array $tokens, ?DbDriver $driver): array
+    {
+        if ($driver !== null && $driver !== DbDriver::Pgsql) {
+            return [];
+        }
+
+        [$keyword, $start] = $this->leadingKeyword($tokens);
+
+        if ($keyword !== 'CREATE') {
+            return [];
+        }
+
+        // CREATE [OR REPLACE] RULE: at most four word tokens.
+        $words = [];
+        $wordTokens = [];
+
+        for ($i = $start; $i < $start + 4 && isset($tokens[$i]); $i++) {
+            if (! in_array($tokens[$i]->type, [TokenType::None, TokenType::Keyword], true)) {
+                break;
+            }
+
+            foreach ($this->tokenWords($tokens[$i]) as $word) {
+                $words[] = $word;
+                $wordTokens[] = $i;
+            }
+        }
+
+        $at = ($words[1] ?? '') === 'OR' && ($words[2] ?? '') === 'REPLACE' ? 3 : 1;
+
+        if (($words[$at] ?? '') !== 'RULE') {
+            return [];
+        }
+
+        $doIndex = $this->ruleActionStart($tokens, $wordTokens[$at] + 1);
+
+        if ($doIndex === null) {
+            return ['CREATE RULE whose DO action the guard cannot find is not allowed through QueryProxy: the guard cannot tell which statement the rule runs.'];
+        }
+
+        $first = $doIndex + 1;
+
+        while (isset($tokens[$first])
+            && in_array($tokens[$first]->type, [TokenType::None, TokenType::Keyword], true)
+            && array_diff($this->tokenWords($tokens[$first]), ['ALSO', 'INSTEAD']) === []) {
+            $first++;
+        }
+
+        $action = array_slice($tokens, $first);
+        $violations = array_map(
+            fn (string $message): string => "CREATE RULE action: {$message}",
+            $this->catalogWriteViolations($action, $driver, anyDepth: true),
+        );
+
+        $starts = [];
+        $previous = null;
+
+        foreach ($action as $index => $token) {
+            if (($previous === null || $this->isOperator($previous, '('))
+                && in_array($token->type, [TokenType::None, TokenType::Keyword], true)
+                && in_array($this->tokenWords($token)[0] ?? '', ['SET', 'RESET'], true)) {
+                $starts[] = $index;
+            }
+
+            $previous = $token;
+        }
+
+        foreach ($starts as $number => $index) {
+            $piece = array_slice($action, $index, ($starts[$number + 1] ?? count($action)) - $index);
+            $messages = ($this->tokenWords($piece[0])[0] ?? '') === 'SET'
+                ? $this->serverVariableViolations($piece, $driver)
+                : $this->resetViolations($piece);
+
+            foreach ($messages as $message) {
+                $violations[] = "CREATE RULE action: {$message}";
+            }
+        }
+
+        return array_values(array_unique($violations));
+    }
+
+    /**
+     * The index of the DO that starts the action of a CREATE RULE, or null
+     * when the guard cannot place it. $from is the token after the RULE
+     * word. The rule header is read by its grammar, in order:
+     *
+     *     name AS ON event TO qualified_name [WHERE condition] DO ...
+     *
+     * so the DO is the first unquoted, top-level DO that is not the second
+     * half of a dotted name. DO is a reserved word, so it can be a name only
+     * as a part after a dot (public.do, new.do, (new).do); such a part is
+     * skipped, and so is a "quoted" or U&"quoted" one, which is not a word
+     * token at all. The rule name is skipped up to its AS (an unquoted AS
+     * cannot be a name), and every step after it has to be where the grammar
+     * puts it: anything else (a missing ON, an event that is not SELECT /
+     * INSERT / UPDATE / DELETE, no TO, no DO, a DO that shares a compound
+     * token with the action's first word) returns null, which refuses the
+     * statement.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function ruleActionStart(array $tokens, int $from): ?int
+    {
+        // Word units of the header: [word, token index, last word of its
+        // token]; a non-word token is [null, ...] and a dot is ['.', ...],
+        // so a name part is told from a keyword by what stands before it.
+        $units = [];
+
+        for ($i = $from, $count = count($tokens); $i < $count; $i++) {
+            $token = $tokens[$i];
+
+            if (in_array($token->type, [TokenType::None, TokenType::Keyword], true)) {
+                $words = $this->tokenWords($token);
+
+                foreach ($words as $position => $word) {
+                    $units[] = [$word, $i, $position === count($words) - 1];
+                }
+
+                continue;
+            }
+
+            $units[] = [match (true) {
+                $this->isOperator($token, '.') => '.',
+                $this->isOperator($token, '(') => '(',
+                $this->isOperator($token, ')') => ')',
+                default => null,
+            }, $i, true];
+        }
+
+        $isWord = fn (int $at, string $word): bool => isset($units[$at]) && $units[$at][0] === $word;
+        $total = count($units);
+        $at = 0;
+
+        // The rule name, up to AS.
+        while ($at < $total && ! $isWord($at, 'AS')) {
+            $at++;
+        }
+
+        // AS ON event TO
+        if (! $isWord($at + 1, 'ON')
+            || ! in_array($units[$at + 2][0] ?? null, ['SELECT', 'INSERT', 'UPDATE', 'DELETE'], true)
+            || ! $isWord($at + 3, 'TO')) {
+            return null;
+        }
+
+        // qualified_name [WHERE condition] DO: a keyword is only a keyword
+        // at the top level and when no dot stands before it.
+        $at += 4;
+        $depth = 0;
+
+        for (; $at < $total; $at++) {
+            [$word, $index, $last] = $units[$at];
+
+            if ($word === '(') {
+                $depth++;
+            } elseif ($word === ')') {
+                $depth--;
+            } elseif ($word === 'DO' && $depth === 0 && ($units[$at - 1][0] ?? null) !== '.') {
+                return $last ? $index : null;
+            }
+        }
+
+        return null;
     }
 
     /**

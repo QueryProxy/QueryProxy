@@ -85,6 +85,10 @@ class QueryExecutor
 
             $isRead = $request->type === StatementType::Read && count($statements) === 1;
 
+            if (! $isRead) {
+                $this->assertWritableDefaultDatabase($connection, $connectionName);
+            }
+
             $outcome = $isRead
                 ? $this->executeRead($request, $connectionName, $statements[0])
                 : $this->executeWrite($request, $connectionName, $statements);
@@ -287,6 +291,44 @@ class QueryExecutor
                 $connection->driver->label(),
                 implode(' and ', $found),
                 count($found) > 1 ? 'these flags' : 'the flag',
+            ));
+        }
+    }
+
+    /**
+     * Refuse to run a write on a MySQL / MariaDB session whose default
+     * database is the server's own `mysql` system schema.
+     *
+     * The guard rejects a write that names the system schema, but a table
+     * name without a schema resolves against the session's default database:
+     * with `mysql` as the default, "UPDATE user SET ..." edits the account
+     * table. The default is read on the very connection the write then runs
+     * on, before its first statement, and it is never changed here — the
+     * operator has to point the connection at the application database. A
+     * session with no default database (NULL) cannot resolve a bare name and
+     * passes. Reads and the other drivers are not checked; the guard already
+     * rejects what a read could reach through the system schema.
+     *
+     * @throws RuntimeException when the session's default database is `mysql`
+     */
+    private function assertWritableDefaultDatabase(Connection $connection, string $connectionName): void
+    {
+        if (! in_array($connection->driver, [DbDriver::Mysql, DbDriver::Mariadb], true)) {
+            return;
+        }
+
+        $database = DB::connection($connectionName)->scalar('SELECT DATABASE()');
+
+        if (is_string($database) && strtolower($database) === 'mysql') {
+            // The message avoids the schema's own name on purpose: the error
+            // sanitizer redacts the connection's database name, and on this
+            // very connection that name is the one it would blank out.
+            throw new RuntimeException(sprintf(
+                'Refusing to run a write: the default database of the %s connection is the server\'s system schema, '.
+                'so a table name without a schema in the SQL would resolve inside it, and QueryProxy cannot vouch '.
+                'that the statement touches only application data. '.
+                'Change the connection\'s default database to the application database and re-run the request.',
+                $connection->driver->label(),
             ));
         }
     }

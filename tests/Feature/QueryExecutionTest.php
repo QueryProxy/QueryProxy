@@ -208,21 +208,36 @@ test('a custom disk declared public is refused as well', function () {
  * reports $sqlMode: the configured connection answers the sql_mode read with
  * that value and runs everything else against the SQLite target file, so a
  * statement that reaches the database leaves a trace there.
+ *
+ * The session's default database ("SELECT DATABASE()") is answered the same
+ * way: $defaultDatabase holds the value the server reports, wrapped in an
+ * array so that NULL (no default database selected) can be told from the
+ * 'app' default, or a Throwable to raise instead.
+ *
+ * @param  array{0: string|null}|Throwable  $defaultDatabase
  */
-function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $driver, string|Throwable $sqlMode): void
+function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $driver, string|Throwable $sqlMode, array|Throwable $defaultDatabase = ['app']): void
 {
     $request->connection->forceFill(['driver' => $driver])->save();
 
-    DB::extend('fake_mysql_session', function (array $config) use ($sqlMode) {
-        return new class(new PDO('sqlite:'.$config['database']), $config['database'], '', $config, $sqlMode) extends SQLiteConnection
+    DB::extend('fake_mysql_session', function (array $config) use ($sqlMode, $defaultDatabase) {
+        return new class(new PDO('sqlite:'.$config['database']), $config['database'], '', $config, $sqlMode, $defaultDatabase) extends SQLiteConnection
         {
-            public function __construct($pdo, $database, $tablePrefix, $config, private string|Throwable $sqlMode)
+            public function __construct($pdo, $database, $tablePrefix, $config, private string|Throwable $sqlMode, private array|Throwable $defaultDatabase)
             {
                 parent::__construct($pdo, $database, $tablePrefix, $config);
             }
 
             public function scalar($query, $bindings = [], $useReadPdo = true)
             {
+                if ($query === 'SELECT DATABASE()') {
+                    if ($this->defaultDatabase instanceof Throwable) {
+                        throw $this->defaultDatabase;
+                    }
+
+                    return $this->defaultDatabase[0];
+                }
+
                 if ($query !== 'SELECT @@SESSION.sql_mode') {
                     return parent::scalar($query, $bindings, $useReadPdo);
                 }
@@ -330,3 +345,124 @@ test('drivers without a quoting sql_mode are not asked for one', function () {
 
     expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed);
 });
+
+test('a write on a MySQL / MariaDB session whose default database is the system schema is refused before the SQL runs', function (DbDriver $driver, string $defaultDatabase) {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, $driver, 'STRICT_TRANS_TABLES', [$defaultDatabase]);
+
+    $sent = [];
+    DB::listen(function ($query) use (&$sent) {
+        // Only what reaches the target server counts, not the app's own queries.
+        if (str_starts_with($query->connectionName, 'queryproxy_target_')) {
+            $sent[] = $query->sql;
+        }
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toContain('default database')
+        ->and($request->error_message)->toContain($driver->label())
+        ->and($request->affected_rows)->toBeNull()
+        ->and($sent)->toBe([]);
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers WHERE active = 0')->fetchColumn())->toBe(0);
+})->with([
+    'mysql, lower case' => [DbDriver::Mysql, 'mysql'],
+    'mariadb, lower case' => [DbDriver::Mariadb, 'mysql'],
+    'mysql, mixed case' => [DbDriver::Mysql, 'MySQL'],
+    'mariadb, upper case' => [DbDriver::Mariadb, 'MYSQL'],
+]);
+
+test('a read on a MySQL / MariaDB session whose default database is the system schema still runs', function (DbDriver $driver) {
+    [$request, $dbFile] = executionSetup('SELECT id, name FROM customers ORDER BY id LIMIT 10');
+    fakeMysqlSession($request, $dbFile, $driver, 'STRICT_TRANS_TABLES', ['mysql']);
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->result_row_count)->toBe(3);
+})->with([
+    'mysql' => [DbDriver::Mysql],
+    'mariadb' => [DbDriver::Mariadb],
+]);
+
+test('a write runs when the default database is an application database or none is selected', function (DbDriver $driver, ?string $defaultDatabase) {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, $driver, 'STRICT_TRANS_TABLES', [$defaultDatabase]);
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->affected_rows)->toBe(2);
+})->with([
+    'mysql, app' => [DbDriver::Mysql, 'app'],
+    'mariadb, app' => [DbDriver::Mariadb, 'app'],
+    'mysql, a name that only contains mysql' => [DbDriver::Mysql, 'mysql_app'],
+    'mariadb, a name that only contains mysql' => [DbDriver::Mariadb, 'app_mysql'],
+    'mysql, no default database (NULL)' => [DbDriver::Mysql, null],
+    'mariadb, no default database (NULL)' => [DbDriver::Mariadb, null],
+]);
+
+test('a write whose default database cannot be read is refused before the SQL runs', function () {
+    [$request, $dbFile] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+    fakeMysqlSession($request, $dbFile, DbDriver::Mysql, 'STRICT_TRANS_TABLES', new RuntimeException('DATABASE() failed'));
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->affected_rows)->toBeNull();
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers WHERE active = 0')->fetchColumn())->toBe(0);
+});
+
+test('drivers other than MySQL / MariaDB are not asked for a default database', function () {
+    [$request] = executionSetup('UPDATE customers SET active = 0 WHERE id > 1', ['type' => 'write']);
+
+    DB::listen(function ($query) {
+        expect($query->sql)->not->toContain('DATABASE()');
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed);
+});
+
+test('a segment that holds only an executable comment never reaches the server', function (string $sql) {
+    [$request, $dbFile] = executionSetup($sql, ['type' => 'write']);
+
+    $sent = [];
+    DB::listen(function ($query) use (&$sent) {
+        // Only what reaches the target server counts, not the app's own queries.
+        if (str_starts_with($query->connectionName, 'queryproxy_target_')) {
+            $sent[] = $query->sql;
+        }
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->affected_rows)->toBe(2)
+        ->and($sent)->toHaveCount(1)
+        ->and($sent[0])->toStartWith('UPDATE customers');
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers')->fetchColumn())->toBe(3);
+})->with([
+    '/*! */ after the statement' => ['UPDATE customers SET active = 0 WHERE id > 1; /*! DROP TABLE customers */'],
+    '/*!50000 */ after the statement' => ['UPDATE customers SET active = 0 WHERE id > 1; /*!50000 DROP TABLE customers */;'],
+    '/*M! */ before the statement' => ['/*M! DROP TABLE customers */; UPDATE customers SET active = 0 WHERE id > 1'],
+    '/*! */ between a statement and an empty one' => ['UPDATE customers SET active = 0 WHERE id > 1; /*!40101 SET @x = 1 */; ;'],
+]);

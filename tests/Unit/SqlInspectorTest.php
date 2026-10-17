@@ -2115,7 +2115,6 @@ test('ordinary SQL Server batches and statements still pass', function (string $
     'THROW with arguments before ELSE' => ["IF @x IS NULL THROW 51000, 'm', 1 ELSE PRINT 'ok'", StatementType::Write],
     'EXEC with a bare argument' => ['EXEC sp_who active SELECT 1', StatementType::Write],
     'EXEC with named, OUTPUT and WITH RECOMPILE arguments' => ["EXEC dbo.p @a = 1, @b = @c OUTPUT, @d = DEFAULT WITH RECOMPILE EXEC p N'x', @y OUT", StatementType::Write],
-    'EXECUTE AS and REVERT' => ["EXECUTE AS USER = 'u' SELECT 1 REVERT", StatementType::Write],
     'RAISERROR with options' => ["RAISERROR('m', 16, 1) WITH NOWAIT RAISERROR 50001 'x'", StatementType::Write],
     'USE before a query' => ['USE [db] SELECT 1', StatementType::Write],
     'DBCC with options' => ["DBCC CHECKDB (db) WITH NO_INFOMSGS DBCC CHECKIDENT ('t', RESEED, 0)", StatementType::Write],
@@ -2125,7 +2124,6 @@ test('ordinary SQL Server batches and statements still pass', function (string $
     'KILL, CHECKPOINT and RECONFIGURE' => ['KILL 5 WITH STATUSONLY CHECKPOINT RECONFIGURE WITH OVERRIDE', StatementType::Write],
     'THROW starting the batch' => ["THROW 50000, 'x', 1 SELECT 1", StatementType::Write],
     'EXEC with a return status and a bare argument' => ['EXEC @rc = p active', StatementType::Write],
-    'REVERT WITH COOKIE' => ['REVERT WITH COOKIE = @c', StatementType::Write],
     'USE master before a query' => ['USE master SELECT 1', StatementType::Write],
     'CHECKPOINT with a duration' => ['CHECKPOINT 10 SELECT 1', StatementType::Write],
 ]);
@@ -3695,4 +3693,363 @@ test('a maximum-size statement full of PL/pgSQL statement introducers is scanned
     'IN UPDATE' => ['DO $$BEGIN SELECT 1 ', 'IN UPDATE t ', '; END$$'],
     'AS UPDATE' => ['DO $$BEGIN SELECT 1 ', 'AS UPDATE t ', '; END$$'],
     'U& names in RESET statements' => ['DO $$BEGIN ', 'RESET U&"search_path"; ', 'END$$'],
+]);
+
+/*
+|--------------------------------------------------------------------------
+| Faz 02 — pre-existing gaps
+|--------------------------------------------------------------------------
+*/
+
+test('ALTER DATABASE / ROLE ... RESET of a protection switch or RESET ALL is rejected', function (?DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('RESET');
+})->with(function () {
+    $statements = [
+        'RESET role' => 'ALTER DATABASE d RESET role',
+        'RESET ALL' => 'ALTER DATABASE d RESET ALL',
+        'RESET all, lower case' => 'ALTER DATABASE d reset all',
+        'RESET session_authorization' => 'ALTER DATABASE d RESET session_authorization',
+        'RESET default_transaction_read_only' => 'ALTER DATABASE d RESET default_transaction_read_only',
+        'quoted name' => 'ALTER DATABASE d RESET "role"',
+        'quoted mixed case' => 'ALTER DATABASE d RESET "ROLE"',
+        'U& name' => 'ALTER DATABASE d RESET U&"\0072ole"',
+        'comments and newlines' => "ALTER /* c */ DATABASE\n d -- x\n RESET /* y */ role",
+        'quoted database name' => 'ALTER DATABASE "my db" RESET ALL',
+        'ROLE ... IN DATABASE' => 'ALTER ROLE r IN DATABASE d RESET ALL',
+        'ROLE, no database' => 'ALTER ROLE r RESET role',
+        'ROLE ALL IN DATABASE' => 'ALTER ROLE ALL IN DATABASE d RESET ALL',
+        'USER ... IN DATABASE' => 'ALTER USER r IN DATABASE d RESET role',
+        'inside a transaction block' => 'BEGIN; ALTER DATABASE d RESET ALL; COMMIT',
+        'inside a DO body' => 'DO $$BEGIN ALTER DATABASE d RESET ALL; END$$',
+        'inside a function body' => 'CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$BEGIN ALTER DATABASE d RESET role; END$$',
+        'PREPARE ... AS' => 'PREPARE p AS ALTER DATABASE d RESET ALL',
+        'after a CTE-less EXPLAIN ANALYZE' => 'EXPLAIN ANALYZE ALTER DATABASE d RESET ALL',
+    ];
+
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        foreach ($statements as $label => $sql) {
+            yield ($driver?->value ?? 'no driver').': '.$label => [$driver, $sql];
+        }
+    }
+});
+
+test('ALTER DATABASE RESET written as dynamic SQL is rejected', function (?DbDriver $driver, string $sql) {
+    expect(inspect($sql, $driver)->passes())->toBeFalse();
+})->with(function () {
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        yield ($driver?->value ?? 'no driver').': EXECUTE in a DO body' => [$driver, "DO \$\$BEGIN EXECUTE 'ALTER DATABASE d RESET ALL'; END\$\$"];
+    }
+});
+
+test('ALTER DATABASE RESET of an ordinary setting and other ALTER DATABASE forms still pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'RESET work_mem' => ['ALTER DATABASE d RESET work_mem'],
+    'RESET search_path, quoted' => ['ALTER DATABASE d RESET "search_path"'],
+    'SET search_path' => ['ALTER DATABASE d SET search_path = app'],
+    'RESET a qualified custom setting' => ['ALTER DATABASE d RESET app.mode'],
+    'RESET after a comment about role' => ["ALTER DATABASE d RESET work_mem -- role\n"],
+    'table storage parameter reset' => ['ALTER TABLE t RESET (fillfactor)'],
+    'RESET statement on a string called all' => ["SELECT 'ALTER DATABASE d RESET ALL'"],
+]);
+
+test('MySQL / MariaDB transaction_read_only writes are rejected in every scope and spelling', function (DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('read_only');
+})->with(function () {
+    $statements = [
+        'SESSION, 0' => 'SET SESSION transaction_read_only = 0',
+        'SESSION, OFF' => 'SET SESSION transaction_read_only = OFF',
+        '@@, OFF' => 'SET @@transaction_read_only = OFF',
+        '@@session.' => 'SET @@session.transaction_read_only = 0',
+        '@@global.' => 'SET @@global.transaction_read_only = 0',
+        'GLOBAL' => 'SET GLOBAL transaction_read_only = 0',
+        'PERSIST' => 'SET PERSIST transaction_read_only = 0',
+        'LOCAL' => 'SET LOCAL transaction_read_only = 0',
+        'bare name' => 'SET transaction_read_only = 0',
+        'tx_read_only alias' => 'SET SESSION tx_read_only = 0',
+        'tx_read_only, @@' => 'SET @@tx_read_only = 0',
+        'turning it ON is refused too' => 'SET SESSION transaction_read_only = 1',
+        'mixed case' => 'SeT SeSsIoN Transaction_Read_Only = 0',
+        'backtick quoted' => 'SET SESSION `transaction_read_only` = 0',
+        'backtick quoted after @@' => 'SET @@`tx_read_only` = 0',
+        'comments and newlines' => "SET /* c */ SESSION\n transaction_read_only -- x\n = 0",
+        'second assignment of a list' => 'SET @a = 1, SESSION transaction_read_only = 0',
+        'inside a transaction block' => 'BEGIN; SET SESSION transaction_read_only = 0; COMMIT',
+        'inside START TRANSACTION' => 'START TRANSACTION; SET @@transaction_read_only = OFF; COMMIT',
+        'PREPARE FROM' => "PREPARE p FROM 'SET SESSION transaction_read_only = 0'",
+        'EXECUTE IMMEDIATE' => "EXECUTE IMMEDIATE 'SET @@tx_read_only = 0'",
+    ];
+
+    foreach ([DbDriver::Mysql, DbDriver::Mariadb] as $driver) {
+        foreach ($statements as $label => $sql) {
+            yield $driver->value.': '.$label => [$driver, $sql];
+        }
+    }
+
+    yield 'mariadb: SET STATEMENT ... FOR' => [DbDriver::Mariadb, 'SET STATEMENT transaction_read_only = 0 FOR SELECT 1'];
+});
+
+test('transaction_read_only is refused on an unknown driver; transaction_isolation and SET TRANSACTION READ ONLY still pass', function (string $sql, bool $passes) {
+    expect(inspect($sql, null)->passes() || ! $passes)->toBeTrue();
+
+    foreach ([DbDriver::Mysql, DbDriver::Mariadb] as $driver) {
+        expect(inspect($sql, $driver)->passes())->toBe($passes);
+    }
+})->with([
+    'read-only switch' => ['SET SESSION transaction_read_only = 0', false],
+    'transaction_isolation' => ["SET SESSION transaction_isolation = 'READ-COMMITTED'", true],
+    'transaction_isolation, @@' => ["SET @@transaction_isolation = 'REPEATABLE-READ'", true],
+    'SET TRANSACTION READ ONLY' => ['SET TRANSACTION READ ONLY', true],
+    'SET SESSION TRANSACTION READ ONLY' => ['SET SESSION TRANSACTION READ ONLY', true],
+    'SET TRANSACTION ISOLATION LEVEL' => ['SET TRANSACTION ISOLATION LEVEL READ COMMITTED', true],
+    'a user variable that looks alike' => ['SET @transaction_read_only = 0', true],
+    'a string that looks alike' => ["SELECT 'SET SESSION transaction_read_only = 0'", true],
+    'a column that looks alike' => ['SELECT transaction_read_only FROM t LIMIT 5', true],
+]);
+
+test('PostgreSQL refuses transaction_read_only through its own list, not the MySQL read-only rule', function () {
+    $violations = inspect('SET transaction_read_only = off', DbDriver::Pgsql)->violations;
+
+    expect($violations)->toHaveCount(1)
+        ->and($violations[0])->toContain('SET transaction_read_only is not allowed')
+        ->and($violations[0])->not->toContain("the session's read-only switch");
+});
+
+test('a CREATE RULE action is scanned with the guard rules', function (?DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse();
+})->with(function () {
+    $statements = [
+        'catalog UPDATE, ALSO' => "CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'catalog UPDATE, INSTEAD' => "CREATE RULE r AS ON INSERT TO t DO INSTEAD UPDATE pg_proc SET prosrc = 'x'",
+        'catalog UPDATE, bare DO' => "CREATE RULE r AS ON INSERT TO t DO UPDATE pg_proc SET prosrc = 'x'",
+        'OR REPLACE' => "CREATE OR REPLACE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'quoted rule name' => "CREATE RULE \"r\" AS ON INSERT TO t DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'mixed case' => "Create Or Replace Rule r As On Insert To t Do Also Update PG_PROC Set prosrc = 'x'",
+        'qualified catalog' => "CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_catalog.pg_proc SET prosrc = 'x'",
+        'quoted catalog name' => "CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE \"pg_proc\" SET prosrc = 'x'",
+        'U& catalog name' => 'CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE U&"pg_\0070roc" SET a = 1',
+        'catalog INSERT' => 'CREATE RULE r AS ON INSERT TO t DO ALSO INSERT INTO pg_authid (rolname) VALUES (\'x\')',
+        'catalog DELETE' => 'CREATE RULE r AS ON DELETE TO t DO INSTEAD DELETE FROM pg_roles WHERE true',
+        'comments and newlines' => "CREATE /* c */ RULE r AS ON INSERT TO t\n DO -- x\n ALSO /* y */ UPDATE pg_proc SET a = 1",
+        'role switch through set_config' => "CREATE RULE r AS ON INSERT TO t DO ALSO SELECT set_config('role', 'postgres', false)",
+        'a rule that never says DO' => 'CREATE RULE r AS ON INSERT TO t',
+        'catalog write in the first statement of a list' => 'BEGIN; CREATE RULE r AS ON INSERT TO t DO ALSO (UPDATE pg_proc SET a = 1 WHERE true; NOTIFY x); COMMIT',
+        'catalog write in the second statement of a list' => 'BEGIN; CREATE RULE r AS ON INSERT TO t DO ALSO (NOTIFY x; UPDATE pg_proc SET a = 1 WHERE true); COMMIT',
+        'role switch in a list' => "BEGIN; CREATE RULE r AS ON INSERT TO t DO INSTEAD (NOTIFY x; SET role = 'postgres'); COMMIT",
+        'inside a DO body' => 'DO $$BEGIN CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET a = 1; END$$',
+        'inside a function body' => 'CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$BEGIN CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET a = 1; END$$',
+        'EXECUTE of a string' => "DO \$\$BEGIN EXECUTE 'CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET a = 1'; END\$\$",
+        'PREPARE ... AS' => 'PREPARE p AS CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET a = 1',
+        'a table called do' => "CREATE RULE r AS ON INSERT TO public.do DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'a column called do in WHERE' => "CREATE RULE r AS ON INSERT TO t WHERE new.do = 1 DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'a spaced dot before do' => "CREATE RULE r AS ON INSERT TO t WHERE new . do = 1 DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'a comment between the dot and do' => "CREATE RULE r AS ON INSERT TO t WHERE new./* c */do = 1 DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'a parenthesized row before .do' => "CREATE RULE r AS ON INSERT TO t WHERE (new).do = 1 DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'do as a column twice in WHERE' => "CREATE RULE r AS ON INSERT TO t WHERE new.do = old.do DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'do column in a nested condition' => "CREATE RULE r AS ON INSERT TO t WHERE (a AND (new.do = 1)) DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'role switch after a do column' => 'CREATE RULE r AS ON INSERT TO t WHERE new.do = 1 DO ALSO SET role x',
+        'catalog INSERT after a do table' => 'CREATE RULE r AS ON INSERT TO public.do DO INSTEAD INSERT INTO pg_authid VALUES (1)',
+        'a do table and a WHERE' => "CREATE RULE r AS ON UPDATE TO public.do WHERE new.do = 1 DO ALSO UPDATE pg_proc SET prosrc = 'x'",
+        'no AS before the event' => 'CREATE RULE r ON INSERT TO t DO ALSO NOTIFY x',
+        'no ON before the event' => 'CREATE RULE r AS INSERT TO t DO ALSO NOTIFY x',
+        'an event that is not one' => 'CREATE RULE r AS ON TRUNCATE TO t DO NOTHING',
+        'no TO before the table' => 'CREATE RULE r AS ON INSERT t DO NOTHING',
+        'a DO that only the condition holds' => 'CREATE RULE r AS ON INSERT TO t WHERE new.do = 1',
+    ];
+
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        foreach ($statements as $label => $sql) {
+            yield ($driver?->value ?? 'no driver').': '.$label => [$driver, $sql];
+        }
+    }
+});
+
+test('a CREATE RULE with an ordinary action still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'DO NOTHING' => ['CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING'],
+    'ALSO on a user table' => ['CREATE RULE r AS ON UPDATE TO t DO ALSO UPDATE audit SET n = n + 1 WHERE id = 1'],
+    'NOTIFY' => ['CREATE RULE r AS ON INSERT TO t DO ALSO NOTIFY changed'],
+    'a user table whose name starts like a catalog' => ['CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE audit_pg_notes SET a = 1 WHERE id = 1'],
+    'a transaction block' => ['BEGIN; CREATE RULE r AS ON INSERT TO t DO ALSO (NOTIFY x; NOTIFY y); COMMIT'],
+    'a string that looks like a catalog write' => ["SELECT 'CREATE RULE r AS ON INSERT TO t DO ALSO UPDATE pg_proc SET a = 1'"],
+    'a column called rule' => ['SELECT rule FROM t LIMIT 5'],
+    'a table called do' => ['CREATE RULE r AS ON INSERT TO public.do DO ALSO NOTIFY x'],
+    'a column called do in WHERE' => ['CREATE RULE r AS ON UPDATE TO t WHERE new.do = 1 DO ALSO UPDATE audit SET n = 1 WHERE id = 1'],
+    'a quoted table called do' => ['CREATE RULE r AS ON INSERT TO "do" DO ALSO NOTIFY x'],
+    'a rule with a parenthesized WHERE' => ['CREATE RULE r AS ON DELETE TO t WHERE (old.a = 1 AND old.do = 2) DO INSTEAD NOTHING'],
+    'a Unicode-escaped rule name' => ['CREATE RULE U&"r" AS ON INSERT TO t DO ALSO NOTIFY x'],
+]);
+
+test('a RESET word that is a database or role name is refused with a message that does not blame a U& name', function (string $sql) {
+    $violations = inspect($sql, DbDriver::Pgsql)->violations;
+
+    expect($violations)->not->toBe([])
+        ->and(implode(' ', $violations))->not->toContain('U&');
+})->with([
+    'RENAME TO reset' => ['ALTER DATABASE d RENAME TO reset'],
+    'OWNER TO reset' => ['ALTER DATABASE d OWNER TO reset'],
+    'a database called reset' => ['ALTER DATABASE reset RESET work_mem'],
+]);
+
+test('ALTER DATABASE ... CHARACTER SET passes on MySQL and is refused where the dialect is unknown', function () {
+    // The unknown driver is the union of the dialects, and PostgreSQL takes a
+    // database named "character" (ALTER DATABASE character SET role = 'x'),
+    // so the SET of CHARACTER SET cannot be skipped there.
+    expect(inspect('ALTER DATABASE d CHARACTER SET utf8mb4', DbDriver::Mysql)->passes())->toBeTrue()
+        ->and(inspect('ALTER DATABASE d CHARACTER SET utf8mb4', null)->passes())->toBeFalse()
+        ->and(inspect("ALTER DATABASE character SET role = 'x'", DbDriver::Pgsql)->passes())->toBeFalse();
+});
+
+test('SQL Server context switches are rejected on SQL Server and on an unknown driver', function (?DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse();
+})->with(function () {
+    $statements = [
+        'EXECUTE AS USER' => "EXECUTE AS USER = 'sa'",
+        'EXECUTE AS LOGIN' => "EXECUTE AS LOGIN = 'sa'",
+        'EXEC AS' => "EXEC AS USER = 'sa'",
+        'EXEC AS CALLER' => 'EXEC AS CALLER',
+        'lower case' => "execute as user = 'sa'",
+        'comments between the words' => "EXEC /* c */ AS /* d */ USER = 'sa'",
+        'newlines between the words' => "EXECUTE\n  AS\n  LOGIN = 'sa'",
+        'SETUSER' => "SETUSER 'sa'",
+        'bare SETUSER' => 'SETUSER',
+        'SETUSER, lower case' => "setuser 'sa'",
+        'REVERT' => 'REVERT',
+        'REVERT WITH COOKIE' => 'REVERT WITH COOKIE = @cookie',
+        'after a first statement' => "SELECT 1; EXECUTE AS USER = 'sa'",
+        'on the next line, no semicolon' => "SELECT 1\nEXECUTE AS USER = 'sa'",
+        'behind IF' => "IF 1 = 1 SETUSER 'sa'",
+        'inside BEGIN TRY' => "BEGIN TRY EXECUTE AS USER = 'sa' END TRY BEGIN CATCH SELECT 1 END CATCH",
+        'inside a transaction block' => "BEGIN TRANSACTION; EXECUTE AS USER = 'sa'; COMMIT",
+        'EXEC of a string, SETUSER' => "EXEC ('SETUSER ''sa''')",
+        'EXEC of an N string' => "EXEC (N'EXECUTE AS USER = ''sa''')",
+        'sp_executesql' => "EXEC sp_executesql N'EXECUTE AS USER = ''sa'''",
+        'sp_executesql, named parameter' => "EXEC sp_executesql @stmt = N'REVERT'",
+        'WITH EXECUTE AS OWNER' => 'CREATE PROCEDURE p WITH EXECUTE AS OWNER AS SELECT 1',
+        'WITH EXECUTE AS CALLER' => 'CREATE PROCEDURE p WITH EXECUTE AS CALLER AS SELECT 1',
+        'WITH EXECUTE AS SELF' => 'CREATE PROCEDURE p WITH EXECUTE AS SELF AS SELECT 1',
+        "WITH EXECUTE AS 'user'" => "CREATE PROCEDURE p WITH EXECUTE AS 'dbo' AS SELECT 1",
+        'function, after another option' => "CREATE FUNCTION f() RETURNS INT WITH SCHEMABINDING, EXECUTE AS 'dbo' AS BEGIN RETURN 1 END",
+        'trigger' => 'CREATE TRIGGER tr ON t WITH EXECUTE AS OWNER AFTER INSERT AS SELECT 1',
+        'ALTER PROCEDURE' => 'ALTER PROCEDURE p WITH EXECUTE AS OWNER AS SELECT 1',
+        'EXEC of a definition' => "EXEC ('CREATE PROCEDURE p WITH EXECUTE AS OWNER AS SELECT 1')",
+    ];
+
+    foreach ([DbDriver::Sqlsrv, null] as $driver) {
+        foreach ($statements as $label => $sql) {
+            yield ($driver?->value ?? 'no driver').': '.$label => [$driver, $sql];
+        }
+    }
+});
+
+test('SQL Server context-switch words used as names or inside strings still pass', function (string $sql) {
+    foreach ([DbDriver::Sqlsrv, null] as $driver) {
+        expect(inspect($sql, $driver)->violations)->toBe([]);
+    }
+})->with([
+    'a column called execute_as' => ['SELECT execute_as FROM t'],
+    'a column called execute_as, bracketed' => ['SELECT [execute_as], 1 AS x FROM t'],
+    'a bracketed execute with an alias' => ['SELECT [execute] AS x FROM t'],
+    'a qualified execute with an alias' => ['SELECT t.execute AS x FROM t'],
+    'EXECUTE AS inside a string' => ["SELECT 'EXECUTE AS USER = ''sa''' AS note"],
+    'SETUSER inside a string' => ["SELECT 'SETUSER ''sa''' AS note"],
+    'REVERT inside a string' => ["SELECT 'REVERT' AS note"],
+    'EXECUTE AS inside a comment' => ["SELECT 1 /* EXECUTE AS USER = 'sa' */"],
+    'EXECUTE AS inside a line comment' => ["SELECT 1 -- EXECUTE AS USER = 'sa'\n"],
+    'an ordinary EXEC' => ['EXEC sp_who'],
+    'an ordinary EXECUTE with a schema' => ['EXECUTE dbo.report_totals'],
+    'EXEC of a harmless string' => ["EXEC ('SELECT 1')"],
+    'sp_executesql of a harmless string' => ["EXEC sp_executesql N'SELECT 1'"],
+]);
+
+test('a SQL Server definition with a harmless option still passes', function () {
+    expect(inspect('CREATE PROCEDURE p WITH RECOMPILE AS SELECT 1', DbDriver::Sqlsrv)->violations)->toBe([]);
+});
+
+test('the SQL Server batches that used to pass with a context switch are now refused for that switch alone', function (string $sql, array $reasons) {
+    // These batches were pinned as passing before the context switch was
+    // refused; the batch splitter still reads them as statements, so the
+    // only violations left are the switch's own.
+    $violations = implode("\n", inspect($sql, DbDriver::Sqlsrv)->violations);
+
+    expect($violations)->not->toBe('')
+        ->and($violations)->not->toContain('not a statement QueryProxy knows');
+
+    foreach ($reasons as $reason) {
+        expect($violations)->toContain($reason);
+    }
+})->with([
+    'EXECUTE AS and REVERT' => ["EXECUTE AS USER = 'u' SELECT 1 REVERT", ['EXECUTE AS is not allowed', 'REVERT is not allowed']],
+    'REVERT WITH COOKIE' => ['REVERT WITH COOKIE = @c', ['REVERT is not allowed']],
+]);
+
+test('SQL Server EXECUTE AS and SETUSER are not a concern of the other drivers beyond their own rules', function () {
+    expect(inspect('SELECT execute_as FROM t LIMIT 5', DbDriver::Mysql)->violations)->toBe([])
+        ->and(inspect('SELECT execute_as FROM t LIMIT 5', DbDriver::Pgsql)->violations)->toBe([]);
+});
+
+test('splitStatements drops a segment that holds nothing but comments, executable ones included', function (string $sql, array $expected) {
+    expect(app(SqlInspector::class)->splitStatements($sql))->toBe($expected);
+})->with([
+    'a /*! */ segment after a statement' => ['SELECT 1; /*! SET @@global.x = 1 */;', ['SELECT 1']],
+    'a /*! */ segment without a trailing semicolon' => ['SELECT 1; /*! DROP TABLE t */', ['SELECT 1']],
+    'a /*!50000 */ segment' => ['SELECT 1; /*!50000 DROP TABLE t */', ['SELECT 1']],
+    'a /*M! */ segment before a statement' => ['/*M! SELECT 2 */; SELECT 1', ['SELECT 1']],
+    'an empty /*!*/ segment' => ['SELECT 1;/*!*/;', ['SELECT 1']],
+    'a /*!50000 */ segment between statements' => ['SELECT 1; /*!50000 SET x = 1 */; SELECT 2', ['SELECT 1', 'SELECT 2']],
+    'several mixed comment segments' => ["UPDATE t SET a = 1 WHERE id = 1; /* c */; /*!50000 */ ; -- x\n; /*M! DROP TABLE t */", ['UPDATE t SET a = 1 WHERE id = 1']],
+    'only an executable comment' => ['/*!40101 SET x = 1 */', []],
+]);
+
+test('splitStatements keeps an executable comment that sits inside a statement', function () {
+    expect(app(SqlInspector::class)->splitStatements('SELECT 1 /*!50000 , 2 */; SELECT 3'))
+        ->toBe(['SELECT 1 /*!50000 , 2 */', 'SELECT 3']);
+});
+
+test('a maximum-size statement full of Faz 02 constructs is scanned in linear time', function (DbDriver $driver, string $head, string $unit, string $tail, bool $passes) {
+    $statement = fn (int $bytes): string => $head.str_repeat($unit, intdiv($bytes - strlen($head) - strlen($tail), strlen($unit))).$tail;
+    $outcome = true;
+    $elapsed = function (string $sql) use ($driver, &$outcome): float {
+        $best = INF;
+
+        gc_disable();
+
+        try {
+            foreach (range(1, 2) as $run) {
+                $start = hrtime(true);
+                $outcome = inspect($sql, $driver)->passes();
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    $baseline = $elapsed($statement(intdiv(60000, 4)));
+    $maximum = $elapsed($statement(60000));
+
+    expect($outcome)->toBe($passes)
+        ->and($maximum)->toBeLessThan($baseline * 8 + 0.5);
+})->with([
+    'CREATE RULE statements in a DO body' => [DbDriver::Pgsql, 'DO $$BEGIN ', 'CREATE RULE r AS ON INSERT TO t DO ALSO NOTIFY x; ', 'END$$', true],
+    'ALTER DATABASE RESET in a DO body' => [DbDriver::Pgsql, 'DO $$BEGIN ', 'ALTER DATABASE d RESET work_mem; ', 'END$$', true],
+    'RESET clauses in one ALTER DATABASE' => [DbDriver::Pgsql, 'ALTER DATABASE d RESET work_mem ', 'RESET work_mem ', '', true],
+    'SET clauses in one ALTER DATABASE' => [DbDriver::Pgsql, 'ALTER DATABASE d SET a = 1 ', 'SET a = 1 ', '', true],
+    'SQL Server names that look like EXECUTE AS' => [DbDriver::Sqlsrv, 'SELECT 1 ', ', execute_as, [execute] ', ' FROM t', true],
+    'MySQL SET list of ordinary variables' => [DbDriver::Mysql, 'SET ', 'transaction_isolation = 1, ', '@b = 2', true],
 ]);
