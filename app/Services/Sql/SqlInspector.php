@@ -66,6 +66,30 @@ use PhpMyAdmin\SqlParser\TokenType;
  *    PostgreSQL, and when the driver is unknown, a listed name is rejected
  *    in every scope: plain SET, SET SESSION and SET LOCAL alike.
  *
+ * Four more things are refused outright, because each one raises what the
+ * session may do or lifts the read-only defence, and none has a use that
+ * needs a person's approval to be worth the risk:
+ *
+ *  - ALTER SYSTEM (SET, RESET, RESET ALL) on PostgreSQL. It writes
+ *    postgresql.auto.conf for the whole server, whatever the variable is, so
+ *    it is refused as a statement rather than judged by a name.
+ *  - DML on a system catalog: UPDATE / INSERT / DELETE / MERGE (and REPLACE)
+ *    whose target is a pg_catalog or pg_toast table, or a "pg_"-prefixed
+ *    table, on PostgreSQL, or a table of the mysql schema on MySQL / MariaDB,
+ *    in plain, qualified and quoted spelling. Reading a catalog (SELECT *
+ *    FROM pg_proc) is ordinary DBA work and passes. See catalogWriteViolations().
+ *  - A role or user switch: SET [SESSION | LOCAL] ROLE, RESET ROLE,
+ *    SET [SESSION | LOCAL] SESSION AUTHORIZATION, RESET SESSION
+ *    AUTHORIZATION, MySQL / MariaDB SET ROLE and SET DEFAULT ROLE, and
+ *    set_config('role' | 'session_authorization', ...), which reaches the
+ *    same setting through the variable list.
+ *  - READ WRITE in SET TRANSACTION, SET SESSION CHARACTERISTICS AS
+ *    TRANSACTION, BEGIN and START TRANSACTION. It is the spelling of
+ *    transaction_read_only that is not a SET of that variable.
+ * They are judged in every nested path the guard descends into (a DO or
+ * function body, dynamic SQL, a CTE body, EXPLAIN ANALYZE, SET STATEMENT ...
+ * FOR), because those paths hand the inner statement to the same rules.
+ *
  * Those two lists live in config/queryproxy.php and can only be extended from
  * the environment, never shortened. {@see self::UNTRUSTED_LANGUAGES} and
  * {@see self::DANGEROUS_VARIABLES} are the floor the configuration is merged
@@ -270,8 +294,17 @@ class SqlInspector
      * and foreign keys from firing (session_replication_role), or switch off
      * a catalog, large-object or page-integrity check
      * (allow_system_table_mods, lo_compat_privileges, zero_damaged_pages,
-     * ignore_checksum_failure). Settings only a reload or a restart can
-     * change are left out: no SET can reach them.
+     * ignore_checksum_failure). role and session_authorization are the
+     * settings behind SET ROLE and SET SESSION AUTHORIZATION: listed, they
+     * close the spellings the statement patterns cannot read ("role" quoted,
+     * SET SESSION role TO x, set_config('role', ...)). Settings only a reload
+     * or a restart can change are left out: no SET can reach them; ALTER
+     * SYSTEM, which does write them, is refused as a statement.
+     *
+     * The READ WRITE spellings of the two read-only settings
+     * (SET TRANSACTION READ WRITE, SET SESSION CHARACTERISTICS AS TRANSACTION
+     * READ WRITE, BEGIN ... READ WRITE, START TRANSACTION READ WRITE) set them
+     * without naming them and are refused as statements for the same reason.
      *
      * sql_mode is listed for a different reason: NO_BACKSLASH_ESCAPES and
      * ANSI_QUOTES change how the server reads string literals, and the guard
@@ -310,6 +343,8 @@ class SqlInspector
         'lo_compat_privileges',
         'zero_damaged_pages',
         'ignore_checksum_failure',
+        'role',
+        'session_authorization',
     ];
 
     /**
@@ -485,6 +520,33 @@ class SqlInspector
      */
     private const UNICODE_WHITESPACE_PATTERN = '/[\x{FEFF}\x{0085}\x{00A0}\x{1680}\x{180E}\x{2000}-\x{200B}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]/u';
 
+    /**
+     * The identity-switch statements the forbidden patterns refuse, kept as
+     * constants because other checks reuse them: resetViolations() reports
+     * a quoted RESET "role" with the same text as RESET ROLE, and
+     * analyzeStatement() uses them to recognise the statements that these
+     * patterns already refuse, so the same statement is not refused twice.
+     */
+    private const SET_ROLE_PATTERN = '/^SET\s+((SESSION|LOCAL)\s+)?ROLE\b/i';
+
+    private const SET_SESSION_AUTHORIZATION_PATTERN = '/^(SET\s+((SESSION|LOCAL)\s+)?SESSION\s+AUTHORIZATION|RESET\s+(SESSION\s+AUTHORIZATION|SESSION_AUTHORIZATION))\b/i';
+
+    private const RESET_ROLE_MESSAGE = 'RESET ROLE is not allowed through QueryProxy (it changes the privileges the session runs with).';
+
+    private const UNREADABLE_NAME_MESSAGE = 'A Unicode-escaped U&"..." name whose escapes the guard cannot decode is not allowed through QueryProxy: it cannot tell which object or setting it names.';
+
+    private const USE_CATALOG_SCHEMA_MESSAGE = 'USE mysql is not allowed through QueryProxy: it makes the system catalog the default schema, so an unqualified table name would no longer be judged as a catalog table.';
+
+    private const SESSION_AUTHORIZATION_MESSAGE = 'SET / RESET SESSION AUTHORIZATION is not allowed through QueryProxy (it changes the user the session runs as).';
+
+    /**
+     * The reason serverVariableViolations() gives for SET role and
+     * SET session_authorization; analyzeStatement() recognises it by this
+     * suffix and drops the duplicate when SET_ROLE_PATTERN or
+     * SET_SESSION_AUTHORIZATION_PATTERN already refused the statement.
+     */
+    private const IDENTITY_VARIABLE_REASON = 'changes the privileges or the user the session runs as.';
+
     private const FORBIDDEN_PATTERNS = [
         '/^DROP\s+(DATABASE|SCHEMA)\b/i' => 'DROP DATABASE is not allowed through QueryProxy.',
         '/^GRANT\b/i' => 'GRANT statements are not allowed through QueryProxy.',
@@ -500,6 +562,25 @@ class SqlInspector
         // Call form only: literals are already blanked by normalize(), and an
         // identifier that merely *looks* like one of these is not a call.
         '/\b(PG_READ_FILE|PG_READ_BINARY_FILE|PG_LS_DIR|LO_IMPORT|LO_EXPORT)\s*\(/i' => 'Server-side file IO functions are not allowed through QueryProxy.',
+        // Every ALTER SYSTEM, whatever the setting: it rewrites
+        // postgresql.auto.conf for the whole server and DANGEROUS_VARIABLES
+        // is never consulted, so a name-based judgement would be a denylist
+        // of settings only a reload can reach.
+        '/^ALTER\s+SYSTEM\b/i' => 'ALTER SYSTEM is not allowed through QueryProxy (it rewrites the server-wide postgresql.auto.conf).',
+        // Identity switches: SET [SESSION | LOCAL] ROLE, RESET ROLE, SET
+        // [SESSION | LOCAL] SESSION AUTHORIZATION, RESET SESSION
+        // AUTHORIZATION and the MySQL / MariaDB SET ROLE / SET DEFAULT ROLE.
+        // The quoted and function spellings (SET "role", set_config('role'))
+        // are caught through DANGEROUS_VARIABLES.
+        self::SET_ROLE_PATTERN => 'SET ROLE is not allowed through QueryProxy (it changes the privileges the session runs with).',
+        '/^SET\s+DEFAULT\s+ROLE\b/i' => 'SET DEFAULT ROLE is not allowed through QueryProxy (it changes the privileges sessions start with).',
+        self::SET_SESSION_AUTHORIZATION_PATTERN => self::SESSION_AUTHORIZATION_MESSAGE,
+        '/^RESET\s+ROLE\b/i' => self::RESET_ROLE_MESSAGE,
+        // Transaction access mode: READ WRITE lifts the read-only mode that
+        // transaction_read_only / default_transaction_read_only enforce, in
+        // SET [SESSION | GLOBAL] TRANSACTION, SET SESSION CHARACTERISTICS AS
+        // TRANSACTION, BEGIN [TRANSACTION | WORK] and START TRANSACTION.
+        '/^(SET\b.*\bTRANSACTION\b|(BEGIN|START)\b).*\bREAD\s+WRITE\b/i' => 'READ WRITE is not allowed through QueryProxy (it lifts the read-only transaction mode; READ ONLY is allowed).',
     ];
 
     public function inspect(string $sql, ?DbDriver $driver = null): InspectionResult
@@ -922,13 +1003,32 @@ class SqlInspector
             }
         }
 
+        $identityRefused = preg_match(self::SET_ROLE_PATTERN, $normalized) === 1
+            || preg_match(self::SET_SESSION_AUTHORIZATION_PATTERN, $normalized) === 1;
+
         foreach ($this->targetedViolations($sql, $driver) as $message) {
+            // SET ROLE x is already refused by its pattern; the same
+            // statement is not refused a second time for writing "role".
+            if ($identityRefused && str_ends_with($message, self::IDENTITY_VARIABLE_REASON)) {
+                continue;
+            }
+
             $violations[] = "{$label}: {$message}";
         }
 
         $tokens = $this->significantTokens($sql);
 
+        foreach ($this->resetViolations($tokens) as $message) {
+            if (! in_array("{$label}: {$message}", $violations, true)) {
+                $violations[] = "{$label}: {$message}";
+            }
+        }
+
         foreach ($this->dialectViolations($tokens, $driver) as $message) {
+            $violations[] = "{$label}: {$message}";
+        }
+
+        foreach ($this->catalogWriteViolations($tokens, $driver) as $message) {
             $violations[] = "{$label}: {$message}";
         }
 
@@ -936,6 +1036,10 @@ class SqlInspector
         // "EXPLAIN(ANALYZE)DELETE", "SELECT*INTO t2" and "(SELECT ...)" all
         // start with a keyword that a split on spaces would not see.
         [$keyword, $wrappingParens] = $this->leadingKeyword($tokens);
+
+        if ($keyword === 'USE' && $this->usesCatalogSchema($tokens, $wrappingParens, $driver)) {
+            $violations[] = "{$label}: ".self::USE_CATALOG_SCHEMA_MESSAGE;
+        }
 
         // A statement held in a string (EXEC('...'), sp_executesql,
         // PREPARE, EXECUTE IMMEDIATE) or in a CTE body is judged with the
@@ -3315,6 +3419,15 @@ class SqlInspector
 
                 if ($this->needsNestedInspection($bodySql)) {
                     array_push($violations, ...$this->analyzeNestedStatement($bodySql, $position, $driver, $depth)[1]);
+                } else {
+                    // INSERT and MERGE bodies are not judged as statements of
+                    // their own (see needsNestedInspection()), but the
+                    // system catalogs are off limits to them as well.
+                    $bodyTokens = array_slice($tokens, $open + 1, $close - $open - 1);
+
+                    foreach ($this->catalogWriteViolations($bodyTokens, $driver) as $message) {
+                        $violations[] = "Statement {$position}: {$message}";
+                    }
                 }
 
                 $index = $this->skipCommonTableExpressionTail($tokens, $close + 1);
@@ -5229,11 +5342,25 @@ class SqlInspector
             $tokens = $this->significantTokens($statement);
 
             if ($tokens !== [] && strtoupper((string) $tokens[0]->value) === 'SET') {
-                $messages = array_merge($messages, $this->serverVariableViolations($tokens, DbDriver::Pgsql));
+                $identityRefused = preg_match(self::SET_ROLE_PATTERN, trim($statement)) === 1
+                    || preg_match(self::SET_SESSION_AUTHORIZATION_PATTERN, trim($statement)) === 1;
+
+                foreach ($this->serverVariableViolations($tokens, DbDriver::Pgsql) as $message) {
+                    if (! $identityRefused || ! str_ends_with($message, self::IDENTITY_VARIABLE_REASON)) {
+                        $messages[] = $message;
+                    }
+                }
             }
+
+            $messages = array_merge($messages, $this->resetViolations($tokens));
+
+            // A data-modifying CTE body ("WITH x AS (UPDATE pg_proc ...)")
+            // starts right after an opening parenthesis, so a verb counts at
+            // any depth here.
+            $messages = array_merge($messages, $this->catalogWriteViolations($tokens, DbDriver::Pgsql, anyDepth: true));
         }
 
-        return array_map(fn (string $message): string => "Inside the {$label} body: {$message}", $messages);
+        return array_values(array_unique(array_map(fn (string $message): string => "Inside the {$label} body: {$message}", $messages)));
     }
 
     /**
@@ -6130,6 +6257,12 @@ class SqlInspector
         foreach ($this->splitAssignments($tokens, $index) as $assignment) {
             [$scope, $name] = $this->variableReference($assignment, $statementScope);
 
+            if ($name === '') {
+                $violations[] = 'SET: '.self::UNREADABLE_NAME_MESSAGE;
+
+                continue;
+            }
+
             if ($name === null || ! in_array($name, $dangerous, true)) {
                 continue;
             }
@@ -6147,10 +6280,400 @@ class SqlInspector
     }
 
     /**
+     * DML aimed at the server's own metadata is refused: UPDATE, INSERT,
+     * DELETE, REPLACE and MERGE on a PostgreSQL system catalog or on a
+     * MySQL / MariaDB mysql.* table rewrite roles, privileges, languages and
+     * routine bodies directly, past every check the matching DDL statement
+     * gets. Reading the same tables stays allowed.
+     *
+     * A catalog table is, on PostgreSQL, a name qualified with pg_catalog or
+     * pg_toast — quoted or not, with or without a database part — or an
+     * unqualified name that starts with pg_ (the search_path puts pg_catalog
+     * first); a name qualified with any other schema is a user table. On
+     * MySQL / MariaDB it is a name with mysql as its schema. An unknown
+     * driver applies both readings; SQLite and SQL Server have no rule here.
+     *
+     * Only the write target is judged. On PostgreSQL that is the table after
+     * UPDATE / DELETE FROM / INSERT INTO / MERGE INTO, so
+     * "UPDATE t SET a = 1 FROM pg_proc" and "INSERT INTO t SELECT * FROM
+     * pg_proc" read the catalog and pass. MySQL / MariaDB lets one UPDATE or
+     * DELETE write several joined tables, so there every table the statement
+     * names before its SET / WHERE counts, which also refuses a join that
+     * only reads a mysql.* table: over-refusing is the safe side.
+     *
+     * The statement verb is the first keyword, or the one that follows the
+     * WITH list, so a CTE-led write is judged. A write inside a CTE body is
+     * judged by commonTableExpressionViolations(): an UPDATE / DELETE / WITH
+     * body as a statement of its own, an INSERT / MERGE body by calling this
+     * method on the body's tokens. A write inside dynamic SQL or EXPLAIN
+     * ANALYZE is judged by the nested paths that call this method on the
+     * inner statement; a DO body is judged with $anyDepth, which also counts a
+     * verb right after any parenthesis, at any depth.
+     *
+     * The scan is linear: each verb owns the tokens up to the next verb, so
+     * the name lookups never run over the same token twice.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function catalogWriteViolations(array $tokens, ?DbDriver $driver, bool $anyDepth = false): array
+    {
+        $families = match ($driver) {
+            null => ['pg', 'mysql'],
+            DbDriver::Pgsql => ['pg'],
+            DbDriver::Mysql, DbDriver::Mariadb => ['mysql'],
+            default => [],
+        };
+
+        if ($families === []) {
+            return [];
+        }
+
+        $verbs = [];
+        $depth = 0;
+        $previous = null;
+        $afterPrepare = false;
+
+        foreach ($tokens as $index => $token) {
+            if ($anyDepth
+                && in_array($token->type, [TokenType::None, TokenType::Keyword], true)
+                && ($this->tokenWords($token)[0] ?? '') === 'PREPARE') {
+                $afterPrepare = true;
+            }
+
+            if ($this->isOperator($token, '(')) {
+                $depth++;
+            } elseif ($this->isOperator($token, ')')) {
+                $depth--;
+            } elseif ($anyDepth && $token->type === TokenType::Keyword && $this->tokenWords($token) === ['FOR', 'UPDATE']) {
+                // The lexer merges "FOR UPDATE" into one keyword, so the
+                // UPDATE of "OPEN c FOR UPDATE ..." and of "c CURSOR FOR
+                // UPDATE ..." is hidden in it. A locking clause ("SELECT ...
+                // FOR UPDATE OF t") reads OF, SKIP or NOWAIT as its target,
+                // which is never a catalog table.
+                $verbs[] = [$index, 'UPDATE'];
+            } elseif (($depth === 0 || $anyDepth)
+                && $token->type === TokenType::Keyword
+                && ($index === 0
+                    || ($previous !== null && ($this->isOperator($previous, ')')
+                        || ($anyDepth && ($this->isOperator($previous, '(') || $this->embedsStatement($previous, $afterPrepare))))))) {
+                $verb = $this->tokenWords($token)[0] ?? '';
+
+                if (in_array($verb, ['UPDATE', 'DELETE', 'INSERT', 'REPLACE', 'MERGE'], true)) {
+                    $verbs[] = [$index, $verb];
+                }
+            }
+
+            $previous = $token;
+        }
+
+        $violations = [];
+        $count = count($tokens);
+
+        foreach ($verbs as $position => [$index, $verb]) {
+            $limit = $verbs[$position + 1][0] ?? $count;
+
+            foreach ($families as $family) {
+                foreach ($this->writeTargets($tokens, $index, $verb, $family, $limit) as [$parts, $readable]) {
+                    if (! $readable) {
+                        $violations["{$verb}?"] = "{$verb}: ".self::UNREADABLE_NAME_MESSAGE;
+                    } elseif ($this->isCatalogName($parts, $family)) {
+                        $name = implode('.', $parts);
+                        $violations[$name] = "{$verb} on the system catalog table {$name} is not allowed through QueryProxy: it rewrites the server's own metadata (roles, privileges, languages, routines) past the checks the matching DDL statement gets.";
+                    }
+                }
+            }
+        }
+
+        return array_values($violations);
+    }
+
+    /**
+     * True when the statement is USE mysql on a MySQL-family driver (or an
+     * unknown one): the default schema becomes the system catalog, and the
+     * catalog scan, which only knows the qualified name mysql.<table>, would
+     * no longer see an unqualified "UPDATE user SET ..." as a catalog write.
+     * The name is read from the token, so `mysql`, "mysql", MySQL and any
+     * comment between USE and the name all count; USE also judged inside a
+     * transaction, an executable comment and dynamic SQL, because each of
+     * them re-enters analyzeStatement(). A USE that is not at the head of a
+     * statement is an index hint (FROM t USE INDEX (i)) and is not judged.
+     *
+     * @param  list<Token>  $tokens
+     */
+    private function usesCatalogSchema(array $tokens, int $headIndex, ?DbDriver $driver): bool
+    {
+        if ($driver !== null && $driver !== DbDriver::Mysql && $driver !== DbDriver::Mariadb) {
+            return false;
+        }
+
+        $name = isset($tokens[$headIndex + 1]) ? $this->functionName($tokens[$headIndex + 1]) : null;
+
+        return $name === 'mysql';
+    }
+
+    /**
+     * True when the token is a word after which a PL/pgSQL body (or a
+     * statement that embeds one) puts a data-modifying statement of its own:
+     *  - FOR r IN UPDATE ... RETURNING ... LOOP        (IN)
+     *  - RETURN QUERY UPDATE ... RETURNING ...         (QUERY)
+     *  - OPEN c FOR UPDATE ...; c CURSOR FOR DELETE .. (FOR)
+     *  - PREPARE p AS INSERT ...                       (AS)
+     *  - EXPLAIN ANALYZE [VERBOSE] UPDATE ...          (ANALYZE, ANALYSE, VERBOSE)
+     * PERFORM and EXECUTE already start a body statement of their own (see
+     * blockBodyCallViolations()), and a statement that follows a parenthesis
+     * is counted separately. ON CONFLICT DO UPDATE, FOR UPDATE and ON DELETE
+     * do not follow one of these words, and when one does (FOR UPDATE) the
+     * write target it would read is OF, SKIP, NOWAIT or a keyword, never a
+     * catalog table.
+     *
+     * AS counts only after a PREPARE earlier in the body ($afterPrepare):
+     * PREPARE is the one PL/pgSQL-reachable statement that takes a DML
+     * statement after AS, and without that condition a column alias that is
+     * spelled like a verb ("SELECT 1 AS delete FROM pg_proc") would be read
+     * as one. A body that holds a PREPARE anywhere keeps every AS as a
+     * marker, so an alias there is still refused (fail-closed). The FOR of a
+     * policy ("CREATE POLICY p ON t FOR DELETE USING (...)") is a marker as
+     * well, but the DELETE it precedes names no target without a FROM right
+     * behind it (see writeTargets()), so the policy passes.
+     */
+    private function embedsStatement(Token $previous, bool $afterPrepare): bool
+    {
+        if (! in_array($previous->type, [TokenType::None, TokenType::Keyword], true)) {
+            return false;
+        }
+
+        $words = $this->tokenWords($previous);
+
+        $last = $words[count($words) - 1] ?? '';
+
+        return $last === 'AS'
+            ? $afterPrepare
+            : in_array($last, ['IN', 'QUERY', 'FOR', 'ANALYZE', 'ANALYSE', 'VERBOSE'], true);
+    }
+
+    /**
+     * RESET is judged by the setting it resets, read through functionNameAt()
+     * like every other name this guard compares, so a quoted or Unicode-escaped
+     * name counts: RESET "role", RESET U&"role" and RESET U&"\0072ole" are the
+     * same statements as RESET ROLE, and so are the session_authorization
+     * spellings of RESET SESSION AUTHORIZATION. The lexer reads a quoted name
+     * as a string and normalize() blanks it, which hides it from
+     * FORBIDDEN_PATTERNS. The unquoted spellings are reported with the same
+     * text as those patterns, so a statement both catch is reported once. A
+     * U& name whose escapes do not decode cannot be compared at all, so it is
+     * refused.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<string>
+     */
+    private function resetViolations(array $tokens): array
+    {
+        [$keyword, $index] = $this->leadingKeyword($tokens);
+
+        if ($keyword !== 'RESET' || ! isset($tokens[$index + 1])) {
+            return [];
+        }
+
+        [$name, , $readable] = $this->functionNameAt($tokens, $index + 1);
+
+        if (! $readable) {
+            return [self::UNREADABLE_NAME_MESSAGE.' (RESET)'];
+        }
+
+        return match ($name) {
+            'role' => [self::RESET_ROLE_MESSAGE],
+            'session_authorization' => [self::SESSION_AUTHORIZATION_MESSAGE],
+            default => [],
+        };
+    }
+
+    /**
+     * The names a write statement of the given verb writes to, as lists of
+     * name parts, for the PostgreSQL ("pg") or the MySQL / MariaDB ("mysql")
+     * reading of its syntax (see catalogWriteViolations()). The statement
+     * ends before $limit, so a clause is never searched for past it. Each
+     * target is [parts, readable]; readable is false for a U& name that does
+     * not decode, which the caller refuses.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<array{0: list<string>, 1: bool}>
+     */
+    private function writeTargets(array $tokens, int $verbIndex, string $verb, string $family, int $limit): array
+    {
+        $count = $limit;
+        $start = $verbIndex + 1;
+
+        if ($verb === 'INSERT' || $verb === 'REPLACE' || $verb === 'MERGE') {
+            $skippable = ['INTO', 'ONLY', 'IGNORE', 'LOW_PRIORITY', 'DELAYED', 'HIGH_PRIORITY'];
+            $wordsOfVerb = array_slice($this->tokenWords($tokens[$verbIndex]), 1);
+
+            // A compound verb token ("INSERT INTO", "INSERT IGNORE") already
+            // carries the words that follow the verb.
+            if ($wordsOfVerb !== [] && array_diff($wordsOfVerb, $skippable) !== []) {
+                return [];
+            }
+
+            while (isset($tokens[$start])
+                && $tokens[$start]->type === TokenType::Keyword
+                && array_diff($this->tokenWords($tokens[$start]), $skippable) === []) {
+                $start++;
+            }
+
+            [$parts, , $readable] = $this->qualifiedNameAt($tokens, $start);
+
+            return $parts === [] && $readable ? [] : [[$parts, $readable]];
+        }
+
+        if ($verb === 'UPDATE') {
+            $end = $count;
+
+            for ($i = $start; $i < $count; $i++) {
+                if ($tokens[$i]->type === TokenType::Keyword && ($this->tokenWords($tokens[$i])[0] ?? '') === 'SET') {
+                    $end = $i;
+
+                    break;
+                }
+            }
+        } else {
+            // PostgreSQL: DELETE FROM [ONLY] target ... — the FROM follows
+            // the verb directly. A DELETE without it names no target here:
+            // "FOR DELETE USING (... FROM pg_proc)" of a policy, or an alias
+            // spelled "delete", must not read a FROM inside a parenthesis.
+            if ($family === 'pg') {
+                $from = $tokens[$start] ?? null;
+
+                if ($from === null
+                    || ! in_array($from->type, [TokenType::None, TokenType::Keyword], true)
+                    || ($this->tokenWords($from)[0] ?? '') !== 'FROM') {
+                    return [];
+                }
+
+                $start++;
+            }
+
+            // MySQL: DELETE [options] FROM target [USING ...] | DELETE t1 FROM t1 JOIN ...
+            $end = $count;
+
+            for ($i = $start; $i < $count; $i++) {
+                if ($tokens[$i]->type === TokenType::Keyword
+                    && in_array($this->tokenWords($tokens[$i])[0] ?? '', ['WHERE', 'RETURNING', 'ORDER', 'LIMIT'], true)) {
+                    $end = $i;
+
+                    break;
+                }
+            }
+
+        }
+
+        if ($family === 'pg') {
+            while (isset($tokens[$start])
+                && in_array($tokens[$start]->type, [TokenType::None, TokenType::Keyword], true)
+                && strtoupper($tokens[$start]->token) === 'ONLY') {
+                $start++;
+            }
+
+            [$parts, , $readable] = $this->qualifiedNameAt($tokens, $start);
+
+            return $parts === [] && $readable ? [] : [[$parts, $readable]];
+        }
+
+        $targets = [];
+
+        for ($i = $start; $i < $end; $i++) {
+            [$parts, $partsEnd, $readable] = $this->qualifiedNameAt($tokens, $i);
+
+            if ($parts !== [] || ! $readable) {
+                $targets[] = [$parts, $readable];
+                $i = $partsEnd;
+            }
+        }
+
+        return $targets;
+    }
+
+    /**
+     * True when the name is a system catalog table of the given family: see
+     * catalogWriteViolations().
+     *
+     * @param  list<string>  $parts
+     */
+    private function isCatalogName(array $parts, string $family): bool
+    {
+        $count = count($parts);
+
+        if ($family === 'pg') {
+            return $count === 1
+                ? str_starts_with($parts[0], 'pg_')
+                : in_array($parts[$count - 2], ['pg_catalog', 'pg_toast'], true);
+        }
+
+        return $count >= 2 && in_array('mysql', array_slice($parts, 0, $count - 1), true);
+    }
+
+    /**
+     * Every part of the possibly qualified name that starts at $index —
+     * pg_catalog."pg_proc", mysql.user, db.pg_catalog.pg_proc — case-folded,
+     * the index of its last token, and whether every part was readable. The
+     * list is empty when the token there cannot name an object. Empty parts
+     * ("a..b") are left out.
+     *
+     * Each part goes through functionNameAt(), the one name normalization of
+     * this guard, so pg_proc, "pg_proc", U&"pg_proc" and U&"\0070g_proc"
+     * are the same name. A U& part whose escapes do not decode is reported as
+     * unreadable (false) and ends the name, so the caller can refuse it.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: list<string>, 1: int, 2: bool}
+     */
+    private function qualifiedNameAt(array $tokens, int $index): array
+    {
+        $parts = [];
+        $end = $index;
+        $i = $index;
+
+        while (isset($tokens[$i])) {
+            $isBracket = $tokens[$i]->type === TokenType::None && in_array($tokens[$i]->token, ['[', ']'], true);
+            [$part, $partEnd, $readable] = $isBracket
+                ? [...$this->namePartAt($tokens, $i), true]
+                : $this->functionNameAt($tokens, $i);
+
+            if (! $readable) {
+                return [$parts, $partEnd, false];
+            }
+
+            if ($part === null) {
+                break;
+            }
+
+            $parts[] = $part;
+            $end = $partEnd;
+            $i = $partEnd + 1;
+            $dots = $i;
+
+            while (isset($tokens[$dots]) && $this->isOperator($tokens[$dots], '.')) {
+                $dots++;
+            }
+
+            if ($dots === $i) {
+                break;
+            }
+
+            $i = $dots;
+        }
+
+        return [$parts, $end, true];
+    }
+
+    /**
      * Why writing the dangerous setting $name is refused.
      */
     private function dangerousVariableReason(string $name): string
     {
+        if (in_array($name, ['role', 'session_authorization'], true)) {
+            return "{$name} ".self::IDENTITY_VARIABLE_REASON;
+        }
+
         return in_array($name, self::LEXER_MODE_VARIABLES, true)
             ? "{$name} changes how quotes and backslashes are read, which the guard cannot follow."
             : "{$name} controls server-side file paths, code loading or a protection switch.";
@@ -6262,10 +6785,11 @@ class SqlInspector
     /**
      * The setting name an assignment writes, starting at $index. A
      * PostgreSQL U&"..." name reaches the lexer as three tokens — U, & and
-     * the quoted text with its escapes undecoded — and is decoded here the
-     * way PostgreSQL decodes it, so U&"session\005Freplication_role" is
-     * judged as session_replication_role. Null when there is no name, or
-     * when the escapes do not decode (PostgreSQL rejects such a name).
+     * the quoted text with its escapes undecoded — and goes through
+     * functionNameAt(), the one name normalization of this guard, so
+     * U&"session\005Freplication_role" is judged as session_replication_role.
+     * Null when there is no name, and the empty string when the escapes do
+     * not decode: no setting has an empty name, so the caller refuses it.
      *
      * @param  list<Token>  $assignment
      */
@@ -6275,20 +6799,15 @@ class SqlInspector
             return null;
         }
 
-        $quoted = $assignment[$index + 2] ?? null;
+        [$name, $end, $readable] = $this->functionNameAt($assignment, $index);
 
-        if (strtoupper((string) $assignment[$index]->token) === 'U'
-            && isset($assignment[$index + 1])
-            && $assignment[$index + 1]->token === '&'
-            && $quoted !== null
-            && $quoted->type === TokenType::String
-            && str_starts_with((string) $quoted->token, '"')) {
-            $decoded = $this->decodeUnicodeEscapes(str_replace('""', '"', substr((string) $quoted->token, 1, -1)), '\\');
-
-            return $decoded === null ? null : strtolower($decoded);
+        if (! $readable) {
+            return '';
         }
 
-        return $this->identifierValue($assignment[$index]);
+        // A U& name spans several tokens; any other token keeps the
+        // identifier reading, which also handles the ":=" label tokens.
+        return $end > $index && $name !== null ? $name : $this->identifierValue($assignment[$index]);
     }
 
     /**

@@ -3040,3 +3040,659 @@ test('Unicode whitespace in a string that a dynamic-SQL command runs is rejected
     'mariadb, EXECUTE IMMEDIATE' => [DbDriver::Mariadb, "EXECUTE IMMEDIATE 'DELETE\u{00A0}FROM t'"],
     'sqlsrv, EXEC of a string' => [DbDriver::Sqlsrv, "EXEC('DELETE\u{00A0}FROM t')"],
 ]);
+
+/*
+ * v0.2.6: ALTER SYSTEM, system catalog DML, role / session authorization
+ * switches and READ WRITE.
+ */
+
+test('ALTER SYSTEM is rejected in every spelling', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('ALTER SYSTEM is not allowed');
+})->with([
+    'set' => "ALTER SYSTEM SET work_mem = '1GB'",
+    'set to default' => 'ALTER SYSTEM SET work_mem TO DEFAULT',
+    'reset' => 'ALTER SYSTEM RESET work_mem',
+    'reset all' => 'ALTER SYSTEM RESET ALL',
+    'a variable that is not on any list' => "ALTER SYSTEM SET work_mem = '1GB'",
+    'lower case' => "alter system set work_mem = '1GB'",
+    'extra whitespace' => "ALTER\n\t  SYSTEM   SET work_mem = '1GB'",
+    'comments' => "ALTER /* x */ SYSTEM -- y\n SET work_mem = '1GB'",
+    'in a transaction' => "BEGIN; ALTER SYSTEM SET work_mem = '1GB'; COMMIT;",
+    'in a DO body' => "DO \$\$ BEGIN ALTER SYSTEM SET work_mem = '1GB'; END \$\$",
+    'in a function body' => 'CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN ALTER SYSTEM RESET ALL; END $$',
+]);
+
+test('ALTER SYSTEM is rejected when the driver is unknown', function () {
+    expect(inspect("ALTER SYSTEM SET work_mem = '1GB'")->passes())->toBeFalse();
+});
+
+test('a system catalog write is rejected on PostgreSQL', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('system catalog table');
+})->with([
+    'update, qualified' => "UPDATE pg_catalog.pg_proc SET prosrc = 'x'",
+    'update, unqualified' => "UPDATE pg_language SET lanpltrusted = true WHERE lanname = 'plpython3u'",
+    'update, quoted' => "UPDATE \"pg_proc\" SET prosrc = 'x' WHERE oid = 1",
+    'update, quoted and qualified' => "UPDATE \"pg_catalog\".\"pg_proc\" SET prosrc = 'x' WHERE oid = 1",
+    'update, qualified with a quoted name' => "UPDATE pg_catalog.\"pg_proc\" SET prosrc = 'x' WHERE oid = 1",
+    'update ONLY' => "UPDATE ONLY pg_proc SET prosrc = 'x' WHERE oid = 1",
+    'update with an alias' => "UPDATE pg_catalog.pg_proc AS p SET prosrc = 'x' WHERE p.oid = 1",
+    'update, database-qualified' => "UPDATE db.pg_catalog.pg_proc SET prosrc = 'x' WHERE oid = 1",
+    'update, upper case name' => "UPDATE PG_CATALOG.PG_PROC SET prosrc = 'x' WHERE oid = 1",
+    'update, lower case verb' => "update pg_proc set prosrc = 'x' where oid = 1",
+    'update, comments between the words' => "/* a */ UPDATE /* b */ pg_catalog /* c */ . /* d */ pg_proc SET prosrc = 'x' WHERE oid = 1",
+    'update, newlines' => "UPDATE\n  pg_catalog.pg_proc\nSET prosrc = 'x'\nWHERE oid = 1",
+    'update, pg_toast schema' => 'UPDATE pg_toast.pg_toast_1 SET a = 1 WHERE b = 1',
+    'update FROM a user table' => 'UPDATE pg_authid SET rolsuper = true FROM users WHERE users.id = 1',
+    'delete' => 'DELETE FROM pg_catalog.pg_proc WHERE oid = 1',
+    'delete, quoted' => 'DELETE FROM "pg_proc" WHERE oid = 1',
+    'delete ONLY' => 'DELETE FROM ONLY pg_proc WHERE oid = 1',
+    'delete USING a user table' => 'DELETE FROM pg_proc USING users WHERE users.id = pg_proc.oid',
+    'insert' => 'INSERT INTO pg_authid (rolname) VALUES (\'x\')',
+    'insert, qualified' => 'INSERT INTO pg_catalog.pg_authid (rolname) VALUES (\'x\')',
+    'insert, quoted' => 'INSERT INTO pg_catalog."pg_authid" (rolname) VALUES (\'x\')',
+    'insert from a select' => 'INSERT INTO pg_proc SELECT * FROM pg_proc',
+    'merge' => 'MERGE INTO pg_proc p USING users u ON p.oid = u.id WHEN MATCHED THEN DELETE',
+    'a CTE-led write' => 'WITH x AS (SELECT 1) UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1',
+    'a CTE body that writes' => 'WITH x AS (UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1 RETURNING 1) SELECT * FROM x',
+    'in a transaction' => "BEGIN; UPDATE pg_proc SET prosrc = 'x' WHERE oid = 1; COMMIT;",
+    'EXPLAIN ANALYZE' => 'EXPLAIN ANALYZE UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1',
+    'EXPLAIN (ANALYZE)' => 'EXPLAIN (ANALYZE) DELETE FROM pg_catalog.pg_proc WHERE oid = 1',
+    'PREPARE' => 'PREPARE p AS UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1',
+    'a DO body' => "DO \$\$ BEGIN UPDATE pg_catalog.pg_proc SET prosrc = 'x' WHERE oid = 1; END \$\$",
+    'a DO body, quoted name' => "DO \$\$ BEGIN UPDATE \"pg_proc\" SET prosrc = 'x' WHERE oid = 1; END \$\$",
+    'a DO body, qualified quoted name' => 'DO $$ BEGIN DELETE FROM pg_catalog."pg_proc" WHERE oid = 1; END $$',
+    'a DO body, insert' => "DO \$\$ BEGIN INSERT INTO pg_authid (rolname) VALUES ('x'); END \$\$",
+    'a DO body, CTE body that writes' => 'DO $tag$ BEGIN WITH x AS (DELETE FROM pg_proc WHERE oid = 1 RETURNING 1) SELECT 1; END $tag$',
+    'a function body' => "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS \$\$ BEGIN UPDATE pg_proc SET prosrc = 'x' WHERE oid = 1; END \$\$",
+]);
+
+test('a system catalog write is rejected on MySQL and MariaDB', function (DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('system catalog table');
+})->with([
+    'mysql update' => [DbDriver::Mysql, "UPDATE mysql.user SET authentication_string = '' WHERE user = 'root'"],
+    'mariadb update' => [DbDriver::Mariadb, "UPDATE mysql.user SET password = '' WHERE user = 'root'"],
+    'mysql update, backticks' => [DbDriver::Mysql, "UPDATE `mysql`.`user` SET authentication_string = '' WHERE user = 'root'"],
+    'mysql update, upper case' => [DbDriver::Mysql, "UPDATE MYSQL.USER SET authentication_string = '' WHERE user = 'root'"],
+    'mysql update, comments' => [DbDriver::Mysql, "UPDATE /* a */ mysql /* b */ . /* c */ user SET authentication_string = '' WHERE user = 'root'"],
+    'mysql update with an alias' => [DbDriver::Mysql, "UPDATE mysql.user AS u SET u.authentication_string = '' WHERE u.user = 'root'"],
+    'mysql update LOW_PRIORITY IGNORE' => [DbDriver::Mysql, "UPDATE LOW_PRIORITY IGNORE mysql.user SET authentication_string = '' WHERE user = 'root'"],
+    'mysql multi-table update' => [DbDriver::Mysql, 'UPDATE users u, mysql.user m SET m.plugin = u.plugin WHERE u.id = 1'],
+    'mysql delete' => [DbDriver::Mysql, "DELETE FROM mysql.user WHERE user = 'x'"],
+    'mysql delete, backticks' => [DbDriver::Mysql, "DELETE FROM `mysql`.`user` WHERE user = 'x'"],
+    'mysql insert' => [DbDriver::Mysql, "INSERT INTO mysql.user (user) VALUES ('x')"],
+    'mysql insert ignore' => [DbDriver::Mysql, "INSERT IGNORE INTO mysql.user (user) VALUES ('x')"],
+    'mysql replace' => [DbDriver::Mysql, "REPLACE INTO mysql.user (user) VALUES ('x')"],
+    'mariadb a CTE body that writes' => [DbDriver::Mariadb, 'WITH x AS (UPDATE mysql.user SET plugin = \'\' WHERE user = \'a\') SELECT 1'],
+    'mariadb ANALYZE' => [DbDriver::Mariadb, "ANALYZE UPDATE mysql.user SET plugin = '' WHERE user = 'a'"],
+    'mariadb SET STATEMENT ... FOR' => [DbDriver::Mariadb, "SET STATEMENT max_statement_time = 1 FOR UPDATE mysql.user SET plugin = '' WHERE user = 'a'"],
+    'mariadb EXECUTE IMMEDIATE' => [DbDriver::Mariadb, "EXECUTE IMMEDIATE 'UPDATE mysql.user SET plugin = 1 WHERE id = 2'"],
+    'mysql PREPARE FROM a string' => [DbDriver::Mysql, "PREPARE p FROM 'UPDATE mysql.user SET plugin = 1 WHERE id = 2'"],
+]);
+
+test('a system catalog write is rejected when the driver is unknown', function (string $sql) {
+    expect(inspect($sql)->passes())->toBeFalse();
+})->with([
+    'pg catalog' => ["UPDATE pg_catalog.pg_proc SET prosrc = 'x' WHERE oid = 1"],
+    'mysql schema' => ["UPDATE mysql.user SET plugin = '' WHERE user = 'a'"],
+]);
+
+test('reading a system catalog still passes', function (?DbDriver $driver, string $sql) {
+    expect(inspect($sql, $driver)->violations)->toBe([]);
+})->with([
+    'pg_proc' => [DbDriver::Pgsql, 'SELECT * FROM pg_proc'],
+    'pg_roles' => [DbDriver::Pgsql, 'SELECT rolname FROM pg_roles'],
+    'pg_catalog qualified' => [DbDriver::Pgsql, 'SELECT proname FROM pg_catalog.pg_proc LIMIT 5'],
+    'pg_catalog quoted' => [DbDriver::Pgsql, 'SELECT proname FROM "pg_catalog"."pg_proc" LIMIT 5'],
+    'a CTE that reads' => [DbDriver::Pgsql, 'WITH x AS (SELECT * FROM pg_proc) SELECT * FROM x LIMIT 5'],
+    'an update that reads a catalog in FROM' => [DbDriver::Pgsql, 'UPDATE t SET a = 1 FROM pg_proc WHERE t.id = pg_proc.oid'],
+    'a delete that reads a catalog in USING' => [DbDriver::Pgsql, 'DELETE FROM t USING pg_proc WHERE t.id = pg_proc.oid'],
+    'an insert that reads a catalog' => [DbDriver::Pgsql, 'INSERT INTO t SELECT oid FROM pg_proc'],
+    'a column named pg_x' => [DbDriver::Pgsql, 'UPDATE t SET pg_x = 1 WHERE id = 1'],
+    'a table that merely contains pg_' => [DbDriver::Pgsql, 'UPDATE my_pg_proc SET a = 1 WHERE id = 1'],
+    'a user table in a schema' => [DbDriver::Pgsql, 'UPDATE app.users SET a = 1 WHERE id = 1'],
+    'EXPLAIN without ANALYZE' => [DbDriver::Pgsql, "EXPLAIN UPDATE pg_proc SET prosrc = 'x' WHERE oid = 1"],
+    'EXPLAIN ANALYZE of a read' => [DbDriver::Pgsql, 'EXPLAIN ANALYZE SELECT * FROM pg_proc LIMIT 5'],
+    'a DO body that reads' => [DbDriver::Pgsql, 'DO $$ BEGIN PERFORM * FROM pg_proc; END $$'],
+    'a DO body with a catalog in FROM' => [DbDriver::Pgsql, 'DO $$ BEGIN UPDATE t SET a = 1 FROM pg_proc WHERE t.id = pg_proc.oid; END $$'],
+    'a DO body CTE that reads' => [DbDriver::Pgsql, 'DO $$ BEGIN WITH x AS (SELECT * FROM pg_proc) SELECT 1; END $$'],
+    'a DO body insert with a column list' => [DbDriver::Pgsql, 'DO $$ BEGIN INSERT INTO t (a) VALUES (1); END $$'],
+    'mysql select from mysql.user' => [DbDriver::Mysql, 'SELECT user FROM mysql.user LIMIT 5'],
+    'mysql update of a user table' => [DbDriver::Mysql, 'UPDATE mydb.users SET a = 1 WHERE id = 1'],
+    'mysql PREPARE of a read' => [DbDriver::Mysql, "PREPARE p FROM 'SELECT * FROM mysql.user'"],
+    'mysql table named mysql_x' => [DbDriver::Mysql, 'UPDATE mysql_x SET a = 1 WHERE id = 1'],
+    'pg_ table on mysql' => [DbDriver::Mysql, 'UPDATE pg_proc SET a = 1 WHERE id = 1'],
+    'mysql schema on postgres' => [DbDriver::Pgsql, 'UPDATE mysql.user SET a = 1 WHERE id = 1'],
+]);
+
+test('SET ROLE and SET SESSION AUTHORIZATION are rejected on PostgreSQL', function (string $sql, string $needle) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'SET ROLE' => ['SET ROLE postgres', 'SET ROLE is not allowed'],
+    'SET SESSION ROLE' => ['SET SESSION ROLE postgres', 'SET ROLE is not allowed'],
+    'SET LOCAL ROLE' => ['SET LOCAL ROLE postgres', 'SET ROLE is not allowed'],
+    'SET ROLE NONE' => ['SET ROLE NONE', 'SET ROLE is not allowed'],
+    'SET ROLE, quoted name' => ['SET ROLE "postgres"', 'SET ROLE is not allowed'],
+    'SET ROLE, string name' => ["SET ROLE 'postgres'", 'SET ROLE is not allowed'],
+    'SET role TO default' => ['SET role TO DEFAULT', 'SET ROLE is not allowed'],
+    'SET quoted role =' => ['SET "role" = postgres', 'role'],
+    'SET ROLE, lower case' => ['set role postgres', 'SET ROLE is not allowed'],
+    'SET ROLE, whitespace' => ["SET\n\t  ROLE   postgres", 'SET ROLE is not allowed'],
+    'SET ROLE, comments' => ['SET /* x */ ROLE -- y'."\n".' postgres', 'SET ROLE is not allowed'],
+    'RESET ROLE' => ['RESET ROLE', 'RESET ROLE is not allowed'],
+    'RESET ROLE, lower case with comments' => ['reset /* x */ role', 'RESET ROLE is not allowed'],
+    'SET SESSION AUTHORIZATION' => ['SET SESSION AUTHORIZATION postgres', 'SESSION AUTHORIZATION is not allowed'],
+    'SET SESSION SESSION AUTHORIZATION' => ['SET SESSION SESSION AUTHORIZATION postgres', 'SESSION AUTHORIZATION is not allowed'],
+    'SET LOCAL SESSION AUTHORIZATION' => ['SET LOCAL SESSION AUTHORIZATION postgres', 'SESSION AUTHORIZATION is not allowed'],
+    'SET SESSION AUTHORIZATION DEFAULT' => ['SET SESSION AUTHORIZATION DEFAULT', 'SESSION AUTHORIZATION is not allowed'],
+    'SET SESSION AUTHORIZATION, quoted' => ['SET SESSION AUTHORIZATION "postgres"', 'SESSION AUTHORIZATION is not allowed'],
+    'SET session_authorization' => ['SET session_authorization = postgres', 'session_authorization'],
+    'RESET SESSION AUTHORIZATION' => ['RESET SESSION AUTHORIZATION', 'SESSION AUTHORIZATION is not allowed'],
+    'RESET session_authorization' => ['RESET session_authorization', 'SESSION AUTHORIZATION is not allowed'],
+    'in a transaction' => ['BEGIN; SET ROLE postgres; SELECT 1; COMMIT;', 'SET ROLE is not allowed'],
+    'in a DO body' => ['DO $$ BEGIN SET ROLE postgres; END $$', 'SET ROLE is not allowed'],
+    'in a DO body, inside IF' => ['DO $$ BEGIN IF true THEN SET LOCAL ROLE postgres; END IF; END $$', 'SET ROLE is not allowed'],
+    'in a DO body, quoted' => ['DO $$ BEGIN SET "role" = postgres; END $$', 'SET ROLE is not allowed'],
+    'RESET ROLE in a DO body' => ['DO $$ BEGIN RESET ROLE; END $$', 'RESET ROLE is not allowed'],
+    'SESSION AUTHORIZATION in a DO body' => ['DO $$ BEGIN SET SESSION AUTHORIZATION postgres; END $$', 'SESSION AUTHORIZATION is not allowed'],
+    'set_config in a DO body' => ["DO \$\$ BEGIN PERFORM set_config('role', 'postgres', false); END \$\$", "set_config('role')"],
+    'in a function body' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN SET ROLE postgres; END $$', 'SET ROLE is not allowed'],
+    'EXPLAIN ANALYZE' => ['EXPLAIN ANALYZE SET ROLE postgres', 'SET ROLE is not allowed'],
+]);
+
+test('set_config of role and session_authorization is rejected', function (string $sql, string $needle) {
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        $result = inspect($sql, $driver);
+
+        expect($result->passes())->toBeFalse()
+            ->and(implode("\n", $result->violations))->toContain($needle);
+    }
+})->with([
+    'role' => ["SELECT set_config('role', 'postgres', false)", "set_config('role')"],
+    'role, local' => ["SELECT set_config('role', 'postgres', true)", "set_config('role')"],
+    'role, upper case name' => ["SELECT set_config('ROLE', 'postgres', false)", "set_config('role')"],
+    'role, upper case function' => ["SELECT SET_CONFIG('role', 'postgres', false)", "set_config('role')"],
+    'role, comments and whitespace' => ["SELECT set_config /* x */ (  'role' ,\n 'postgres', false)", "set_config('role')"],
+    'role, schema-qualified' => ["SELECT pg_catalog.set_config('role', 'postgres', false)", "set_config('role')"],
+    'session_authorization' => ["SELECT set_config('session_authorization', 'postgres', false)", "set_config('session_authorization')"],
+    'in a CTE' => ["WITH x AS (SELECT set_config('role', 'postgres', false)) SELECT * FROM x", "set_config('role')"],
+]);
+
+test('MySQL and MariaDB role switches are rejected', function (DbDriver $driver, string $sql, string $needle) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'mysql SET ROLE' => [DbDriver::Mysql, 'SET ROLE admin', 'SET ROLE is not allowed'],
+    'mysql SET ROLE ALL' => [DbDriver::Mysql, 'SET ROLE ALL', 'SET ROLE is not allowed'],
+    'mysql SET ROLE NONE' => [DbDriver::Mysql, 'SET ROLE NONE', 'SET ROLE is not allowed'],
+    'mysql SET ROLE DEFAULT' => [DbDriver::Mysql, 'SET ROLE DEFAULT', 'SET ROLE is not allowed'],
+    'mysql SET ROLE, backticks' => [DbDriver::Mysql, 'SET ROLE `admin`', 'SET ROLE is not allowed'],
+    'mysql SET ROLE, lower case with comments' => [DbDriver::Mysql, 'set /* x */ role admin', 'SET ROLE is not allowed'],
+    'mysql SET DEFAULT ROLE' => [DbDriver::Mysql, "SET DEFAULT ROLE admin TO 'u'@'%'", 'SET DEFAULT ROLE is not allowed'],
+    'mysql SET DEFAULT ROLE ALL' => [DbDriver::Mysql, "SET DEFAULT ROLE ALL TO 'u'@'%'", 'SET DEFAULT ROLE is not allowed'],
+    'mariadb SET ROLE' => [DbDriver::Mariadb, 'SET ROLE admin', 'SET ROLE is not allowed'],
+    'mariadb SET DEFAULT ROLE' => [DbDriver::Mariadb, "SET DEFAULT ROLE admin FOR 'u'@'%'", 'SET DEFAULT ROLE is not allowed'],
+    'mariadb SET STATEMENT ... FOR SET ROLE' => [DbDriver::Mariadb, 'SET STATEMENT max_statement_time = 1 FOR SET ROLE admin', 'SET ROLE is not allowed'],
+    'mysql PREPARE FROM SET ROLE' => [DbDriver::Mysql, "PREPARE p FROM 'SET ROLE admin'", 'SET ROLE is not allowed'],
+    'unknown driver SET ROLE' => [DbDriver::Sqlite, 'SET ROLE admin', 'SET ROLE is not allowed'],
+]);
+
+test('READ WRITE is rejected in every transaction statement', function (string $sql) {
+    foreach ([DbDriver::Pgsql, DbDriver::Mysql, DbDriver::Mariadb, null] as $driver) {
+        $result = inspect($sql, $driver);
+
+        expect($result->passes())->toBeFalse("passed on {$driver?->value}: {$sql}")
+            ->and(implode("\n", $result->violations))->toContain('READ WRITE is not allowed');
+    }
+})->with([
+    'SET TRANSACTION' => ['SET TRANSACTION READ WRITE'],
+    'SET SESSION TRANSACTION' => ['SET SESSION TRANSACTION READ WRITE'],
+    'SET LOCAL TRANSACTION' => ['SET LOCAL TRANSACTION READ WRITE'],
+    'SET TRANSACTION with an isolation level' => ['SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE'],
+    'SET TRANSACTION with an isolation level after' => ['SET TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE'],
+    'SET SESSION CHARACTERISTICS' => ['SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE'],
+    'SET SESSION CHARACTERISTICS with an isolation level' => ['SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE'],
+    'START TRANSACTION' => ['START TRANSACTION READ WRITE'],
+    'START TRANSACTION, isolation first' => ['START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE'],
+    'BEGIN' => ['BEGIN READ WRITE'],
+    'BEGIN TRANSACTION' => ['BEGIN TRANSACTION READ WRITE'],
+    'BEGIN WORK' => ['BEGIN WORK READ WRITE'],
+    'lower case' => ['set transaction read write'],
+    'whitespace' => ["SET   TRANSACTION\n\tREAD\n  WRITE"],
+    'comments' => ['SET TRANSACTION READ /* x */ WRITE'],
+    'inside a transaction block' => ['BEGIN; SET TRANSACTION READ WRITE; SELECT 1; COMMIT;'],
+]);
+
+test('READ WRITE is rejected inside a DO body', function () {
+    $result = inspect('DO $$ BEGIN SET TRANSACTION READ WRITE; END $$', DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('READ WRITE is not allowed');
+});
+
+test('READ ONLY transactions and ordinary SET statements still pass', function (?DbDriver $driver, string $sql) {
+    expect(inspect($sql, $driver)->violations)->toBe([]);
+})->with([
+    'SET TRANSACTION READ ONLY' => [DbDriver::Pgsql, 'SET TRANSACTION READ ONLY'],
+    'SET TRANSACTION READ ONLY, mysql' => [DbDriver::Mysql, 'SET TRANSACTION READ ONLY'],
+    'START TRANSACTION READ ONLY' => [DbDriver::Mysql, 'START TRANSACTION READ ONLY'],
+    'BEGIN READ ONLY' => [DbDriver::Pgsql, 'BEGIN READ ONLY'],
+    'SET SESSION CHARACTERISTICS READ ONLY' => [DbDriver::Pgsql, 'SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY'],
+    'SET TRANSACTION with an isolation level' => [DbDriver::Pgsql, 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY'],
+    'SET search_path' => [DbDriver::Pgsql, 'SET search_path = app, public'],
+    'SET search_path TO' => [DbDriver::Pgsql, 'SET search_path TO app'],
+    'SET LOCAL statement_timeout' => [DbDriver::Pgsql, "SET LOCAL statement_timeout = '5s'"],
+    'SET work_mem' => [DbDriver::Pgsql, "SET work_mem = '64MB'"],
+    'SET TIME ZONE' => [DbDriver::Pgsql, "SET TIME ZONE 'UTC'"],
+    'a column called role' => [DbDriver::Pgsql, 'SELECT role FROM users LIMIT 5'],
+    'a string that says READ WRITE' => [DbDriver::Pgsql, "SELECT 'READ WRITE' AS mode LIMIT 1"],
+    'a column called read_write' => [DbDriver::Mysql, 'SELECT read_write FROM t LIMIT 5'],
+    'set_config of a harmless variable' => [DbDriver::Pgsql, "SELECT set_config('search_path', 'app', false)"],
+    'current_setting of role' => [DbDriver::Pgsql, "SELECT current_setting('role')"],
+    'SELECT current_user' => [DbDriver::Pgsql, 'SELECT current_user'],
+]);
+
+test('role and session_authorization are on the dangerous variable list', function () {
+    expect(SqlInspector::DANGEROUS_VARIABLES)->toContain('role', 'session_authorization')
+        ->and(config('queryproxy.dangerous_variables'))->toContain('role', 'session_authorization');
+});
+
+test('an INSERT or MERGE inside a CTE body cannot write a system catalog', function (?DbDriver $driver, string $sql) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('on the system catalog table');
+})->with([
+    'INSERT into pg_catalog.pg_language' => [DbDriver::Pgsql, 'WITH b AS (INSERT INTO pg_catalog.pg_language SELECT * FROM t RETURNING 1) SELECT 1'],
+    'INSERT into pg_language, main INSERT' => [DbDriver::Pgsql, 'WITH b AS (INSERT INTO pg_language VALUES (1) RETURNING 1) INSERT INTO t SELECT 1 FROM b'],
+    'INSERT into a quoted catalog' => [DbDriver::Pgsql, 'WITH b AS (INSERT INTO "pg_catalog"."pg_proc" VALUES (1) RETURNING 1) SELECT 1'],
+    'MERGE into pg_proc' => [DbDriver::Pgsql, 'WITH b AS (MERGE INTO pg_proc p USING t ON true WHEN MATCHED THEN DELETE RETURNING 1) SELECT 1'],
+    'second CTE of the list' => [DbDriver::Pgsql, 'WITH a AS (SELECT 1), b AS (INSERT INTO pg_proc VALUES (1) RETURNING 1) SELECT 1'],
+    'INSERT in a nested WITH' => [DbDriver::Pgsql, 'WITH b AS (WITH c AS (SELECT 1) INSERT INTO pg_proc SELECT * FROM c RETURNING 1) SELECT 1'],
+    'unknown driver' => [null, 'WITH b AS (INSERT INTO pg_proc VALUES (1) RETURNING 1) SELECT 1'],
+]);
+
+test('a CTE whose INSERT or SELECT only reads a system catalog still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'INSERT that reads a catalog' => ['WITH b AS (INSERT INTO t SELECT oid FROM pg_proc RETURNING 1) SELECT 1 FROM b LIMIT 5'],
+    'INSERT into a user table' => ['WITH b AS (INSERT INTO app.t VALUES (1) RETURNING id) SELECT * FROM b LIMIT 5'],
+    'SELECT from a catalog' => ['WITH a AS (SELECT * FROM pg_proc) SELECT 1 FROM a LIMIT 5'],
+]);
+
+test('a quoted RESET of role or session_authorization is rejected like the unquoted spelling', function (string $sql, string $needle) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($needle);
+})->with([
+    'RESET "role"' => ['RESET "role"', 'RESET ROLE is not allowed'],
+    'RESET "ROLE"' => ['RESET "ROLE"', 'RESET ROLE is not allowed'],
+    'RESET "role", comments' => ['reset /* x */ "role"', 'RESET ROLE is not allowed'],
+    'RESET "session_authorization"' => ['RESET "session_authorization"', 'SESSION AUTHORIZATION is not allowed'],
+    'RESET "SESSION_AUTHORIZATION"' => ['RESET "SESSION_AUTHORIZATION"', 'SESSION AUTHORIZATION is not allowed'],
+    'RESET session_authorization' => ['RESET session_authorization', 'SESSION AUTHORIZATION is not allowed'],
+    'RESET "role" in a DO body' => ['DO $$ BEGIN RESET "role"; END $$', 'RESET ROLE is not allowed'],
+    'RESET "session_authorization" in a DO body' => ['DO $$ BEGIN RESET "session_authorization"; END $$', 'SESSION AUTHORIZATION is not allowed'],
+]);
+
+test('RESET of any other setting still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'RESET search_path' => ['RESET search_path'],
+    'RESET "search_path"' => ['RESET "search_path"'],
+    'RESET statement_timeout' => ['RESET statement_timeout'],
+    'RESET ALL' => ['RESET ALL'],
+    'RESET in a DO body' => ['DO $$ BEGIN RESET search_path; END $$'],
+]);
+
+test('a statement that switches identity is reported once', function (string $sql) {
+    $roleViolations = array_filter(
+        inspect($sql, DbDriver::Pgsql)->violations,
+        fn (string $violation): bool => stripos($violation, 'role') !== false || stripos($violation, 'authorization') !== false,
+    );
+
+    expect($roleViolations)->toHaveCount(1);
+})->with([
+    'SET ROLE' => ['SET ROLE postgres'],
+    'SET LOCAL ROLE NONE' => ['SET LOCAL ROLE NONE'],
+    'SET role TO DEFAULT' => ['SET role TO DEFAULT'],
+    'SET SESSION AUTHORIZATION' => ['SET SESSION AUTHORIZATION postgres'],
+    'RESET ROLE' => ['RESET ROLE'],
+    'RESET "role"' => ['RESET "role"'],
+    'PREPARE of SET ROLE' => ['PREPARE p AS SET ROLE postgres'],
+    'SET ROLE in a DO body' => ['DO $$ BEGIN SET ROLE postgres; END $$'],
+]);
+
+test('SET "role" is still reported through the dangerous variable list', function () {
+    $violations = inspect('SET "role" = postgres', DbDriver::Pgsql)->violations;
+
+    expect($violations)->toHaveCount(1)
+        ->and($violations[0])->toContain('role changes the privileges or the user the session runs as.');
+});
+
+test('a maximum-size statement full of parenthesised keywords is scanned for catalog writes in linear time', function (?DbDriver $driver, string $head, string $unit, string $tail) {
+    // Every parenthesis followed by a keyword used to start a scan of the
+    // rest of the statement, so a quarter of the input took about a sixteenth
+    // of the time instead of a quarter: 63 KB took 25 seconds.
+    $statement = fn (int $bytes): string => $head.str_repeat($unit, intdiv($bytes - strlen($head) - strlen($tail), strlen($unit))).$tail;
+    $passes = true;
+    $elapsed = function (string $sql) use ($driver, &$passes): float {
+        $best = INF;
+
+        gc_disable();
+
+        try {
+            foreach (range(1, 2) as $run) {
+                $start = hrtime(true);
+                $passes = inspect($sql, $driver)->passes() && $passes;
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    $baseline = $elapsed($statement(intdiv(60000, 4)));
+    $maximum = $elapsed($statement(60000));
+
+    expect($passes)->toBeTrue()
+        ->and($maximum)->toBeLessThan($baseline * 8 + 0.5);
+})->with([
+    'DO body, parenthesised NOT' => [DbDriver::Pgsql, 'DO $$DECLARE v int; BEGIN SELECT ', '(NOT b),', ' 1 INTO v; END$$'],
+    'DO body, nested UPDATE' => [DbDriver::Pgsql, 'DO $$BEGIN SELECT ', '(UPDATE t),', ' 1; END$$'],
+    'top level, empty parentheses before UPDATE, mysql' => [DbDriver::Mysql, 'SELECT 1 ', '() UPDATE t ', ''],
+    'top level, empty parentheses before UPDATE, unknown driver' => [null, 'SELECT 1 ', '() UPDATE t ', ''],
+]);
+
+// Review round 2: every name this phase compares (a RESET variable, a SET
+// variable, a catalog table or schema) goes through the same normalization
+// (SqlInspector::functionNameAt), and every place a PL/pgSQL body can embed
+// DML is scanned.
+
+test('RESET of role or session_authorization is refused however the name is spelled', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain($message);
+})->with([
+    'U& role' => ['RESET U&"role"', 'RESET ROLE is not allowed'],
+    'U& role, escaped letter' => ['RESET U&"\0072ole"', 'RESET ROLE is not allowed'],
+    'U& role, six-digit escape' => ['RESET U&"\+000072ole"', 'RESET ROLE is not allowed'],
+    'U& role, upper case' => ['RESET U&"ROLE"', 'RESET ROLE is not allowed'],
+    'U& role, comment before the name' => ['RESET /* c */ U&"role"', 'RESET ROLE is not allowed'],
+    'U& role, after BEGIN' => ['BEGIN; RESET U&"role"', 'RESET ROLE is not allowed'],
+    'U& session_authorization' => ['RESET U&"session_authorization"', 'SESSION AUTHORIZATION is not allowed'],
+    'U& session_authorization, escaped letter' => ['RESET U&"\0073ession_authorization"', 'SESSION AUTHORIZATION is not allowed'],
+    'quoted role' => ['RESET "role"', 'RESET ROLE is not allowed'],
+    'quoted session_authorization' => ['RESET "session_authorization"', 'SESSION AUTHORIZATION is not allowed'],
+    'U& role in a DO body' => ['DO $$ BEGIN RESET U&"role"; END $$', 'Inside the DO block body: RESET ROLE is not allowed'],
+    'U& escaped role in a DO body' => ['DO $$ BEGIN RESET U&"\0072ole"; END $$', 'Inside the DO block body: RESET ROLE is not allowed'],
+    'U& session_authorization in a function body' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN RESET U&"session_authorization"; END $$', 'Inside the function body: SET / RESET SESSION AUTHORIZATION is not allowed'],
+]);
+
+test('RESET of an unrelated setting, quoted or Unicode-escaped, still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'RESET ALL' => ['RESET ALL'],
+    'RESET search_path' => ['RESET search_path'],
+    'U& search_path' => ['RESET U&"search_path"'],
+    'U& rolex' => ['RESET U&"rolex"'],
+    'quoted rolex' => ['RESET "rolex"'],
+    'DO body, U& statement_timeout' => ['DO $$ BEGIN RESET U&"statement_timeout"; END $$'],
+]);
+
+test('a SET of role through a Unicode-escaped name is refused', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'U& role' => ['SET U&"role" = postgres'],
+    'U& escaped role' => ['SET LOCAL U&"\0072ole" TO x'],
+    'U& session_replication_role' => ['SET U&"session\005Freplication_role" = replica'],
+    'DO body' => ['DO $$ BEGIN SET U&"\0072ole" = x; END $$'],
+]);
+
+test('a catalog write is refused whatever way its table or schema name is written', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('on the system catalog table');
+})->with([
+    'UPDATE U& table' => ['UPDATE U&"pg_proc" SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE U& table, escaped letter' => ['UPDATE U&"\0070g_proc" SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE U& table, six-digit escape' => ['UPDATE U&"\+000070g_proc" SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE U& schema, bare table' => ['UPDATE U&"pg_catalog".pg_proc SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE U& schema, escaped letter' => ['UPDATE U&"pg_\0063atalog".pg_proc SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE bare schema, U& table' => ['UPDATE pg_catalog.U&"pg_proc" SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'UPDATE ONLY U& table' => ['UPDATE ONLY U&"pg_proc" SET prosrc = \'x\' WHERE oid = 1', DbDriver::Pgsql],
+    'INSERT U& table' => ['INSERT INTO U&"pg_language" VALUES (1)', DbDriver::Pgsql],
+    'DELETE U& schema and table' => ['DELETE FROM U&"pg_catalog".U&"pg_proc" WHERE oid = 1', DbDriver::Pgsql],
+    'MERGE U& table' => ['MERGE INTO U&"pg_proc" USING t ON true WHEN MATCHED THEN DELETE', DbDriver::Pgsql],
+    'CTE INSERT U& table' => ['WITH b AS (INSERT INTO U&"pg_proc" VALUES (1) RETURNING 1) SELECT 1', DbDriver::Pgsql],
+    'CTE INSERT U& schema' => ['WITH b AS (INSERT INTO U&"pg_catalog".pg_proc VALUES (1) RETURNING 1) SELECT 1', DbDriver::Pgsql],
+    'CTE-led DELETE U& table' => ['WITH a AS (SELECT 1) DELETE FROM U&"pg_proc" WHERE oid = 1', DbDriver::Pgsql],
+    'unknown driver' => ['UPDATE U&"pg_proc" SET prosrc = \'x\' WHERE oid = 1', null],
+    'mysql schema as U&' => ['UPDATE U&"mysql".user SET a = 1 WHERE b = 1', DbDriver::Mysql],
+    'DO body UPDATE U& table' => ['DO $$ BEGIN UPDATE U&"pg_proc" SET a = 1; END $$', DbDriver::Pgsql],
+    'DO body UPDATE U& schema' => ['DO $$ BEGIN UPDATE U&"pg_catalog".pg_proc SET a = 1; END $$', DbDriver::Pgsql],
+    'DO body CTE INSERT U& table' => ['DO $$ BEGIN WITH b AS (INSERT INTO U&"\0070g_proc" VALUES (1) RETURNING 1) SELECT 1; END $$', DbDriver::Pgsql],
+]);
+
+test('a write to a user table whose name is Unicode-escaped still passes', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'UPDATE U& table' => ['UPDATE U&"accounts" SET a = 1 WHERE id = 1'],
+    'UPDATE U& schema in public' => ['UPDATE U&"public".U&"pg_x" SET a = 1 WHERE id = 1'],
+    'DELETE U& table' => ['DELETE FROM U&"\0061ccounts" WHERE id = 1'],
+    'INSERT U& table' => ['INSERT INTO U&"accounts" VALUES (1)'],
+    'reading a U& catalog' => ['SELECT * FROM U&"pg_proc" LIMIT 1'],
+    'UPDATE ... FROM a U& catalog' => ['UPDATE t SET a = 1 FROM U&"pg_proc" p WHERE p.oid = t.id'],
+]);
+
+test('a catalog write embedded in a PL/pgSQL body is refused at every place the body can hold DML', function (string $sql) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and(implode("\n", $result->violations))->toContain('on the system catalog table');
+})->with([
+    'FOR ... IN UPDATE' => ['DO $$ DECLARE r record; BEGIN FOR r IN UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1 RETURNING oid LOOP END LOOP; END $$'],
+    'FOR ... IN DELETE' => ['DO $$ DECLARE r record; BEGIN FOR r IN DELETE FROM pg_proc WHERE oid = 1 RETURNING oid LOOP END LOOP; END $$'],
+    'FOR ... IN INSERT' => ['DO $$ DECLARE r record; BEGIN FOR r IN INSERT INTO pg_proc (oid) VALUES (1) RETURNING oid LOOP END LOOP; END $$'],
+    'FOR ... IN MERGE' => ['DO $$ BEGIN FOR r IN MERGE INTO pg_proc USING t ON true WHEN MATCHED THEN DELETE RETURNING 1 LOOP END LOOP; END $$'],
+    'FOR ... IN WITH ... UPDATE' => ['DO $$ BEGIN FOR r IN WITH x AS (SELECT 1) UPDATE pg_proc SET a = 1 RETURNING oid LOOP END LOOP; END $$'],
+    'labelled FOR ... IN UPDATE' => ['DO $$ BEGIN <<l>> FOR r IN UPDATE pg_proc SET a = 1 RETURNING oid LOOP END LOOP; END $$'],
+    'FOR ... IN UPDATE of a U& table' => ['DO $$ BEGIN FOR r IN UPDATE U&"\0070g_proc" SET a = 1 RETURNING oid LOOP END LOOP; END $$'],
+    'FOR ... IN UPDATE in a function' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN FOR r IN UPDATE pg_proc SET a = 1 RETURNING oid LOOP RETURN NEXT r.oid; END LOOP; END $$'],
+    'RETURN QUERY UPDATE' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY UPDATE pg_proc SET prosrc = \'x\' WHERE oid = 1 RETURNING oid; END $$'],
+    'RETURN QUERY DELETE of a U& table' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY DELETE FROM U&"pg_catalog".U&"pg_proc" RETURNING oid; END $$'],
+    'RETURN QUERY INSERT' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY INSERT INTO pg_catalog.pg_proc (oid) VALUES (1) RETURNING oid; END $$'],
+    'RETURN QUERY WITH ... UPDATE' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY WITH x AS (SELECT 1) UPDATE pg_proc SET prosrc = \'x\' RETURNING oid; END $$'],
+    'OPEN cursor FOR UPDATE' => ['DO $$ DECLARE c refcursor; BEGIN OPEN c FOR UPDATE pg_proc SET a = 1 RETURNING oid; END $$'],
+    'OPEN cursor FOR DELETE' => ['DO $$ DECLARE c refcursor; BEGIN OPEN c FOR DELETE FROM pg_proc RETURNING oid; END $$'],
+    'DECLARE CURSOR FOR UPDATE' => ['DO $$ DECLARE c CURSOR FOR UPDATE pg_proc SET a = 1 RETURNING oid; BEGIN END $$'],
+    'DECLARE CURSOR WITH HOLD FOR DELETE' => ['DO $$ DECLARE c NO SCROLL CURSOR WITH HOLD FOR DELETE FROM pg_proc RETURNING oid; BEGIN END $$'],
+    'DECLARE CURSOR FOR UPDATE in a function' => ['CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ DECLARE c CURSOR FOR UPDATE pg_proc SET a = 1 RETURNING oid; BEGIN END $$'],
+    'PERFORM over a data-modifying CTE' => ['DO $$ BEGIN PERFORM (WITH x AS (UPDATE pg_proc SET a = 1 RETURNING 1) SELECT 1); END $$'],
+    'PERFORM ... FROM a data-modifying CTE' => ['DO $$ BEGIN PERFORM 1 FROM (WITH x AS (UPDATE pg_proc SET a = 1 RETURNING 1) SELECT 1) q; END $$'],
+    'EXPLAIN ANALYZE UPDATE' => ['DO $$ BEGIN EXPLAIN ANALYZE UPDATE pg_proc SET a = 1; END $$'],
+    'EXPLAIN ANALYZE VERBOSE UPDATE' => ['DO $$ BEGIN EXPLAIN ANALYZE VERBOSE UPDATE pg_proc SET a = 1; END $$'],
+    'EXPLAIN (ANALYZE) UPDATE' => ['DO $$ BEGIN EXPLAIN (ANALYZE) UPDATE pg_proc SET a = 1; END $$'],
+    'PREPARE AS UPDATE' => ['DO $$ BEGIN PREPARE p AS UPDATE pg_proc SET a = 1; END $$'],
+    'PREPARE with types AS DELETE' => ['DO $$ BEGIN PREPARE p (int) AS DELETE FROM pg_proc WHERE oid = $1; END $$'],
+    'COPY (UPDATE ...)' => ['DO $$ BEGIN COPY (UPDATE pg_proc SET a = 1 RETURNING oid) TO STDOUT; END $$'],
+    'inside IF' => ['DO $$ BEGIN IF true THEN UPDATE pg_proc SET a = 1; END IF; END $$'],
+    'inside a loop' => ['DO $$ BEGIN WHILE true LOOP UPDATE pg_proc SET a = 1; END LOOP; END $$'],
+    'inside an exception handler' => ['DO $$ BEGIN PERFORM 1; EXCEPTION WHEN others THEN UPDATE pg_proc SET a = 1; END $$'],
+    'after a FOR ... SELECT loop' => ['DO $$ BEGIN FOR r IN SELECT 1 LOOP UPDATE U&"pg_proc" SET a = 1; END LOOP; END $$'],
+]);
+
+test('PL/pgSQL bodies that only read a catalog or write a user table still pass', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
+})->with([
+    'FOR ... IN SELECT from a catalog' => ['DO $$ BEGIN FOR r IN SELECT * FROM pg_proc LOOP END LOOP; END $$'],
+    'FOR ... IN UPDATE of a user table' => ['DO $$ BEGIN FOR r IN UPDATE t SET a = 1 RETURNING id LOOP END LOOP; END $$'],
+    'FOR ... IN INSERT ... SELECT from a catalog' => ['DO $$ BEGIN FOR r IN INSERT INTO t SELECT * FROM pg_proc RETURNING id LOOP END LOOP; END $$'],
+    'FOR ... IN SELECT ... FOR UPDATE' => ['DO $$ BEGIN FOR r IN SELECT * FROM t FOR UPDATE LOOP END LOOP; END $$'],
+    'FOR ... IN SELECT ... FOR UPDATE OF' => ['DO $$ BEGIN FOR r IN SELECT * FROM t FOR UPDATE OF t SKIP LOCKED LOOP END LOOP; END $$'],
+    'FOR ... IN SELECT from a catalog FOR SHARE' => ['DO $$ BEGIN FOR r IN SELECT * FROM pg_proc FOR SHARE LOOP END LOOP; END $$'],
+    'OPEN cursor FOR SELECT from a catalog' => ['DO $$ BEGIN OPEN c FOR SELECT * FROM pg_proc; END $$'],
+    'OPEN cursor FOR SELECT ... FOR UPDATE' => ['DO $$ BEGIN OPEN c FOR SELECT * FROM t FOR UPDATE; END $$'],
+    'RETURN QUERY SELECT from a catalog' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT oid FROM pg_proc; END $$'],
+    'RETURN QUERY UPDATE of a user table' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY UPDATE t SET a = 1 RETURNING oid; END $$'],
+    'RETURN QUERY INSERT ... SELECT from a catalog' => ['CREATE FUNCTION f() RETURNS SETOF oid LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY INSERT INTO t SELECT oid FROM pg_proc RETURNING oid; END $$'],
+    'ON CONFLICT DO UPDATE' => ['DO $$ BEGIN INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2; END $$'],
+    'UPDATE with an IN subquery' => ['DO $$ BEGIN UPDATE t SET a = 1 WHERE b IN (SELECT 1); END $$'],
+    'PREPARE AS UPDATE of a user table' => ['DO $$ BEGIN PREPARE p AS UPDATE t SET a = 1; END $$'],
+    'policy FOR DELETE USING a catalog subquery' => ['DO $$ BEGIN CREATE POLICY p ON t FOR DELETE USING (a IN (SELECT oid FROM pg_proc)); END $$'],
+    'column alias spelled delete after INTO' => ['DO $$ DECLARE v int; BEGIN SELECT 1 AS delete INTO v FROM pg_proc; END $$'],
+    'column alias spelled delete' => ['DO $$ BEGIN PERFORM 1; SELECT 1 AS delete FROM pg_proc; END $$'],
+]);
+
+test('DO-body fail-closed relaxations keep refusing a catalog DELETE or UPDATE', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->violations)->not->toBe([]);
+})->with([
+    'FOR ... IN DELETE' => ['DO $$ BEGIN FOR r IN DELETE FROM pg_proc RETURNING 1 LOOP NULL; END LOOP; END $$'],
+    'RETURN QUERY DELETE' => ['DO $$ BEGIN RETURN QUERY DELETE FROM pg_proc; END $$'],
+    'OPEN cursor FOR DELETE' => ['DO $$ BEGIN OPEN c FOR DELETE FROM pg_proc; END $$'],
+    'PREPARE AS DELETE' => ['DO $$ BEGIN PREPARE p AS DELETE FROM pg_proc; END $$'],
+    'PREPARE with parameter types AS DELETE' => ['DO $$ BEGIN PREPARE p (int) AS DELETE FROM pg_proc; END $$'],
+    'PREPARE AS UPDATE' => ['DO $$ BEGIN PREPARE p AS UPDATE pg_proc SET a = 1; END $$'],
+    'EXPLAIN ANALYZE DELETE' => ['DO $$ BEGIN EXPLAIN ANALYZE DELETE FROM pg_proc; END $$'],
+    'DELETE FROM ONLY' => ['DO $$ BEGIN DELETE FROM ONLY pg_proc; END $$'],
+    'qualified DELETE' => ['DO $$ BEGIN DELETE FROM pg_catalog.pg_proc; END $$'],
+    'DELETE with an IN subquery' => ['DO $$ BEGIN DELETE FROM pg_proc WHERE x IN (SELECT 1 FROM t); END $$'],
+    'DELETE inside a CTE' => ['DO $$ BEGIN WITH d AS (DELETE FROM pg_proc RETURNING 1) SELECT 1; END $$'],
+    'alias spelled delete next to a PREPARE (fail-closed)' => ['DO $$ BEGIN PREPARE p AS SELECT 1 AS delete FROM pg_proc; END $$'],
+]);
+
+test('USE mysql is refused on the MySQL family because it makes the catalog the default schema', function (?DbDriver $driver, string $sql) {
+    $violations = inspect($sql, $driver)->violations;
+
+    expect($violations)->not->toBe([])
+        ->and(implode(' | ', $violations))->toContain('USE mysql');
+})->with(function () {
+    $statements = [
+        'bare' => 'USE mysql',
+        'upper case' => 'USE MYSQL',
+        'mixed case' => 'USE MySql',
+        'backticks' => 'USE `mysql`',
+        'backticks mixed case' => 'use `MySQL`',
+        'block comment between' => 'USE /* x */ mysql',
+        'line comment between' => "USE -- x\n mysql",
+        'trailing semicolon' => 'USE mysql;',
+        'before a query' => 'USE mysql; SELECT * FROM user',
+        'inside BEGIN/COMMIT' => 'BEGIN; USE mysql; COMMIT',
+        'inside START TRANSACTION' => 'START TRANSACTION; USE mysql; SELECT 1; COMMIT',
+        'PREPARE FROM' => "PREPARE p FROM 'USE mysql'",
+        'PREPARE FROM mixed case' => "PREPARE p FROM 'use `MySQL`'",
+        'EXECUTE IMMEDIATE' => "EXECUTE IMMEDIATE 'USE mysql'",
+    ];
+
+    foreach ([DbDriver::Mysql, DbDriver::Mariadb, null] as $driver) {
+        foreach ($statements as $label => $sql) {
+            yield ($driver?->value ?? 'no driver').': '.$label => [$driver, $sql];
+        }
+    }
+
+    // With no driver the guard already refuses every executable comment.
+    foreach ([DbDriver::Mysql, DbDriver::Mariadb] as $driver) {
+        yield $driver->value.': executable comment name' => [$driver, 'USE /*!50000 mysql */'];
+        yield $driver->value.': executable comment keyword' => [$driver, '/*!50000 USE */ mysql'];
+    }
+
+    yield 'mariadb: SET STATEMENT ... FOR USE' => [DbDriver::Mariadb, 'SET STATEMENT max_statement_time=1 FOR USE mysql'];
+});
+
+test('USE of another schema and index hints still pass; USE mysql is not a PostgreSQL concern', function (?DbDriver $driver, string $sql) {
+    expect(inspect($sql, $driver)->violations)->toBe([]);
+})->with([
+    'USE app' => [DbDriver::Mysql, 'USE app'],
+    'USE mysqlx' => [DbDriver::Mysql, 'USE mysqlx'],
+    'USE mysql_app' => [DbDriver::Mariadb, 'USE mysql_app'],
+    'USE backticked app' => [DbDriver::Mysql, 'USE `app`'],
+    'USE with no driver' => [null, 'USE app'],
+    'USE INDEX hint' => [DbDriver::Mysql, 'SELECT * FROM t USE INDEX (i)'],
+    'USE KEY hint' => [DbDriver::Mariadb, 'SELECT * FROM t USE KEY (k)'],
+    'USE INDEX hint named mysql' => [DbDriver::Mysql, 'SELECT * FROM t USE INDEX (mysql)'],
+    'USE mysql on PostgreSQL' => [DbDriver::Pgsql, 'USE mysql'],
+]);
+
+test('a U& name the guard cannot decode is refused by every name comparison', function () {
+    $inspector = app(SqlInspector::class);
+    $call = function (string $method, string $sql, mixed ...$arguments) use ($inspector): array {
+        $reflection = new ReflectionMethod(SqlInspector::class, $method);
+        $tokens = $reflection->getDeclaringClass()->getMethod('significantTokens');
+        $tokens = $tokens->invoke($inspector, $sql);
+
+        return $reflection->invoke($inspector, $tokens, ...$arguments);
+    };
+
+    expect($call('resetViolations', 'RESET U&"\zz"'))->not->toBe([])
+        ->and($call('resetViolations', 'RESET U&"\0072ole"'))->not->toBe([])
+        ->and($call('serverVariableViolations', 'SET U&"\zz" = 1', DbDriver::Pgsql))->not->toBe([])
+        ->and($call('catalogWriteViolations', 'UPDATE U&"\zz" SET a = 1', DbDriver::Pgsql))->not->toBe([])
+        ->and($call('catalogWriteViolations', 'INSERT INTO U&"pg_\zz" VALUES (1)', DbDriver::Pgsql))->not->toBe([])
+        ->and($call('catalogWriteViolations', 'DELETE FROM pg_catalog.U&"\D800x" WHERE a = 1', DbDriver::Pgsql))->not->toBe([])
+        ->and($call('catalogWriteViolations', 'UPDATE U&"accounts" SET a = 1', DbDriver::Pgsql))->toBe([]);
+});
+
+test('a U& name the guard cannot decode is rejected end to end', function (string $sql) {
+    expect(inspect($sql, DbDriver::Pgsql)->passes())->toBeFalse();
+})->with([
+    'RESET, bad escape' => ['RESET U&"\zz"'],
+    'RESET, UESCAPE' => ['RESET U&"!0072ole" UESCAPE \'!\''],
+    'SET, bad escape' => ['SET U&"\zz" = 1'],
+    'UPDATE, bad escape' => ['UPDATE U&"pg_\zz" SET a = 1 WHERE b = 1'],
+    'UPDATE, UESCAPE' => ['UPDATE U&"!0070g_proc" UESCAPE \'!\' SET a = 1 WHERE b = 1'],
+]);
+
+test('a maximum-size statement full of PL/pgSQL statement introducers is scanned in linear time', function (string $head, string $unit, string $tail) {
+    $statement = fn (int $bytes): string => $head.str_repeat($unit, intdiv($bytes - strlen($head) - strlen($tail), strlen($unit))).$tail;
+    $passes = true;
+    $elapsed = function (string $sql) use (&$passes): float {
+        $best = INF;
+
+        gc_disable();
+
+        try {
+            foreach (range(1, 2) as $run) {
+                $start = hrtime(true);
+                $passes = inspect($sql, DbDriver::Pgsql)->passes() && $passes;
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    $baseline = $elapsed($statement(intdiv(60000, 4)));
+    $maximum = $elapsed($statement(60000));
+
+    expect($passes)->toBeTrue()
+        ->and($maximum)->toBeLessThan($baseline * 8 + 0.5);
+})->with([
+    'FOR UPDATE locking clauses' => ['DO $$BEGIN PERFORM 1 FROM t ', 'FOR UPDATE ', '; END$$'],
+    'IN UPDATE' => ['DO $$BEGIN SELECT 1 ', 'IN UPDATE t ', '; END$$'],
+    'AS UPDATE' => ['DO $$BEGIN SELECT 1 ', 'AS UPDATE t ', '; END$$'],
+    'U& names in RESET statements' => ['DO $$BEGIN ', 'RESET U&"search_path"; ', 'END$$'],
+]);

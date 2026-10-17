@@ -53,7 +53,9 @@ return [
     | set_config() with a listed name is refused on every driver. sql_mode
     | is the exception to the scope rule: it changes how quotes and
     | backslashes are read, so a write to it is refused in every scope.
-    | max_connections, wait_timeout, work_mem and the rest pass.
+    | `role` and `session_authorization` are listed as well, so set_config()
+    | cannot switch the session's role or user. max_connections, wait_timeout,
+    | work_mem and the rest pass.
     | Names are matched exactly, case-insensitively — there is no wildcard,
     | so related variables (`general_log`, `general_log_file`) are listed
     | one by one.
