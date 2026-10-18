@@ -276,7 +276,7 @@ All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
 ## Project Status
 
-**Beta.** QueryProxy is at version 0.2.5; breaking changes can land in any 0.y
+**Beta.** QueryProxy is at version 0.2.6; breaking changes can land in any 0.y
 release and are listed in the [changelog](CHANGELOG.md).
 
 ## Contributing

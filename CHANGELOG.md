@@ -6,7 +6,9 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed (Unreleased)
+## [0.2.6] - 2026-10-18
+
+### Fixed (0.2.6)
 
 - **`QUERYPROXY_EXECUTION_TIMEOUT` is read by one rule everywhere.** The
   application config, the queue's `retry_after` and the image entrypoint now
@@ -26,7 +28,7 @@ All notable changes to QueryProxy are documented here. The format follows
 - `DO LANGUAGE E'SQL' …` was refused with two messages for the same problem;
   it now gets one. The refusal itself is unchanged.
 
-### Security (Unreleased)
+### Security (0.2.6)
 
 Tightening of the SQL guard. Unless noted, every item below is a refusal at
 submission, with the same explicit message as the existing rules. The guard
@@ -652,7 +654,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.2...v0.2.3

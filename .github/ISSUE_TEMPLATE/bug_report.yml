@@ -50,7 +50,7 @@ body:
     attributes:
       label: Version
       description: The version of QueryProxy where the bug occurs.
-      placeholder: "0.2.5"
+      placeholder: "0.2.6"
     validations:
       required: true
   - type: textarea
