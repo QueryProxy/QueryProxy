@@ -6,6 +6,77 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`QUERYPROXY_EXECUTION_TIMEOUT` is read by one rule everywhere.** The
+  application config, the queue's `retry_after` and the image entrypoint now
+  all accept only a whole number of seconds greater than zero and fall back to
+  300 for anything else (text, empty, `0`, `000`, negative, decimal, a value
+  with a unit, `true`). Before, the entrypoint took `0` and `000` literally
+  and derived a 10-second worker timeout from them, and a value such as
+  `true` was read as 1 second by the config. `retry_after` for an invalid
+  value is 330, as for the default. The config falls back silently; the
+  entrypoint still warns at container start.
+- **The `sql_mode` refusal pointed at the wrong cause.** The message told you
+  to remove `NO_BACKSLASH_ESCAPES` / `ANSI_QUOTES` from the server's or the
+  user's default `sql_mode`, but QueryProxy overrides the session's mode when
+  it connects, so a default cannot be the source. It now says the flag was set
+  after connecting (for example by a proxy or connection pooler that rewrites
+  session variables) and to look there.
+- `DO LANGUAGE E'SQL' …` was refused with two messages for the same problem;
+  it now gets one. The refusal itself is unchanged.
+
+### Security
+
+Tightening of the SQL guard. Unless noted, every item below is a refusal at
+submission, with the same explicit message as the existing rules. The guard
+remains a layer of defence in depth; the DBA approval is still what authorizes
+a statement.
+
+- **Role and user switches are refused.** `SET [SESSION|LOCAL] ROLE`,
+  `RESET ROLE` (also written `RESET "role"`), `SET … SESSION AUTHORIZATION`,
+  `RESET SESSION AUTHORIZATION`, MySQL and MariaDB `SET ROLE` /
+  `SET DEFAULT ROLE`, and `set_config('role', …)` /
+  `set_config('session_authorization', …)`. `role` and
+  `session_authorization` join the built-in list of guarded settings, which
+  `QUERYPROXY_EXTRA_DANGEROUS_VARIABLES` can only extend.
+- **`ALTER SYSTEM` is refused** on PostgreSQL, whatever it sets.
+- **Writes to the system catalog are refused.** PostgreSQL: `INSERT`,
+  `UPDATE`, `DELETE` and `MERGE` into `pg_catalog`, `pg_toast` and `pg_…`
+  tables. MySQL and MariaDB: the same statements and `REPLACE` against the
+  `mysql` schema. Qualified, quoted and CTE-wrapped spellings are covered.
+  On MySQL and MariaDB `USE mysql` is refused as well (also inside `PREPARE`,
+  `EXECUTE IMMEDIATE` and `SET STATEMENT … FOR`), so that a name without a
+  schema cannot be resolved against the catalog. Reading the catalog
+  (`SELECT * FROM pg_proc`, `SELECT … FROM mysql.user`) still passes.
+- **`READ WRITE` is refused** in `SET TRANSACTION`, `SET SESSION
+  CHARACTERISTICS`, `BEGIN` and `START TRANSACTION`, so a submission cannot
+  lift a read-only transaction. `READ ONLY` still passes.
+- **Writes to the MySQL / MariaDB read-only switch are refused** in every
+  scope and spelling (`transaction_read_only`, `tx_read_only`, `SESSION`,
+  `GLOBAL`, `@@…`, `SET STATEMENT … FOR`).
+- **A MySQL / MariaDB write whose default database is `mysql` is refused at
+  execution.** A table name without a schema would otherwise resolve inside
+  the system schema. The executor reads `DATABASE()` on the connection before
+  the first statement; a single-statement read and a connection with no default
+  database are not affected.
+- **`ALTER DATABASE|ROLE|USER … RESET` of a guarded setting (or `ALL`) is
+  refused** on PostgreSQL, and the action of a `CREATE [OR REPLACE] RULE`
+  (`DO [ALSO|INSTEAD] …`) is now inspected by the guard's own rules instead of
+  being skipped.
+- **SQL Server impersonation is refused:** `EXECUTE AS`, `EXEC AS`, `SETUSER`
+  and `REVERT`, including inside `EXEC('…')` and `sp_executesql`, and
+  `WITH EXECUTE AS` in object definitions. A column named `execute_as` and the
+  text inside a string literal are not affected.
+- **A very long dotted-name chain could stall a worker.** The guard re-walked
+  the rest of the chain at every part, so the cost grew with the square of the
+  chain length and a statement near the editor's size limit could keep a PHP
+  process busy for a long time. It now scans in linear time. No refusal was
+  added or relaxed by this change.
+- The new rules apply inside `DO` and routine bodies, `PREPARE` and
+  `EXECUTE IMMEDIATE` text, CTE bodies, `EXPLAIN ANALYZE`, MariaDB `ANALYZE`
+  and `SET STATEMENT … FOR`.
+
 ## [0.2.5] - 2026-10-10
 
 ### Added
