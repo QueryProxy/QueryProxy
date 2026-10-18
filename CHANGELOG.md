@@ -6,6 +6,39 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-18
+
+### Security (0.2.7)
+
+- **`EXPLAIN`, `KILL` and `WITH` bodies are parsed with bounded memory.** The
+  inner statement behind these keywords was parsed by a parser that kept every
+  error with a full backtrace, so a 63 KB dotted-name chain behind `EXPLAIN`
+  peaked at about 300 MB and could exhaust a 256 MB `memory_limit`. Inner
+  bodies now keep only the first error and stay well under 64 MB on the same
+  input.
+- **`UPDATE` and `DELETE` statements the guard cannot parse are refused.**
+  When such a statement could not be parsed, the guard fell back to a text
+  search for `WHERE`, which also matched the `WHERE` of a subquery and let
+  some statements without their own `WHERE` clause through. They are now
+  refused as too complex to verify.
+
+### Fixed (0.2.7)
+
+- Nested `DO` blocks no longer repeat the same refusal for one language
+  literal; independent violations keep their own messages. Which statements
+  are accepted or refused is unchanged.
+- The test suite no longer needs a generated `APP_KEY`: `phpunit.xml` sets a
+  fixed, non-secret test key.
+
+### Changed (0.2.7)
+
+- **`QUERYPROXY_EXECUTION_TIMEOUT` is capped at 86400 seconds.** A valid value
+  above 86400 is clamped to 86400 instead of saturating in the application or
+  overflowing the image entrypoint's arithmetic. The entrypoint prints a
+  warning at container start when it clamps; the application clamps silently.
+- Inspecting a large `DO` body is faster (a 63 KB body takes about 29% less
+  time), because lexing results are shared instead of repeated.
+
 ## [0.2.6] - 2026-10-18
 
 ### Fixed (0.2.6)
@@ -654,7 +687,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.3...v0.2.4
