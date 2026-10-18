@@ -64,10 +64,18 @@ fi
 # query 10s of headroom, supervisord waits another 10s before SIGKILL, and
 # the queue's retry_after (config/queue.php) adds 30s on top of the timeout.
 EXECUTION_TIMEOUT="${QUERYPROXY_EXECUTION_TIMEOUT:-300}"
+# Same rule as config/queryproxy.php: a whole number of seconds greater than
+# zero, anything else (text, empty, 0, negative) falls back to 300.
 case "$EXECUTION_TIMEOUT" in
     '' | *[!0-9]*)
         echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' is not a whole number of seconds; using 300." >&2
         EXECUTION_TIMEOUT=300
+        ;;
+    *)
+        if [ "$((10#$EXECUTION_TIMEOUT))" -le 0 ]; then
+            echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' must be greater than zero; using 300." >&2
+            EXECUTION_TIMEOUT=300
+        fi
         ;;
 esac
 QUERYPROXY_WORKER_TIMEOUT=$((10#$EXECUTION_TIMEOUT + 10))

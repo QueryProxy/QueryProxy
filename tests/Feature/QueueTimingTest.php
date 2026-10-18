@@ -23,13 +23,13 @@ use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Output\BufferedOutput;
 
 /**
- * Evaluate config/queue.php with the given env overrides (null = unset),
+ * Evaluate a config file with the given env overrides (null = unset),
  * restoring the original environment afterwards.
  *
  * @param  array<string, string|null>  $env
  * @return array<string, mixed>
  */
-function loadQueueConfig(array $env): array
+function loadConfigFileWithEnv(string $file, array $env): array
 {
     $original = [];
 
@@ -46,7 +46,7 @@ function loadQueueConfig(array $env): array
     }
 
     try {
-        return require config_path('queue.php');
+        return require config_path($file);
     } finally {
         foreach ($original as $key => [$server, $envValue, $putenv]) {
             unset($_SERVER[$key], $_ENV[$key]);
@@ -65,6 +65,23 @@ function loadQueueConfig(array $env): array
             }
         }
     }
+}
+
+/**
+ * @param  array<string, string|null>  $env
+ * @return array<string, mixed>
+ */
+function loadQueueConfig(array $env): array
+{
+    return loadConfigFileWithEnv('queue.php', $env);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function loadQueryproxyConfig(?string $timeout): array
+{
+    return loadConfigFileWithEnv('queryproxy.php', ['QUERYPROXY_EXECUTION_TIMEOUT' => $timeout]);
 }
 
 /**
@@ -125,14 +142,52 @@ test('retry_after defaults above the execution timeout when no env value is set'
         ->and($queue['connections']['database']['retry_after'])->toBe($timeout + 30);
 });
 
-test('retry_after follows a changed execution timeout', function () {
-    config(['queryproxy.execution_timeout' => 900]);
-
-    $queue = loadQueueConfig(unsetRetryAfterEnv());
+test('retry_after follows a changed QUERYPROXY_EXECUTION_TIMEOUT', function () {
+    $queue = loadQueueConfig([...unsetRetryAfterEnv(), 'QUERYPROXY_EXECUTION_TIMEOUT' => '900']);
 
     expect($queue['connections']['database']['retry_after'])->toBe(930)
         ->and($queue['connections']['redis']['retry_after'])->toBe(930);
 });
+
+dataset('invalid execution timeouts', [
+    'text' => ['abc'],
+    'empty' => [''],
+    'zero' => ['0'],
+    'zeros' => ['000'],
+    'negative' => ['-5'],
+    'decimal' => ['12.5'],
+    'with a unit' => ['60s'],
+    'padded with a space' => [' 60'],
+    // env() turns these into bool/null/'' before the rule sees them, and
+    // docker/entrypoint.sh rejects all of them as non-numeric.
+    'true' => ['true'],
+    'false' => ['false'],
+    'null' => ['null'],
+    'parenthesised true' => ['(true)'],
+    'parenthesised empty' => ['(empty)'],
+]);
+
+test('an invalid QUERYPROXY_EXECUTION_TIMEOUT falls back to 300, as docker/entrypoint.sh does', function (string $value) {
+    expect(loadQueryproxyConfig($value)['execution_timeout'])->toBe(300);
+})->with('invalid execution timeouts');
+
+test('an unset QUERYPROXY_EXECUTION_TIMEOUT is 300', function () {
+    expect(loadQueryproxyConfig(null)['execution_timeout'])->toBe(300);
+});
+
+test('a valid QUERYPROXY_EXECUTION_TIMEOUT is used as written', function (string $value, int $expected) {
+    expect(loadQueryproxyConfig($value)['execution_timeout'])->toBe($expected);
+})->with([
+    'plain' => ['45', 45],
+    'leading zeros' => ['0090', 90],
+]);
+
+test('retry_after follows the 300 second fallback of an invalid QUERYPROXY_EXECUTION_TIMEOUT', function (string $value) {
+    $queue = loadQueueConfig([...unsetRetryAfterEnv(), 'QUERYPROXY_EXECUTION_TIMEOUT' => $value]);
+
+    expect($queue['connections']['database']['retry_after'])->toBe(330)
+        ->and($queue['connections']['redis']['retry_after'])->toBe(330);
+})->with('invalid execution timeouts');
 
 test('an explicit retry_after env value wins', function () {
     $queue = loadQueueConfig([...unsetRetryAfterEnv(), 'DB_QUEUE_RETRY_AFTER' => '999']);

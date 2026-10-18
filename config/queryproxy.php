@@ -1,6 +1,15 @@
 <?php
 
 use App\Services\Sql\SqlInspector;
+use App\Support\ExecutionTimeout;
+
+/*
+| QUERYPROXY_EXECUTION_TIMEOUT is validated by ExecutionTimeout::resolve(), the
+| same rule docker/entrypoint.sh applies. The fallback to 300 is silent here:
+| the logger is not available while config files load, and the entrypoint
+| already warns about a bad value at container start.
+*/
+$executionTimeout = ExecutionTimeout::resolve(env('QUERYPROXY_EXECUTION_TIMEOUT', '300'));
 
 return [
 
@@ -27,7 +36,7 @@ return [
     | at `public` or at any disk configured with `visibility => public`.
     */
 
-    'execution_timeout' => (int) env('QUERYPROXY_EXECUTION_TIMEOUT', 300),
+    'execution_timeout' => $executionTimeout,
 
     'result_disk' => env('QUERYPROXY_RESULT_DISK', 'local'),
 

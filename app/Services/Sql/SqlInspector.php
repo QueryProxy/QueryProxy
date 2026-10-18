@@ -572,6 +572,8 @@ class SqlInspector
 
     private const RESET_ROLE_MESSAGE = 'RESET ROLE is not allowed through QueryProxy (it changes the privileges the session runs with).';
 
+    private const DO_LANGUAGE_LITERAL_MESSAGE = 'A DO block that names its language with a string literal (LANGUAGE \'...\' or LANGUAGE $$...$$) is not allowed: the guard reads the language, and tells it from the body, only when it is written as a plain name.';
+
     private const UNREADABLE_NAME_MESSAGE = 'A Unicode-escaped U&"..." name whose escapes the guard cannot decode is not allowed through QueryProxy: it cannot tell which object or setting it names.';
 
     private const USE_CATALOG_SCHEMA_MESSAGE = 'USE mysql is not allowed through QueryProxy: it makes the system catalog the default schema, so an unqualified table name would no longer be judged as a catalog table.';
@@ -1270,6 +1272,14 @@ class SqlInspector
      * The lexer's tokens for each piece of SQL text read during the current
      * inspect() call, keyed by that text (see lexTokens()), and how deeply
      * inspect() is nested.
+     *
+     * Memory note: this per-request cache keeps the tokens of every distinct
+     * text lexed (the statement, each statement of a batch, every body and
+     * reading derived from them) until the outermost inspect() returns and
+     * empties it, so peak memory grows with the request size times the number
+     * of derived readings. It is sized for the 65535-character limit of the
+     * `max:65535` validation rule on the SQL field; measure memory again
+     * before raising that limit.
      *
      * @var array<string, list<Token>>
      */
@@ -4741,10 +4751,22 @@ class SqlInspector
         $keyword = strtoupper((string) $tokens[0]->value);
 
         if ($keyword === 'DO') {
-            return array_values(array_unique(array_merge(
-                $this->routineClauseViolations($sql),
-                $this->anonymousBlockViolations($sql),
-            )));
+            $clauseViolations = $this->routineClauseViolations($sql);
+            $blockViolations = $this->anonymousBlockViolations($sql);
+
+            // A language written as a literal is refused as such. Judging the
+            // same text a second time as a language name would add a second,
+            // misleading reason ('SQL' read as a quoted name that "keeps its
+            // case"), so the language-name verdicts are left out.
+            if (in_array(self::DO_LANGUAGE_LITERAL_MESSAGE, $blockViolations, true)) {
+                $clauseViolations = array_values(array_filter(
+                    $clauseViolations,
+                    fn (string $violation): bool => ! str_starts_with($violation, 'DO ... LANGUAGE ')
+                        && ! str_starts_with($violation, 'A DO statement whose language'),
+                ));
+            }
+
+            return array_values(array_unique(array_merge($clauseViolations, $blockViolations)));
         }
 
         if ($keyword === 'SET') {
@@ -5359,7 +5381,7 @@ class SqlInspector
         $literals = $this->anonymousBlockLiterals($sql, $ranges);
 
         if ($this->languageLiteral($sql, $literals, $ranges['comments'])) {
-            $violations[] = 'A DO block that names its language with a string literal (LANGUAGE \'...\' or LANGUAGE $$...$$) is not allowed: the guard reads the language, and tells it from the body, only when it is written as a plain name.';
+            $violations[] = self::DO_LANGUAGE_LITERAL_MESSAGE;
 
             return $violations;
         }

@@ -278,6 +278,10 @@ test('a MySQL / MariaDB session whose sql_mode changes quoting is refused before
         ->and($request->error_message)->toContain($flag)
         ->and($request->error_message)->toContain('sql_mode')
         ->and($request->error_message)->toContain($driver->label())
+        // The connection overrides the session's sql_mode when it connects, so
+        // the message must not send the operator to the server defaults.
+        ->and($request->error_message)->toContain('applied after connecting')
+        ->and($request->error_message)->not->toContain('Remove ')
         ->and($request->affected_rows)->toBeNull();
 
     $pdo = new PDO('sqlite:'.$dbFile);

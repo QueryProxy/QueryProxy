@@ -641,6 +641,27 @@ test('a DO block or a function in a language other than plpgsql and sql is refus
     'nested DO, quoted language, in a quoted DO body' => ["DO 'BEGIN DO LANGUAGE \"plperl\" ''return 1;''; END'", 'LANGUAGE plperl is not allowed'],
 ]);
 
+test('a DO block language the guard cannot take as a plain name gets exactly one reason', function (string $sql, string $message) {
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toHaveCount(1)
+        ->and($result->violations[0])->toContain($message);
+})->with([
+    "DO, E'' language, leading" => ["DO LANGUAGE E'SQL' \$\$ SELECT 1 \$\$", 'names its language with a string literal'],
+    "DO, E'' language, trailing" => ["DO \$\$ SELECT 1 \$\$ LANGUAGE E'SQL'", 'names its language with a string literal'],
+    "DO, '' language" => ["DO LANGUAGE 'SQL' \$\$ SELECT 1 \$\$", 'names its language with a string literal'],
+    'DO, unresolvable U& language, leading' => ['DO LANGUAGE U&"sql\\0020" $$ SELECT 1 $$', 'language the guard cannot read'],
+    'DO, unresolvable U& language, trailing' => ['DO $$ SELECT 1 $$ LANGUAGE U&"sql\\0020"', 'language the guard cannot read'],
+]);
+
+test('a U& language name that spells a one-letter language is reported by its real name', function () {
+    $result = inspect('DO LANGUAGE U&"\\0075" $$ SELECT 1 $$', DbDriver::Pgsql);
+
+    expect($result->violations)->toHaveCount(1)
+        ->and($result->violations[0])->toContain('LANGUAGE u is not allowed');
+});
+
 test('DO blocks and functions in plpgsql or sql pass the language rule', function (string $sql) {
     expect(inspect($sql, DbDriver::Pgsql)->violations)->toBe([]);
 })->with([

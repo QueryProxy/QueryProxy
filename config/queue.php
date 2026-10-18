@@ -1,5 +1,7 @@
 <?php
 
+use App\Support\ExecutionTimeout;
+
 /*
 | Queue re-reservation window, derived from the query execution timeout.
 |
@@ -7,12 +9,11 @@
 | (or, with tries=1, marked failed) while the first one keeps going. The
 | window must therefore outlast the longest query plus the worker's own
 | --timeout margin: execution_timeout + 30 seconds. An explicit
-| *_QUEUE_RETRY_AFTER env value still wins. queryproxy.php may not be loaded
-| yet when this file is evaluated, so fall back to the same env variable.
+| *_QUEUE_RETRY_AFTER env value still wins. The timeout is resolved from the
+| env variable through the same ExecutionTimeout rule queryproxy.php uses, so
+| the two files cannot disagree and no load order between them matters.
 */
-$executionTimeout = (int) (app()->bound('config') && config()->has('queryproxy.execution_timeout')
-    ? config('queryproxy.execution_timeout')
-    : env('QUERYPROXY_EXECUTION_TIMEOUT', 300));
+$executionTimeout = ExecutionTimeout::resolve(env('QUERYPROXY_EXECUTION_TIMEOUT', '300'));
 
 $retryAfter = $executionTimeout + 30;
 

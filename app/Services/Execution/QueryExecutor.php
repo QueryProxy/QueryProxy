@@ -266,8 +266,10 @@ class QueryExecutor
     /**
      * Refuse to run on a MySQL / MariaDB session whose sql_mode changes how
      * quotes and backslashes are read. The session's mode is read on the very
-     * connection the request then runs on; it is never changed here — the
-     * server's or the connection user's default is what has to be fixed.
+     * connection the request then runs on; it is never changed here. The
+     * connection already overrides the session's sql_mode with a fixed strict
+     * set when it connects (Laravel's `strict` option), so a server or user
+     * default cannot be what put the flag there: it was applied after connect.
      * Other drivers have no such mode and are not checked.
      *
      * @throws RuntimeException when the session's sql_mode carries a flag in
@@ -287,10 +289,12 @@ class QueryExecutor
             throw new RuntimeException(sprintf(
                 'Refusing to run: the %s session sql_mode includes %s, which changes how quotes and backslashes are read, '.
                 'so QueryProxy cannot vouch that the SQL it checked is the SQL the server would run. '.
-                'Remove %s from the server\'s or the connection user\'s default sql_mode and re-run the request.',
+                'QueryProxy sets a fixed sql_mode when it opens the connection, so the server\'s or the connection user\'s default sql_mode is not what set %s; '.
+                'it was applied after connecting, for example by a proxy or connection pooler that rewrites session variables or by something else that changes the session. '.
+                'Find what sets it, remove it, and re-run the request.',
                 $connection->driver->label(),
                 implode(' and ', $found),
-                count($found) > 1 ? 'these flags' : 'the flag',
+                count($found) > 1 ? 'these flags' : 'this flag',
             ));
         }
     }
