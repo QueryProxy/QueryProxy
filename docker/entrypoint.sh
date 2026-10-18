@@ -64,22 +64,33 @@ fi
 # query 10s of headroom, supervisord waits another 10s before SIGKILL, and
 # the queue's retry_after (config/queue.php) adds 30s on top of the timeout.
 EXECUTION_TIMEOUT="${QUERYPROXY_EXECUTION_TIMEOUT:-300}"
-# Same rule as config/queryproxy.php: a whole number of seconds greater than
-# zero, anything else (text, empty, 0, negative) falls back to 300.
+# Same rule as App\Support\ExecutionTimeout: a whole number of seconds greater
+# than zero, capped at 86400 (24h). Anything else (text, empty, 0, negative)
+# falls back to 300; a larger number is clamped to 86400. The cap is checked on
+# the digit string (leading zeros stripped, then length, then value), so a
+# value too big for shell arithmetic is clamped instead of overflowing.
 case "$EXECUTION_TIMEOUT" in
     '' | *[!0-9]*)
         echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' is not a whole number of seconds; using 300." >&2
         EXECUTION_TIMEOUT=300
         ;;
     *)
-        if [ "$((10#$EXECUTION_TIMEOUT))" -le 0 ]; then
+        # Strip leading zeros so the value is never read as octal.
+        EXECUTION_TIMEOUT_DIGITS="${EXECUTION_TIMEOUT#"${EXECUTION_TIMEOUT%%[!0]*}"}"
+        if [ -z "$EXECUTION_TIMEOUT_DIGITS" ]; then
             echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' must be greater than zero; using 300." >&2
             EXECUTION_TIMEOUT=300
+        elif [ "${#EXECUTION_TIMEOUT_DIGITS}" -gt 5 ] || [ "$EXECUTION_TIMEOUT_DIGITS" -gt 86400 ]; then
+            echo "[entrypoint] QUERYPROXY_EXECUTION_TIMEOUT='${EXECUTION_TIMEOUT}' exceeds the 86400 second maximum; using 86400." >&2
+            EXECUTION_TIMEOUT=86400
+        else
+            EXECUTION_TIMEOUT="$EXECUTION_TIMEOUT_DIGITS"
         fi
+        unset EXECUTION_TIMEOUT_DIGITS
         ;;
 esac
-QUERYPROXY_WORKER_TIMEOUT=$((10#$EXECUTION_TIMEOUT + 10))
-QUERYPROXY_WORKER_STOP_WAIT=$((10#$EXECUTION_TIMEOUT + 20))
+QUERYPROXY_WORKER_TIMEOUT=$((EXECUTION_TIMEOUT + 10))
+QUERYPROXY_WORKER_STOP_WAIT=$((EXECUTION_TIMEOUT + 20))
 export QUERYPROXY_WORKER_TIMEOUT QUERYPROXY_WORKER_STOP_WAIT
 
 # Only the container that serves the app migrates, seeds and warms caches.

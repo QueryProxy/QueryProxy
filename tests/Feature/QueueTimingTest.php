@@ -180,6 +180,14 @@ test('a valid QUERYPROXY_EXECUTION_TIMEOUT is used as written', function (string
 })->with([
     'plain' => ['45', 45],
     'leading zeros' => ['0090', 90],
+    'the maximum' => ['86400', 86400],
+]);
+
+test('a QUERYPROXY_EXECUTION_TIMEOUT above the maximum is clamped to 86400', function (string $value) {
+    expect(loadQueryproxyConfig($value)['execution_timeout'])->toBe(86400);
+})->with([
+    'one over' => ['86401'],
+    'beyond PHP_INT_MAX' => ['999999999999999999999999'],
 ]);
 
 test('retry_after follows the 300 second fallback of an invalid QUERYPROXY_EXECUTION_TIMEOUT', function (string $value) {
