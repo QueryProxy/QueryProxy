@@ -212,6 +212,13 @@ class SqlInspector
     private const MAX_BLOCK_BODY_QUOTE_DEPTH = 8;
 
     /**
+     * The length from which a statement of a procedural body reuses the
+     * tokens of the whole body instead of being lexed again (see
+     * fragmentTokens()). Shorter ones cost little to lex.
+     */
+    private const FRAGMENT_SLICE_MIN_BYTES = 2048;
+
+    /**
      * What the guard reports for a version-conditional comment whose end it
      * cannot place where the server does (see versionConditionalComments()).
      */
@@ -572,6 +579,12 @@ class SqlInspector
     private const SET_SESSION_AUTHORIZATION_PATTERN = '/^(SET\s+((SESSION|LOCAL)\s+)?SESSION\s+AUTHORIZATION|RESET\s+(SESSION\s+AUTHORIZATION|SESSION_AUTHORIZATION))\b/i';
 
     private const RESET_ROLE_MESSAGE = 'RESET ROLE is not allowed through QueryProxy (it changes the privileges the session runs with).';
+
+    /**
+     * The subject of the language verdict on a DO language written as a '...'
+     * literal (see withoutLiteralLanguageEcho()).
+     */
+    private const LITERAL_LANGUAGE_SUBJECT = 'DO (language written as a literal)';
 
     private const DO_LANGUAGE_LITERAL_MESSAGE = 'A DO block that names its language with a string literal (LANGUAGE \'...\' or LANGUAGE $$...$$) is not allowed: the guard reads the language, and tells it from the body, only when it is written as a plain name.';
 
@@ -1529,7 +1542,11 @@ class SqlInspector
      * empties it, so peak memory grows with the request size times the number
      * of derived readings. It is sized for the 65535-character limit of the
      * `max:65535` validation rule on the SQL field; measure memory again
-     * before raising that limit.
+     * before raising that limit. The tokens of a long body statement are not
+     * cached as a text of their own: they are copies cut out of the whole
+     * body's cached tokens (see fragmentTokens()), live only while that
+     * statement is checked, and add at most one more copy of the body's
+     * tokens in all, so the estimate above holds.
      *
      * @var array<string, list<Token>>
      */
@@ -5004,19 +5021,7 @@ class SqlInspector
             $clauseViolations = $this->routineClauseViolations($sql);
             $blockViolations = $this->anonymousBlockViolations($sql);
 
-            // A language written as a literal is refused as such. Judging the
-            // same text a second time as a language name would add a second,
-            // misleading reason ('SQL' read as a quoted name that "keeps its
-            // case"), so the language-name verdicts are left out.
-            if (in_array(self::DO_LANGUAGE_LITERAL_MESSAGE, $blockViolations, true)) {
-                $clauseViolations = array_values(array_filter(
-                    $clauseViolations,
-                    fn (string $violation): bool => ! str_starts_with($violation, 'DO ... LANGUAGE ')
-                        && ! str_starts_with($violation, 'A DO statement whose language'),
-                ));
-            }
-
-            return array_values(array_unique(array_merge($clauseViolations, $blockViolations)));
+            return array_values(array_unique($this->withoutLiteralLanguageEcho(array_merge($clauseViolations, $blockViolations))));
         }
 
         if ($keyword === 'SET') {
@@ -5046,7 +5051,7 @@ class SqlInspector
                 $violations = array_merge($violations, $this->routineClauseViolations($sql));
             }
 
-            return array_values(array_unique($violations));
+            return array_values(array_unique($this->withoutLiteralLanguageEcho($violations)));
         }
 
         // ALTER FUNCTION | PROCEDURE | ROUTINE | DATABASE | ROLE | USER ...
@@ -5745,10 +5750,20 @@ class SqlInspector
         $reading = strtr($reading, ['`' => ' ', '@' => ' ']);
         [$messages] = $this->functionCallEffects($this->significantTokens($reading));
 
-        $statements = preg_split('/;|\b(?:BEGIN|DECLARE|END|THEN|ELSE|ELSIF|LOOP|EXECUTE|PERFORM|RETURN)\b/i', $reading) ?: [];
+        $statements = preg_split('/;|\b(?:BEGIN|DECLARE|END|THEN|ELSE|ELSIF|LOOP|EXECUTE|PERFORM|RETURN)\b/i', $reading, -1, PREG_SPLIT_OFFSET_CAPTURE) ?: [];
+        $tokenStarts = null;
 
-        foreach ($statements as $statement) {
-            $tokens = $this->significantTokens($statement);
+        foreach ($statements as [$statement, $offset]) {
+            // A long statement is not lexed a second time: its tokens are cut
+            // out of the reading's own (see fragmentTokens()).
+            $tokens = null;
+
+            if (strlen($statement) >= self::FRAGMENT_SLICE_MIN_BYTES) {
+                $tokenStarts ??= $this->tokenStartIndex($reading);
+                $tokens = $tokenStarts === null ? null : $this->fragmentTokens($reading, $tokenStarts, $offset, strlen($statement));
+            }
+
+            $tokens ??= $this->significantTokens($statement);
 
             if ($tokens !== [] && strtoupper((string) $tokens[0]->value) === 'SET') {
                 $identityRefused = preg_match(self::SET_ROLE_PATTERN, trim($statement)) === 1
@@ -5771,6 +5786,98 @@ class SqlInspector
         }
 
         return array_values(array_unique(array_map(fn (string $message): string => "Inside the {$label} body: {$message}", $messages)));
+    }
+
+    /**
+     * Where each token of $reading starts, as [position => index in
+     * lexTokens($reading)], or null when the tokens of a piece of $reading
+     * cannot be told from those of the piece lexed on its own (see
+     * fragmentTokens()): text with a non-ASCII character (token positions
+     * count characters, not bytes), a "$" (the piece would be masked as dollar
+     * quoting on its own, not as part of the whole), or the word DELIMITER
+     * (it changes how the lexer reads what follows).
+     *
+     * @return array<int, int>|null
+     */
+    private function tokenStartIndex(string $reading): ?array
+    {
+        if (str_contains($reading, '$') || preg_match('/[^\x00-\x7F]|DELIMITER/i', $reading) === 1) {
+            return null;
+        }
+
+        $starts = [];
+
+        foreach ($this->lexTokens($reading) as $index => $token) {
+            // The closing delimiter token the lexer appends has no text.
+            if ($token->token !== '' && $token->position !== null) {
+                $starts[$token->position] = $index;
+            }
+        }
+
+        return $starts;
+    }
+
+    /**
+     * The significant tokens of $length bytes of $reading from $offset, as
+     * significantTokens() would return them for that piece lexed on its own,
+     * taken from the reading's tokens instead of a second lexer pass over a
+     * text that is nearly the whole reading.
+     *
+     * The lexer keeps almost no state between tokens, so a piece that starts
+     * and ends on a token boundary of the whole is lexed the same way alone,
+     * with these exceptions, which return null (the caller lexes the piece):
+     *  - a piece that does not start and end on a token boundary, which
+     *    includes a token (a compound keyword, a quoted name) that runs across
+     *    the end of a piece;
+     *  - a piece that ends in a character the lexer reads differently at the
+     *    end of a text than before more text;
+     *  - a piece whose last token is a keyword: the lexer turns a function
+     *    keyword into a name unless a "(" follows it, and the text after the
+     *    piece is not the end of the text it is on its own.
+     * The tokens are copies with their positions made relative to the piece,
+     * as the lexer would give them, so the cached tokens are left as they are.
+     *
+     * @param  array<int, int>  $starts  tokenStartIndex() of $reading
+     * @return list<Token>|null
+     */
+    private function fragmentTokens(string $reading, array $starts, int $offset, int $length): ?array
+    {
+        $end = $offset + $length;
+
+        if ($length < 1 || ! isset($starts[$offset]) || (! isset($starts[$end]) && $end !== strlen($reading))) {
+            return null;
+        }
+
+        // The lexer looks ahead past some characters: "1." is a number alone
+        // and "1" followed by "." when text comes after it, "--" is a comment
+        // at the end of a text only. A piece that ends in a character it never
+        // looks past (a letter, a digit, a space, ")" or a quote) is lexed the
+        // same either way.
+        if ($end !== strlen($reading) && preg_match('/[A-Za-z0-9_)\s\']/', $reading[$end - 1]) !== 1) {
+            return null;
+        }
+
+        $all = $this->lexTokens($reading);
+        $stop = $starts[$end] ?? count($all);
+        $tokens = [];
+
+        for ($index = $starts[$offset]; $index < $stop; $index++) {
+            $token = $all[$index];
+
+            if (in_array($token->type, [TokenType::Comment, TokenType::Whitespace, TokenType::Delimiter], true)) {
+                continue;
+            }
+
+            $copy = clone $token;
+            $copy->position = (int) $token->position - $offset;
+            $tokens[] = $copy;
+        }
+
+        if ($tokens !== [] && $tokens[count($tokens) - 1]->type === TokenType::Keyword) {
+            return null;
+        }
+
+        return $tokens;
     }
 
     /**
@@ -5803,8 +5910,17 @@ class SqlInspector
         $violations = [];
         $scanned = [];
 
-        foreach ($this->procedureBodies($text, $ranges) as [$label, $body, $start]) {
+        foreach ($this->procedureBodies($text, $ranges) as [$label, $body, $start, $isLanguage]) {
             $scanned[$start] = true;
+
+            if ($body === null && $isLanguage) {
+                // The same refusal, in the same words, as a top-level DO
+                // block's language literal: the literal is not a body, and
+                // the "unterminated body" reason below would misdescribe it.
+                $violations[] = self::DO_LANGUAGE_LITERAL_MESSAGE;
+
+                continue;
+            }
 
             if ($body === null) {
                 $violations[] = "A {$label} body that is unterminated, or written as a string literal continued by another literal, is not allowed: the guard will not guess which text PostgreSQL runs.";
@@ -5815,6 +5931,13 @@ class SqlInspector
             $violations = array_merge($violations, $this->blockBodyViolations($body, $label, $depth + 1));
         }
 
+        // PostgreSQL also takes the language after the body: DO 'code'
+        // LANGUAGE 'plperlu'. That literal is no body of procedureBodies(),
+        // and is refused for what it is like any other DO language literal.
+        if ($this->nestedDoLanguageLiteral($text, $ranges)) {
+            $violations[] = self::DO_LANGUAGE_LITERAL_MESSAGE;
+        }
+
         foreach ($ranges['quoted'] as [$start, $end]) {
             if (! isset($scanned[$start])) {
                 $violations = array_merge($violations, $this->nestedBodyViolations($this->dollarQuotedInner(substr($text, $start, $end - $start)), $depth + 1));
@@ -5822,6 +5945,65 @@ class SqlInspector
         }
 
         return $violations;
+    }
+
+    /**
+     * True when a DO statement written in $text takes a string literal after
+     * its LANGUAGE keyword, whichever side of the body the clause is on, and
+     * the language that literal names is one the guard refuses: anything but
+     * plpgsql and sql. DO 'code' LANGUAGE 'sql' is not refused, as it never
+     * was; only the verdict on a literal (languageViolations()) is given its
+     * own message, so the message never refuses more than the verdict did.
+     *
+     * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges  postgresLexicalRanges() of $text
+     */
+    private function nestedDoLanguageLiteral(string $text, array $ranges): bool
+    {
+        // Two readings of the same bytes: one with only the comments blanked,
+        // in which a "quoted" name is still there between LANGUAGE and a
+        // literal, and one with every string and name blanked, which can be
+        // cut into statements at ';'.
+        $named = $this->blankRanges($text, $ranges['comments']);
+        $code = $this->postgresCodeText($text, $ranges);
+        $word = '(?<![A-Za-z0-9_$\x80-\xff])';
+        $reading = null;
+
+        foreach ($this->anonymousBlockLiterals($text, $ranges) as [$start, , $kind]) {
+            $opening = $start - $this->stringPrefixLength($kind);
+
+            if (preg_match("/{$word}LANGUAGE\\s*\$/i", substr($named, 0, $opening), $keyword, PREG_OFFSET_CAPTURE) !== 1) {
+                continue;
+            }
+
+            // The language the literal names, read the way the language rule
+            // reads it (clauseReading()), so a literal is given the message
+            // exactly when that rule has a verdict on it: E'sql' and 'sql'
+            // read as sql, E'plperlu' and $$sql$$ do not read as one.
+            $reading ??= $this->clauseReading($text, $ranges);
+
+            if ($reading === null) {
+                continue;
+            }
+
+            $semicolon = strpos($reading, ';', $keyword[0][1]);
+            $clause = $semicolon === false
+                ? substr($reading, $keyword[0][1])
+                : substr($reading, $keyword[0][1], $semicolon - $keyword[0][1]);
+            [$language] = $this->languageClauses($clause)[0];
+
+            if ($this->languageViolations($language, 'DO', 'block') === []) {
+                continue;
+            }
+
+            $before = substr($code, 0, $opening);
+            $statement = substr($before, (int) strrpos($before, ';'));
+
+            if (preg_match("/{$word}DO\\s*(?=LANGUAGE(?![A-Za-z0-9_\$\\x80-\\xff])|(?:E|U&)?')/i", $statement) === 1) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -5868,6 +6050,52 @@ class SqlInspector
     }
 
     /**
+     * A language written as a string literal is refused as such
+     * (DO_LANGUAGE_LITERAL_MESSAGE). The language-name rules read the same
+     * literal a second time: 'foo' and 'plperlu' are read as the names foo
+     * and plperlu (the verdicts carrying LITERAL_LANGUAGE_SUBJECT), and
+     * E'plperlu', E'SQL' and $$sql$$ as a language the guard cannot read.
+     * Once the literal message is there, those verdicts are left out; without
+     * it they stay, written as the verdicts on a name.
+     *
+     * The literal message is given for every nested DO language literal the
+     * language rule refuses (see nestedBodyViolations() and
+     * nestedDoLanguageLiteral()), so a verdict on a literal is never left
+     * out for want of its own message: what is left
+     * out of a statement with several blocks is only the echo of a literal
+     * the statement is refused for anyway.
+     *
+     * Every other language verdict stays: a name written as a name, bare or
+     * "quoted", is judged on its own however many literals sit beside it, so
+     * the reason the guard gives still names the language that would run as
+     * the superuser. A language that cannot be read written next to a literal
+     * one is hidden behind the literal message, which is the one cost of this
+     * rule; the statement is refused either way.
+     *
+     * @param  list<string>  $violations
+     * @return list<string>
+     */
+    private function withoutLiteralLanguageEcho(array $violations): array
+    {
+        if (! in_array(self::DO_LANGUAGE_LITERAL_MESSAGE, $violations, true)) {
+            // No literal message to stand for them: the verdicts are the
+            // only reason given, and read as the ones on a name.
+            return array_map(
+                fn (string $violation): string => str_starts_with($violation, self::LITERAL_LANGUAGE_SUBJECT.' ')
+                    ? 'DO '.substr($violation, strlen(self::LITERAL_LANGUAGE_SUBJECT) + 1)
+                    : $violation,
+                $violations,
+            );
+        }
+
+        return array_values(array_filter(
+            $violations,
+            fn (string $violation): bool => ! str_starts_with($violation, self::LITERAL_LANGUAGE_SUBJECT.' ')
+                && ! str_starts_with($violation, 'A DO statement whose language'),
+        ));
+    }
+
+    /**
      * The LANGUAGE and SET clauses of PostgreSQL statements that outlive
      * themselves, in $text and, recursively, in every procedural body and
      * dollar-quoted string written inside it:
@@ -5901,18 +6129,12 @@ class SqlInspector
         }
 
         $ranges = $this->postgresLexicalRanges($text, openCommentRunsToEnd: true);
-        $view = $ranges === null ? null : $this->postgresBlockBodyView($text, openCommentRunsToEnd: true, keepNameStrings: true);
+        $view = $ranges === null ? null : $this->clauseReading($text, $ranges);
 
         if ($ranges === null || $view === null) {
             return ['A statement whose LANGUAGE and SET clauses the guard cannot read is not allowed through QueryProxy.'];
         }
 
-        foreach ($ranges['quoted'] as [$start, $end]) {
-            $length = $end - $start;
-            $view = substr_replace($view, $length >= 2 ? "'".str_repeat(' ', $length - 2)."'" : ' ', $start, $length);
-        }
-
-        $view = $this->withQuotedNamesSpelledOut($text, $view, $ranges['strings']);
         $violations = [];
 
         foreach (explode(';', $view) as $statement) {
@@ -5943,6 +6165,31 @@ class SqlInspector
         }
 
         return array_values(array_unique($violations));
+    }
+
+    /**
+     * The reading of $text the LANGUAGE and SET rules work on (see
+     * routineClauseViolations()): the body view with every dollar-quoted
+     * string reduced to an empty '...' of the same length and the names
+     * written out (withQuotedNamesSpelledOut()). Byte positions are those of
+     * $text. Null when the body view cannot be built.
+     *
+     * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges  postgresLexicalRanges() of $text, with open comments run to the end
+     */
+    private function clauseReading(string $text, array $ranges): ?string
+    {
+        $view = $this->postgresBlockBodyView($text, openCommentRunsToEnd: true, keepNameStrings: true);
+
+        if ($view === null) {
+            return null;
+        }
+
+        foreach ($ranges['quoted'] as [$start, $end]) {
+            $length = $end - $start;
+            $view = substr_replace($view, $length >= 2 ? "'".str_repeat(' ', $length - 2)."'" : ' ', $start, $length);
+        }
+
+        return $this->withQuotedNamesSpelledOut($text, $view, $ranges['strings']);
     }
 
     /**
@@ -6026,7 +6273,7 @@ class SqlInspector
                 $violations[] = 'A CREATE FUNCTION or CREATE PROCEDURE statement without a LANGUAGE clause is not allowed through QueryProxy: write LANGUAGE plpgsql or LANGUAGE sql.';
             }
 
-            foreach ($languages as $language) {
+            foreach ($languages as [$language]) {
                 $violations = array_merge($violations, $this->languageViolations($language, 'CREATE FUNCTION', 'function'));
             }
         }
@@ -6036,8 +6283,16 @@ class SqlInspector
         preg_match_all("/{$word}DO\\s*(?=LANGUAGE{$end}|(?:E|U&)?')/i", $statement, $blocks, PREG_OFFSET_CAPTURE);
 
         foreach ($blocks[0] as [, $position]) {
-            foreach ($this->languageClauses(substr($statement, $position)) as $language) {
-                $violations = array_merge($violations, $this->languageViolations($language, 'DO', 'block'));
+            foreach ($this->languageClauses(substr($statement, $position)) as [$language, $isLiteral]) {
+                // A language written as '...' is refused once more, as such,
+                // by DO_LANGUAGE_LITERAL_MESSAGE; its verdict here carries
+                // its own subject so withoutLiteralLanguageEcho() can tell it
+                // from the verdict on a language written as a name.
+                $violations = array_merge($violations, $this->languageViolations(
+                    $language,
+                    $isLiteral ? self::LITERAL_LANGUAGE_SUBJECT : 'DO',
+                    'block',
+                ));
             }
         }
 
@@ -6050,9 +6305,9 @@ class SqlInspector
      * lower case, a "..." name (U& ones are spelled "..." by now, see
      * withQuotedNamesSpelledOut()) and a '...' name are kept as written.
      * Null for a language written any other way, which the guard cannot
-     * read.
+     * read. Each is paired with whether it was written as a '...' literal.
      *
-     * @return list<?string>
+     * @return list<array{0: ?string, 1: bool}>
      */
     private function languageClauses(string $reading): array
     {
@@ -6078,11 +6333,13 @@ class SqlInspector
             // A bare name directly followed by & or a quote is a U& or E prefix
             // the guard could not resolve, not the language itself.
             if (preg_match("/^\\s*(?:({$name})(?![&'\"])|\"({$name})\"|'({$name})')(?!\\s*\\.)/", $after, $language) !== 1) {
-                $languages[] = null;
+                $languages[] = [null, false];
             } elseif ($language[1] !== '') {
-                $languages[] = strtolower($language[1]);
+                $languages[] = [strtolower($language[1]), false];
+            } elseif ($language[2] !== '') {
+                $languages[] = [$language[2], false];
             } else {
-                $languages[] = $language[2] !== '' ? $language[2] : $language[3];
+                $languages[] = [$language[3], true];
             }
         }
 
@@ -6291,7 +6548,8 @@ class SqlInspector
 
     /**
      * The literals of $text that PostgreSQL runs as a procedural body, each
-     * as [label, body, start offset], the body null when it cannot be read:
+     * as [label, body, start offset, language operand], the body null when it
+     * cannot be read:
      * the literal is unterminated, or a '...' one is followed by another
      * literal with only whitespace and comments between (string
      * continuation). A '...' or dollar-quoted literal is a body when it
@@ -6299,8 +6557,13 @@ class SqlInspector
      * '...' literal is one when it follows DO (with or without a LANGUAGE
      * clause) — a dollar-quoted DO body is code to the reading already.
      *
+     * The fourth element is true for a literal written right after LANGUAGE
+     * (DO LANGUAGE E'SQL' $x$...$x$): it names the language, it is not a
+     * body, and the caller refuses it as a language literal rather than as
+     * an unreadable body.
+     *
      * @param  array{comments: list<array{0: int, 1: int}>, quoted: list<array{0: int, 1: int}>, strings: list<array{0: int, 1: int, 2: string}>}  $ranges  postgresLexicalRanges() of $text
-     * @return list<array{0: string, 1: ?string, 2: int}>
+     * @return list<array{0: string, 1: ?string, 2: int, 3: bool}>
      */
     private function procedureBodies(string $text, array $ranges): array
     {
@@ -6335,7 +6598,7 @@ class SqlInspector
 
             if ($kind === 'dollar') {
                 [$inner, $closed] = $this->dollarQuotedParts($region);
-                $bodies[] = [$label, $closed ? $inner : null, $start];
+                $bodies[] = [$label, $closed ? $inner : null, $start, false];
 
                 continue;
             }
@@ -6347,7 +6610,7 @@ class SqlInspector
 
             $bodies[] = [$label, $closed && ! $continued
                 ? $this->decodePostgresString(substr($region, 1, -1), $kind)
-                : null, $start];
+                : null, $start, preg_match("/{$word}LANGUAGE\\s*\$/i", $before) === 1];
         }
 
         return $bodies;

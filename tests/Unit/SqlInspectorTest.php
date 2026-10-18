@@ -4253,3 +4253,366 @@ test('a dotted name chain is judged by its last part, however long the chain is'
     'a long empty-part chain ending in a blocked function' => ['SELECT '.str_repeat('a..', 200).'openrowset(1) FROM t', DbDriver::Sqlsrv, false],
     'a long ordinary chain' => ['SELECT '.rtrim(str_repeat('a.', 200), '.').' FROM t', DbDriver::Mysql, true],
 ]);
+
+test('a nested DO that names its language with a literal is refused with that message once', function (string $sql, ?DbDriver $driver) {
+    // The language-name verdict and the "body continued by another literal"
+    // verdict used to report the same literal one after the other, so a DO
+    // nested in a DO body (or in a function body) was refused with two
+    // messages for one cause.
+    $violations = inspect($sql, $driver)->violations;
+    $literal = array_values(array_filter($violations, fn (string $message): bool => str_contains($message, 'names its language with a string literal')));
+
+    expect(inspect($sql, $driver)->passes())->toBeFalse()
+        ->and($violations)->toHaveCount(1)
+        ->and($literal)->toHaveCount(1)
+        ->and($violations[0])->not->toContain('unterminated')
+        ->and($violations[0])->not->toContain('whose language');
+})->with(function (): array {
+    $sql = [
+        'nested DO' => "DO \$\$ BEGIN DO LANGUAGE E'SQL' \$x\$ SELECT 1 \$x\$; END \$\$",
+        'nested DO, plain literal' => "DO \$\$ BEGIN DO LANGUAGE 'plpgsql' \$x\$ SELECT 1 \$x\$; END \$\$",
+        'three levels' => "DO \$a\$ BEGIN DO \$b\$ BEGIN DO LANGUAGE E'SQL' \$x\$ SELECT 1 \$x\$; END \$b\$; END \$a\$",
+        'top level DO' => "DO LANGUAGE E'SQL' \$x\$ SELECT 1 \$x\$",
+        'DO in a dollar-quoted function body' => "CREATE FUNCTION f() RETURNS void AS \$\$ BEGIN DO LANGUAGE E'SQL' \$x\$ SELECT 1 \$x\$; END \$\$ LANGUAGE plpgsql",
+        'DO in a string-literal function body' => "CREATE FUNCTION f() RETURNS void AS 'BEGIN DO LANGUAGE E''SQL'' \$x\$ SELECT 1 \$x\$; END' LANGUAGE plpgsql",
+        'DO in a string-literal DO body' => "DO 'BEGIN DO LANGUAGE E''SQL'' \$x\$ SELECT 1 \$x\$; END'",
+    ];
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $label => $driver) {
+        foreach ($sql as $name => $statement) {
+            $cases["{$name}, {$label}"] = [$statement, $driver];
+        }
+    }
+
+    return $cases;
+});
+
+test('the other nested-body verdicts are still reported, once each', function (string $sql, string $message) {
+    $violations = inspect($sql, DbDriver::Pgsql)->violations;
+
+    expect($violations)->toHaveCount(1)
+        ->and($violations[0])->toContain($message);
+})->with([
+    'a nested body continued by another literal' => ["DO \$\$ BEGIN DO 'a' 'b'; END \$\$", 'unterminated, or written as a string literal continued'],
+    'an unterminated nested body' => ["DO \$\$ BEGIN DO 'unterminated; END \$\$", 'unterminated, or written as a string literal continued'],
+    'a nested language the guard cannot read' => ['DO $$ BEGIN DO LANGUAGE $l$plpgsql$l$ $x$ SELECT 1 $x$; END $$', 'names its language with a string literal'],
+    'a nested quoted language name' => ['DO $$ BEGIN DO LANGUAGE "Sql" $x$ SELECT 1 $x$; END $$', 'a quoted language name keeps its case'],
+    'a function body continued by another literal' => ["CREATE FUNCTION f() RETURNS void AS 'x' 'y' LANGUAGE plpgsql", 'A function body that is unterminated'],
+]);
+
+test('a maximum-size DO body is read a bounded number of times and in linear time', function (?DbDriver $driver, string $head, string $unit, string $tail) {
+    // The checks of a DO body used to lex the whole body over and over: the
+    // body itself, the text without its strings and every statement of it. The
+    // body is now lexed a few times at most (once more for the reading with
+    // its strings blanked out), and the statements of a long body are cut out
+    // of those tokens instead of being lexed one by one.
+    $length = 63000;
+    $sql = $head.str_repeat($unit, intdiv($length - strlen($head) - strlen($tail), strlen($unit))).$tail;
+    $inspector = new class extends SqlInspector
+    {
+        /** @var list<int> */
+        public array $lexed = [];
+
+        protected function lex(string $sql): array
+        {
+            $this->lexed[] = strlen($sql);
+
+            return parent::lex($sql);
+        }
+    };
+
+    // See the linear-time lexing test above: the collector stays off while the
+    // tens of thousands of tokens are live, and runs once afterwards.
+    gc_disable();
+
+    try {
+        $passes = $inspector->inspect($sql, $driver)->passes();
+    } finally {
+        gc_enable();
+        gc_collect_cycles();
+        gc_mem_caches();
+    }
+
+    $large = array_filter($inspector->lexed, fn (int $size): bool => $size >= 32 * 1024);
+
+    expect($passes)->toBeTrue()
+        ->and(count($large))->toBeLessThanOrEqual(4)
+        ->and(array_sum($inspector->lexed))->toBeLessThanOrEqual(4.5 * strlen($sql));
+})->with(function (): array {
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $label => $driver) {
+        $cases["dotted names, {$label}"] = [$driver, 'DO $$BEGIN INSERT INTO a', '.a', ' VALUES (1); END$$'];
+        $cases["INSERT statements, {$label}"] = [$driver, 'DO $$BEGIN ', 'INSERT INTO t (a) VALUES (1); ', 'END$$'];
+        $cases["PERFORM statements, {$label}"] = [$driver, 'DO $$BEGIN ', "PERFORM 1 + 2 FROM t WHERE x = 'a'; ", 'END$$'];
+    }
+
+    return $cases;
+});
+
+test('a maximum-size DO body is inspected in time that grows with its length', function (?DbDriver $driver) {
+    $statement = fn (int $length): string => 'DO $$BEGIN '.str_repeat('INSERT INTO t (a) VALUES (1); ', intdiv($length, 30)).'END$$';
+    $elapsed = function (string $sql) use ($driver): float {
+        $best = INF;
+
+        for ($run = 0; $run < 3; $run++) {
+            $start = hrtime(true);
+            $passes = inspect($sql, $driver)->passes();
+            $best = min($best, (hrtime(true) - $start) / 1e9);
+        }
+
+        expect($passes)->toBeTrue();
+
+        return $best;
+    };
+
+    gc_disable();
+
+    try {
+        $baseline = $elapsed($statement(intdiv(63000, 8)));
+        $maximum = $elapsed($statement(63000));
+    } finally {
+        gc_enable();
+        gc_collect_cycles();
+        gc_mem_caches();
+    }
+
+    expect($maximum)->toBeLessThan($baseline * 16 + 0.5);
+})->with([
+    'pgsql' => [DbDriver::Pgsql],
+    'no driver' => [null],
+]);
+
+test('a refused statement stays refused when it is long enough to be read from the body tokens', function (string $statement, ?DbDriver $driver) {
+    // A statement of 2048 bytes or more inside a DO body is not lexed on its
+    // own: its tokens are cut out of the body's (see fragmentTokens()). Each of
+    // these ends in a space, a name or a number, the only endings that path
+    // accepts, and is refused as the short statement is. A parser upgrade
+    // that makes the lexer read a token differently depending on what comes
+    // before it would show up here as a long statement that passes.
+    $short = "DO \$\$BEGIN {$statement}; END\$\$";
+    $padded = "DO \$\$BEGIN {$statement}".str_repeat(' ', 2100).'; END$$';
+    $filled = "DO \$\$BEGIN {$statement}".str_repeat(' AND a = 1', 220).'; END$$';
+
+    expect(inspect($short, $driver)->passes())->toBeFalse()
+        ->and(inspect($padded, $driver)->passes())->toBeFalse()
+        ->and(inspect($padded, $driver)->violations)->toBe(inspect($short, $driver)->violations);
+
+    // A WHERE-style filler only fits a statement that has a WHERE clause.
+    if (str_contains($statement, 'WHERE')) {
+        expect(inspect($filled, $driver)->passes())->toBeFalse();
+    }
+})->with(function (): array {
+    $statements = [
+        'SET ROLE' => 'SET role = admin',
+        'SET LOCAL ROLE' => 'SET LOCAL role = admin',
+        'SET session_replication_role' => 'SET session_replication_role = replica',
+        'RESET ROLE' => 'RESET role',
+        'RESET session_authorization' => 'RESET session_authorization',
+        'catalog UPDATE' => "UPDATE pg_proc SET proname = 'x' WHERE oid = 1",
+        'catalog DELETE' => 'DELETE FROM pg_proc WHERE oid = 1',
+    ];
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $label => $driver) {
+        foreach ($statements as $name => $statement) {
+            $cases["{$name}, {$label}"] = [$statement, $driver];
+        }
+    }
+
+    return $cases;
+});
+
+test('the tokens cut out of a body are the ones the statement alone would lex to', function () {
+    // fragmentTokens() stands in for a lexer pass over each statement of a
+    // long body. Compare it with that pass on a set of statements, so that a
+    // new lexer rule reaching across a statement boundary is caught here.
+    $inspector = new SqlInspector;
+    $private = fn (string $name, mixed ...$arguments): mixed => (new ReflectionMethod($inspector, $name))->invoke($inspector, ...$arguments);
+    $shape = fn (array $tokens): array => array_map(
+        fn (Token $token): array => [$token->type, $token->value, $token->token, $token->position, $token->flags],
+        $tokens,
+    );
+    $statements = [
+        'SET role = admin',
+        'UPDATE pg_proc SET proname = 1 WHERE oid = 1 AND a.b.c = 2',
+        "PERFORM 1 + 2 FROM t WHERE x = 'a'",
+        'INSERT INTO a.b.c (d, e) VALUES (1, 2.5)',
+        'x := a * b - c',
+        'SELECT count(*) FROM t',
+        'SELECT a.* FROM t, u',
+        'RESET session_authorization',
+        'v := now()',
+        'SELECT a.select FROM t',
+        'SELECT 1 FROM t -- tail',
+        'SELECT /* c */ 1',
+        'SELECT 1 UNION ALL SELECT 2',
+        'SELECT a   FROM   t',
+        "SELECT 'a' || 'b'",
+    ];
+    $reading = 'BEGIN '.implode(";\n  ", $statements).'; END';
+    $starts = $private('tokenStartIndex', $reading);
+    $cut = 0;
+    $total = 0;
+
+    expect($starts)->toBeArray();
+
+    foreach (preg_split('/;/', $reading, -1, PREG_SPLIT_OFFSET_CAPTURE) as [$piece, $offset]) {
+        $total++;
+        $tokens = $private('fragmentTokens', $reading, $starts, $offset, strlen($piece));
+
+        if ($tokens === null) {
+            continue;
+        }
+
+        $cut++;
+        expect($shape($tokens))->toBe($shape($private('significantTokens', $piece)), $piece);
+    }
+
+    // Most pieces end in a name or a number and are cut out; the rest (a
+    // keyword last, a comment) fall back to a lexer pass.
+    expect($cut)->toBeGreaterThan(intdiv($total, 2));
+});
+
+test('an untrusted language stays reported next to the nested DO literal-language message', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+    $messages = implode("\n", $result->violations);
+
+    expect($result->passes())->toBeFalse()
+        ->and(substr_count($messages, 'plperlu'))->toBeGreaterThanOrEqual(1)
+        ->and($result->violations)->toHaveCount(2);
+})->with(function (): array {
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $label => $driver) {
+        $cases["CREATE FUNCTION, {$label}"] = [
+            'CREATE FUNCTION f() RETURNS void AS $$ BEGIN DO LANGUAGE plperlu $y$ system(\'id\') $y$; DO LANGUAGE E\'SQL\' $x$ SELECT 1 $x$; END $$ LANGUAGE plpgsql',
+            $driver,
+        ];
+        $cases["nested DO, {$label}"] = [
+            'DO $$ BEGIN DO LANGUAGE plperlu $y$ system(\'id\') $y$; DO LANGUAGE E\'SQL\' $x$ SELECT 1 $x$; END $$',
+            $driver,
+        ];
+    }
+
+    return $cases;
+});
+
+test('a DO language written as a literal is refused with one message, at the top level and nested', function (string $language, string $wrap, ?DbDriver $driver) {
+    $block = "DO LANGUAGE {$language} \$x\$ SELECT 1 \$x\$";
+    $sql = str_replace('{}', $block, $wrap);
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toHaveCount(1);
+
+    // A dollar-quoted language is a language the guard cannot read, which a
+    // nested block reports in its own words; every other literal gets the
+    // literal message.
+    if (! str_contains($language, '$')) {
+        expect($result->violations[0])->toContain('names its language with a string literal');
+    }
+})->with(function (): array {
+    $languages = [
+        "'foo'" => "'foo'",
+        "'plperlu'" => "'plperlu'",
+        "'SQL'" => "'SQL'",
+        "E'plperlu'" => "E'plperlu'",
+        "E'SQL'" => "E'SQL'",
+        '$l$sql$l$' => '$l$sql$l$',
+    ];
+    $wraps = [
+        'top level' => '{}',
+        'nested in DO' => 'DO $$ BEGIN {}; END $$',
+        'nested in CREATE FUNCTION' => 'CREATE FUNCTION f() RETURNS void AS $$ BEGIN {}; END $$ LANGUAGE plpgsql',
+    ];
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $driverLabel => $driver) {
+        foreach ($wraps as $wrapLabel => $wrap) {
+            foreach ($languages as $label => $language) {
+                $cases["{$label}, {$wrapLabel}, {$driverLabel}"] = [$language, $wrap, $driver];
+            }
+        }
+    }
+
+    return $cases;
+});
+
+test('a language written as a name keeps its own verdict beside a literal one', function (string $name, string $expected) {
+    $sql = "DO \$\$ BEGIN DO LANGUAGE {$name} \$y\$ x \$y\$; DO LANGUAGE E'SQL' \$x\$ SELECT 1 \$x\$; END \$\$";
+    $result = inspect($sql, DbDriver::Pgsql);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toHaveCount(2)
+        ->and(implode("\n", $result->violations))->toContain($expected);
+})->with([
+    'quoted name' => ['"Sql"', 'a quoted language name keeps its case'],
+    'bare untrusted name' => ['plperlu', 'untrusted procedural language'],
+]);
+
+test('a language literal written after the body of a nested DO is refused with the literal message', function (string $sql, ?DbDriver $driver) {
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBeFalse()
+        ->and($result->violations)->toHaveCount(1)
+        ->and($result->violations[0])->toContain('names its language with a string literal')
+        ->and($result->violations[0])->not->toContain('language written as a literal');
+})->with(function (): array {
+    $statements = [
+        'beside a literal block' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE \'plperlu\'; DO LANGUAGE E\'SQL\' $x$ SELECT 1 $x$; END $$',
+        'alone' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE \'plperlu\'; END $$',
+        'escape literal' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE E\'plperlu\'; END $$',
+        'no body' => 'DO $$ BEGIN DO LANGUAGE \'foo\'; END $$',
+        'in CREATE FUNCTION' => 'CREATE FUNCTION f() RETURNS void AS $$ BEGIN DO \'select 1\' LANGUAGE \'plperlu\'; END $$ LANGUAGE plpgsql',
+    ];
+    $cases = [];
+
+    foreach (['pgsql' => DbDriver::Pgsql, 'no driver' => null] as $label => $driver) {
+        foreach ($statements as $name => $sql) {
+            $cases["{$name}, {$label}"] = [$sql, $driver];
+        }
+    }
+
+    return $cases;
+});
+
+test('a nested DO that names plpgsql or sql with a literal is still accepted, written before or after the body', function (string $sql) {
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        expect(inspect($sql, $driver)->passes())->toBeTrue();
+    }
+})->with([
+    'sql after the body' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE \'sql\'; END $$',
+    'plpgsql after the body' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE \'plpgsql\'; END $$',
+    'escape sql after the body' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE E\'sql\'; END $$',
+    'escape plpgsql after the body' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE E\'plpgsql\'; END $$',
+    'unicode sql after the body' => 'DO $$ BEGIN DO \'select 1\' LANGUAGE U&\'sql\'; END $$',
+    'plpgsql after a dollar-quoted body' => 'DO $$ BEGIN DO $b$ begin null; end $b$ LANGUAGE \'plpgsql\'; END $$',
+    'sql after a dollar-quoted body' => 'DO $$ BEGIN DO $x$ SELECT 1 $x$ LANGUAGE \'sql\'; END $$',
+    'in CREATE FUNCTION' => 'CREATE FUNCTION f() RETURNS void AS $$ BEGIN DO \'select 1\' LANGUAGE \'sql\'; END $$ LANGUAGE plpgsql',
+]);
+
+test('the verdicts of independent blocks are kept beside a literal language message', function (string $sql, string $expected) {
+    foreach ([DbDriver::Pgsql, null] as $driver) {
+        $result = inspect($sql, $driver);
+
+        expect($result->passes())->toBeFalse()
+            ->and($result->violations)->toHaveCount(2)
+            ->and(implode("\n", $result->violations))->toContain($expected)
+            ->and(implode("\n", $result->violations))->toContain('names its language with a string literal');
+    }
+})->with([
+    'nested name written after the body' => ['DO $$ BEGIN DO \'select 1\' LANGUAGE plperlu; DO LANGUAGE E\'SQL\' $x$ SELECT 1 $x$; END $$', 'plperlu is an untrusted procedural language'],
+    'nested name written before the body' => ['DO $$ BEGIN DO LANGUAGE plperlu $y$ x $y$; DO \'select 1\' LANGUAGE \'foo\'; END $$', 'plperlu is an untrusted procedural language'],
+    'the function own language literal' => ['CREATE FUNCTION f() RETURNS void LANGUAGE \'plperlu\' AS $$ BEGIN DO LANGUAGE \'foo\' $x$ x $x$; END $$', 'plperlu is an untrusted procedural language'],
+]);
+
+test('a verdict on a language literal reads as a verdict on a name when no literal message stands for it', function () {
+    $inspector = new SqlInspector;
+    $echo = (new ReflectionMethod($inspector, 'withoutLiteralLanguageEcho'));
+    $subject = (new ReflectionClassConstant(SqlInspector::class, 'LITERAL_LANGUAGE_SUBJECT'))->getValue();
+    $verdict = "{$subject} ... LANGUAGE foo is not allowed through QueryProxy: x.";
+
+    expect($echo->invoke($inspector, [$verdict, 'other']))->toBe(['DO ... LANGUAGE foo is not allowed through QueryProxy: x.', 'other']);
+});
