@@ -12,19 +12,23 @@ production credentials, developers submit SQL through a guarded editor; DBAs app
 or reject from the web UI or straight from Slack / Teams; approved queries run
 asynchronously on a worker, and results come back masked, limited and fully audited.
 
-Built for small and mid-sized engineering teams, DevOps engineers and DBAs. It is a
-single Laravel monolith with no external dependencies by default.
+Built for small and mid-sized engineering teams, DevOps engineers and DBAs.
+It is a single Laravel monolith with no external dependencies by default.
 
 ![A completed request: guards injected the LIMIT, a DBA approved from Slack, and the results came back masked](docs/assets/request-result.png)
 
+<!-- markdownlint-disable MD033 -->
 <details>
 <summary>More screenshots: the approvals queue and the Query Studio</summary>
+<!-- markdownlint-enable MD033 -->
 
 ![The DBA approvals queue with a pending write request](docs/assets/approvals.png)
 
 ![The Query Studio: connection picker and guarded SQL editor](docs/assets/query-studio.png)
 
+<!-- markdownlint-disable MD033 -->
 </details>
+<!-- markdownlint-enable MD033 -->
 
 ## Features
 
@@ -120,21 +124,22 @@ docker exec -it queryproxy php artisan queryproxy:create-admin
 
 To explore with demo data, set `QUERYPROXY_SEED_DEMO=true`. It creates
 `admin@example.com`, `dba@example.com`, `developer@example.com` and
-`auditor@example.com`, which share one randomly generated password printed once in
-the container logs (`docker logs queryproxy`). The seeder refuses to run while
+`auditor@example.com`, which share one randomly generated password printed once
+in the container logs (`docker logs queryproxy`). The seeder refuses to run while
 `APP_ENV=production` unless you also set `QUERYPROXY_SEED_DEMO_FORCE=true`.
 
 ## How It Works
 
 A request passes the SQL guards, waits for a DBA decision, runs on the queue worker
-with cursor streaming, and lands as a masked NDJSON file that the viewer and the CSV
-export read. Every step is written to the audit log. The
+with cursor streaming, and lands as a masked NDJSON file that the viewer and
+the CSV export read. Every step is written to the audit log. The
 [introduction](https://queryproxy.com/docs/#how-it-works) has the full flow diagram.
 
 ## Configuration
 
 Settings live in `.env`; `.env.example` lists the full set.
 
+<!-- markdownlint-disable MD013 -->
 | Key | Default | Meaning |
 | :-- | :-- | :-- |
 | `QUERYPROXY_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | none | First-boot administrator; ignored once any user exists |
@@ -150,6 +155,7 @@ Settings live in `.env`; `.env.example` lists the full set.
 | `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
 | `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
 | `TRUSTED_PROXIES` | none | Reverse proxy IPs / CIDRs allowed to set `X-Forwarded-*` |
+<!-- markdownlint-enable MD013 -->
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL or PostgreSQL. The queue uses the database driver by default; set
@@ -186,7 +192,8 @@ reversed on downgrade. Back up before every upgrade, and read the
    ```bash
    docker stop queryproxy
    docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
-     sh -c "umask 077 && tar czf /backup/queryproxy-data.tgz -C /data . && chown $(id -u):$(id -g) /backup/queryproxy-data.tgz"
+     sh -c "umask 077 && tar czf /backup/queryproxy-data.tgz -C /data . \
+       && chown $(id -u):$(id -g) /backup/queryproxy-data.tgz"
    ```
 
 2. Save the container's settings before you remove it. This keeps only the
@@ -198,7 +205,8 @@ reversed on downgrade. Back up before every upgrade, and read the
      umask 077
      docker image inspect "$(docker inspect queryproxy --format '{{.Image}}')" \
        --format '{{range .Config.Env}}{{println .}}{{end}}' > image-defaults.env
-     docker inspect queryproxy --format '{{range .Config.Env}}{{println .}}{{end}}' \
+     docker inspect queryproxy \
+       --format '{{range .Config.Env}}{{println .}}{{end}}' \
        | grep -vxF -f image-defaults.env > queryproxy.env
      rm image-defaults.env
    )
@@ -229,19 +237,22 @@ reversed on downgrade. Back up before every upgrade, and read the
 With Compose, the settings stay in the compose file. Stop the stack with
 `docker compose stop`, back up as in step 1 with the volume name that
 `docker volume ls` shows (Compose prefixes it with the project name, for example
-`queryproxy_queryproxy-data`), then run `docker compose pull && docker compose up -d`.
+`queryproxy_queryproxy-data`), then run
+`docker compose pull && docker compose up -d`.
 
 To roll back, restore the backup from step 1 (and your database backup) and start
 the previous version tag with the same `queryproxy.env`.
 
 > [!WARNING]
 > The second command deletes everything in the `queryproxy-data` volume before it
-> extracts the backup. Check that `queryproxy-data.tgz` is the archive you want first.
+> extracts the backup. Check that `queryproxy-data.tgz` is the archive you want
+> first.
 
 ```bash
 docker stop queryproxy && docker rm queryproxy
 docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
-  sh -c 'find /data -mindepth 1 -delete && tar xzf /backup/queryproxy-data.tgz -C /data'
+  sh -c 'find /data -mindepth 1 -delete \
+    && tar xzf /backup/queryproxy-data.tgz -C /data'
 docker run -d --name queryproxy -p 7432:7432 \
   --env-file queryproxy.env \
   -v queryproxy-data:/var/www/html/storage/app \
@@ -265,15 +276,18 @@ All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
 ## Project Status
 
-**Beta.** QueryProxy is at version 0.2.5; breaking changes can land in any 0.y release and are listed in the [changelog](CHANGELOG.md).
+**Beta.** QueryProxy is at version 0.2.5; breaking changes can land in any 0.y
+release and are listed in the [changelog](CHANGELOG.md).
 
 ## Contributing
 
-Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md) before opening an issue or pull request.
+Contributions are welcome. Read the [contributing guide](CONTRIBUTING.md)
+before opening an issue or pull request.
 
 ## Security
 
-Do not report security vulnerabilities through public issues; follow the [security policy](SECURITY.md) instead.
+Do not report security vulnerabilities through public issues; follow the
+[security policy](SECURITY.md) instead.
 
 ## License
 

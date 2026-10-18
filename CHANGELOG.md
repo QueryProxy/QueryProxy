@@ -6,7 +6,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
+### Fixed (Unreleased)
 
 - **`QUERYPROXY_EXECUTION_TIMEOUT` is read by one rule everywhere.** The
   application config, the queue's `retry_after` and the image entrypoint now
@@ -26,7 +26,7 @@ All notable changes to QueryProxy are documented here. The format follows
 - `DO LANGUAGE E'SQL' …` was refused with two messages for the same problem;
   it now gets one. The refusal itself is unchanged.
 
-### Security
+### Security (Unreleased)
 
 Tightening of the SQL guard. Unless noted, every item below is a refusal at
 submission, with the same explicit message as the existing rules. The guard
@@ -79,24 +79,24 @@ a statement.
 
 ## [0.2.5] - 2026-10-10
 
-### Added
+### Added (0.2.5)
 
 - `php artisan queryproxy:mask-error-messages [--dry-run]` masks the error
-  messages already stored on query requests and the copy of them inside
-  in-app "request failed" notifications, using each connection's current
-  rules (a request or connection that no longer exists gets the fixed
-  message). Safe to run repeatedly; the immutable audit log is left untouched
-  and the run is recorded as one `error_messages.masked` entry (scanned,
-  changed, replaced by the fixed message, skipped; and scanned, changed,
-  replaced by the fixed message and skipped for notifications) even when it stops halfway. A record whose connection rules
-  cannot be read is skipped, left unchanged and reported, and the command
-  exits non-zero.
+  messages already stored on query requests and the copy of them inside in-app
+  "request failed" notifications, using each connection's current rules (a
+  request or connection that no longer exists gets the fixed message). Safe to
+  run repeatedly; the immutable audit log is left untouched and the run is
+  recorded as one `error_messages.masked` entry (scanned, changed, replaced by
+  the fixed message, skipped; and scanned, changed, replaced by the fixed
+  message and skipped for notifications) even when it stops halfway. A record
+  whose connection rules cannot be read is skipped, left unchanged and reported,
+  and the command exits non-zero.
 - **DDL flag on requests.** A request that contains DDL now carries a `DDL`
   badge in the approvals queue and on the request page, and the Slack and
   Teams "new request" messages say so, so the approving DBA sees it before
   deciding. The flag was already computed and stored; it was never shown.
 
-### Fixed
+### Fixed (0.2.5)
 
 - **A request failed by the job's `failed()` handler left no trace.** It now
   writes the `request.execution_failed` audit entry (with
@@ -114,7 +114,7 @@ a statement.
   steps and the add-member error pointed to "Admin → Users"; they now name
   the actual screen, Teams & Users → Manage users.
 
-### Security
+### Security (0.2.5)
 
 - **Error messages of failed queries are masked like result data.** Driver
   errors echo the offending values (`Duplicate entry 'bob@x.io'`,
@@ -136,7 +136,7 @@ a statement.
 
 ## [0.2.4] - 2026-10-04
 
-### Fixed
+### Fixed (0.2.4)
 
 - The live PostgreSQL test that lifts a read-only transaction failed when
   `pdo_pgsql` was built against libpq older than 17: the driver frees prepared
@@ -144,7 +144,7 @@ a statement.
   refuse the switch back to read-write. The test's setup statements now run
   unprepared. The guard itself is unchanged.
 
-### Security
+### Security (0.2.4)
 
 - **`league/commonmark` updated to 2.10.3.** 2.10.0 is affected by
   GHSA-3q6v-r5mr-hxv8 (high) and GHSA-97jj-33gv-5xf9 (medium). The release
@@ -154,7 +154,7 @@ a statement.
 
 ## [0.2.3] - 2026-10-04
 
-### Changed
+### Changed (0.2.3)
 
 - **CI and the live test setup.** `ci.yml` runs with a read-only `contents`
   token and checks out without persisting credentials, as `live-pgsql.yml`
@@ -171,7 +171,7 @@ a statement.
   example locally, recreate the container once**
   (`docker compose -f docker-compose.test.yml down`, then `up -d --wait`).
 
-### Fixed
+### Fixed (0.2.3)
 
 - **A write refused by a read-only session was silently run again.** Laravel
   counts PostgreSQL SQLSTATE `25006` and MySQL/MariaDB's `--read-only` error as
@@ -193,7 +193,7 @@ a statement.
   development machine under load; the verdicts do not change. New tests pin
   the lex count, the memory peak and a time bound relative to a bare lexer pass.
 
-### Security
+### Security (0.2.3)
 
 - **PostgreSQL `DO` bodies were read with the MySQL lexer.** The guard scanned
   a `DO` body for blocked functions with MySQL's string rules, so a body such
@@ -248,7 +248,7 @@ a statement.
   driver, so on PostgreSQL (and when the target database is unknown)
   `SET @@general_log = 1` is now refused.
 
-**Notes**
+### Notes (0.2.3)
 
 - PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
   classified as a write and always go through human approval. Dynamic SQL
@@ -261,7 +261,7 @@ a statement.
 
 ## [0.2.2] - 2026-10-03
 
-### Added
+### Added (0.2.2)
 
 - **Live PostgreSQL guard tests.** A `live-pgsql` Pest group in `tests/Live`
   runs the guard against a real PostgreSQL server and checks both the verdict
@@ -271,7 +271,7 @@ a statement.
   set. `docker-compose.test.yml` starts a throwaway PostgreSQL 17 for local runs,
   and the new `live-pgsql` GitHub Actions workflow runs the group in CI.
 
-### Fixed
+### Fixed (0.2.2)
 
 - **The queue timing warning missed `queue:listen` and `queue:work --once`.**
   The warning that `retry_after` is at or below the execution timeout was
@@ -285,7 +285,7 @@ a statement.
   changing `QUERYPROXY_EXECUTION_TIMEOUT` in the example also moves the worker
   timeout. The example needs the image's default entrypoint.
 
-### Security
+### Security (0.2.2)
 
 - **PostgreSQL settings that load code or lift protections were not guarded.**
   The dangerous-variable list now also names `session_preload_libraries`,
@@ -306,8 +306,8 @@ a statement.
   `EXPLAIN ANALYZE`, MariaDB's `ANALYZE [FORMAT = x] <statement>` executes the
   statement. It is now judged as the statement inside it (type, denylist,
   `WHERE` rule, `LIMIT`, nesting depth). Only `SELECT`, `WITH`, `INSERT`,
-  `REPLACE`, `UPDATE`, `DELETE` or a parenthesized query may follow; anything else (`DROP`,
-  `TRUNCATE`, `SET`, a nested `ANALYZE`, …), and a parenthesized
+  `REPLACE`, `UPDATE`, `DELETE` or a parenthesized query may follow; anything
+  else (`DROP`, `TRUNCATE`, `SET`, a nested `ANALYZE`, …), and a parenthesized
   `(ANALYZE <statement>)`, is rejected. The mysql driver and an unknown driver
   are judged the same way. `ANALYZE TABLE …` (maintenance) is unchanged.
 - **Multibyte comments could hide the real statement from `EXPLAIN ANALYZE` and
@@ -327,13 +327,13 @@ a statement.
   written, so a `WHERE` or `LIMIT` inside it may or may not exist. On the
   `mysql` and `mariadb` drivers the statement is now checked twice, once as if
   the bodies run and once as if the server skips them, and is rejected when
-  either reading is refused or when the two readings differ in statement
-  count, transaction state, type or prepared text. **Behaviour change:** these
-  are now rejected on `mysql` and `mariadb`, which 0.2.1 accepted: different
-  versions in one request (`SELECT /*!40101 1 */, /*!50503 2 */` is one), a
-  version of other than 5 digits (5 or 6 on MariaDB), a versioned comment nested in or holding another comment, and one
-  with `*/` inside a string or line comment in its body. A request with a single
-  version and a plain body is unaffected.
+  either reading is refused or when the two readings differ in statement count,
+  transaction state, type or prepared text. **Behaviour change:** these are now
+  rejected on `mysql` and `mariadb`, which 0.2.1 accepted: different versions in
+  one request (`SELECT /*!40101 1 */, /*!50503 2 */` is one), a version of other
+  than 5 digits (5 or 6 on MariaDB), a versioned comment nested in or holding
+  another comment, and one with `*/` inside a string or line comment in its
+  body. A request with a single version and a plain body is unaffected.
 - **SQL that was not valid UTF-8 slipped past the lexer.** A stray byte inside
   a comment (`DROP DATABASE prod /* é\xFF */`) made the guard read an empty
   statement. SQL that is not valid UTF-8 is now rejected
@@ -361,7 +361,7 @@ a statement.
   identifiers and comments. A plain string such as `'a\'` is therefore
   rejected on PostgreSQL even though MySQL and MariaDB behave as before.
 
-**Notes**
+### Notes (0.2.2)
 
 - PostgreSQL `DO` blocks remain exempt from the `WHERE` rule: they are
   classified as a write and always go through human approval, where the
@@ -370,7 +370,7 @@ a statement.
 
 ## [0.2.1] - 2026-10-02
 
-### Fixed
+### Fixed (0.2.1)
 
 - `retry_after` for the database, Beanstalkd and Redis queues no longer falls
   back to Laravel's 90 seconds, which is below the worker's 310-second timeout
@@ -387,7 +387,7 @@ a statement.
   `execution.late_completion` audit entry is written; for a write it records
   that the write was committed.
 
-### Security
+### Security (0.2.1)
 
 - **`EXPLAIN ANALYZE <DML>` was classified as a read and ran the DML.**
   `EXPLAIN ANALYZE` executes the statement it explains, but the guard treated
@@ -463,7 +463,7 @@ a statement.
   with the default masking rules. Existing teams are not changed (see
   Upgrading).
 
-**Upgrading**
+### Upgrading (0.2.1)
 
 - **Remove the fixed `retry_after` lines from your `.env`.** The 0.2.0
   `.env.example` shipped `DB_QUEUE_RETRY_AFTER=330` as an active setting, and an
@@ -495,16 +495,16 @@ a statement.
 
 ## [0.2.0] - 2026-09-18
 
-### Changed
+### Changed (0.2.0)
 
 - **Breaking — set `TRUSTED_PROXIES` when running behind a reverse proxy.** It is
   empty by default. Until it names your proxy, `X-Forwarded-Proto` is ignored, so
   HTTPS is not detected and audit entries record the proxy's address rather than
   the client's. Never use `*`.
-- **Breaking — a system administrator must set the ChatOps signing secret.** DBAs
-  keep control of the webhook URL and the enabled flag, but can no longer enter or
-  rotate the secret. Existing installations should rotate it once after upgrading:
-  any DBA who configured ChatOps already knows the current value.
+- **Breaking — a system administrator must set the ChatOps signing secret.**
+  DBAs keep control of the webhook URL and the enabled flag, but can no longer
+  enter or rotate the secret. Existing installations should rotate it once after
+  upgrading: any DBA who configured ChatOps already knows the current value.
 - **Breaking — Approve / Reject buttons in chat messages posted before this
   version stop working**, because they carry no action token. Decide those
   requests in the web UI. Teams automations must start sending the `token` field
@@ -520,7 +520,7 @@ a statement.
   defaults** per team to pick them up; it is idempotent and leaves existing rules
   untouched.
 
-### Security
+### Security (0.2.0)
 
 - **ChatOps approvals could be made in someone else's name.** The webhook HMAC
   proves only that the caller knows the signing secret, but the approver's
@@ -571,7 +571,7 @@ a statement.
 
 ## [0.1.3] - 2026-09-08
 
-### Changed
+### Changed (0.1.3)
 
 - Image bases moved to `php:8.5-fpm-alpine` and `node:26-alpine`. OPcache is no
   longer installed explicitly: PHP 8.5 links it statically and enables it by
@@ -581,7 +581,7 @@ a statement.
 
 ## [0.1.2] - 2026-09-08
 
-### Added
+### Added (0.1.2)
 
 - `php artisan queryproxy:create-admin` creates the first administrator, and
   `QUERYPROXY_ADMIN_EMAIL` / `QUERYPROXY_ADMIN_PASSWORD` / `QUERYPROXY_ADMIN_NAME`
@@ -590,7 +590,7 @@ a statement.
 - Container `HEALTHCHECK` against `/up`, so `docker run` reports health without
   a compose file.
 
-### Changed
+### Changed (0.1.2)
 
 - **One-container install.** The image now runs the queue worker and the
   scheduler alongside the web tier, so `docker run -p 7432:7432 -v
@@ -606,12 +606,12 @@ a statement.
 
 ## [0.1.1] - 2026-09-08
 
-### Added
+### Added (0.1.1)
 
 - `.dockerignore`, so local `docker build` uses the same clean context as CI
   instead of copying host `vendor/`, `node_modules/` and `.env` into the image.
 
-### Fixed
+### Fixed (0.1.1)
 
 - Demo seeding (`QUERYPROXY_SEED_DEMO=true`) crashed the production container
   on first boot: the seeder relied on Faker, which is a dev-only dependency and
@@ -621,7 +621,7 @@ a statement.
 
 The first public release.
 
-### Added
+### Added (0.1.0)
 
 - **Teams & RBAC** — Admin / DBA / Developer / Auditor roles, hard team
   isolation, per-developer connection grants.
