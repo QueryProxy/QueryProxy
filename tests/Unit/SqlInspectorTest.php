@@ -4053,3 +4053,71 @@ test('a maximum-size statement full of Faz 02 constructs is scanned in linear ti
     'SQL Server names that look like EXECUTE AS' => [DbDriver::Sqlsrv, 'SELECT 1 ', ', execute_as, [execute] ', ' FROM t', true],
     'MySQL SET list of ordinary variables' => [DbDriver::Mysql, 'SET ', 'transaction_isolation = 1, ', '@b = 2', true],
 ]);
+
+test('a maximum-size dotted name chain is scanned in linear time', function (?DbDriver $driver, string $head, string $unit, string $tail, bool $passes) {
+    $statement = fn (int $bytes): string => $head.str_repeat($unit, intdiv($bytes - strlen($head) - strlen($tail), strlen($unit))).$tail;
+    $outcomes = [];
+    $elapsed = function (string $sql) use ($driver, &$outcomes): float {
+        $best = INF;
+
+        gc_disable();
+
+        try {
+            foreach (range(1, 2) as $run) {
+                $start = hrtime(true);
+                $outcomes[] = inspect($sql, $driver)->passes();
+                $best = min($best, (hrtime(true) - $start) / 1e9);
+            }
+        } finally {
+            gc_enable();
+            gc_collect_cycles();
+            gc_mem_caches();
+        }
+
+        return $best;
+    };
+
+    // A chain read from every part to its end costs the square of its length:
+    // four times the bytes would take sixteen times as long. The bound is far
+    // above the linear ratio and far below the quadratic one.
+    $baseline = $elapsed($statement(15000));
+    $maximum = $elapsed($statement(60000));
+
+    // The verdict must not depend on the length of the chain: a guard that
+    // rejects, or lets through, a long chain early would also run faster.
+    expect(array_unique($outcomes))->toBe([$passes])
+        ->and($maximum)->toBeLessThan($baseline * 7 + 0.3);
+})->with(function (): array {
+    $cases = [];
+    $drivers = ['pgsql' => DbDriver::Pgsql, 'mysql' => DbDriver::Mysql, 'no driver' => null];
+
+    foreach ($drivers as $label => $driver) {
+        $cases["SELECT list, {$label}"] = [$driver, 'SELECT a', '.a', ' FROM t', true];
+        $cases["INSERT target, {$label}"] = [$driver, 'INSERT INTO a', '.a', ' VALUES (1)', true];
+        $cases["UPDATE target, {$label}"] = [$driver, 'UPDATE a', '.a', ' SET x = 1 WHERE id = 1', true];
+        $cases["DO body, {$label}"] = [$driver, 'DO $$BEGIN INSERT INTO a', '.a', ' VALUES (1); END$$', $driver !== DbDriver::Mysql];
+    }
+
+    $cases['SELECT list, sqlite'] = [DbDriver::Sqlite, 'SELECT a', '.a', ' FROM t', true];
+    $cases['SELECT list, sqlsrv'] = [DbDriver::Sqlsrv, 'SELECT a', '.a', ' FROM t', true];
+    $cases['bracketed parts, sqlsrv'] = [DbDriver::Sqlsrv, 'SELECT [a]', '.[a]', ' FROM t', true];
+    $cases['empty parts, sqlsrv'] = [DbDriver::Sqlsrv, 'SELECT a', '..a', ' FROM t', true];
+    $cases['quoted parts, pgsql'] = [DbDriver::Pgsql, 'SELECT "a"', '."a"', ' FROM t', true];
+    $cases['blocked function at the end of the chain, sqlsrv'] = [DbDriver::Sqlsrv, 'SELECT a', '.a', '.openrowset(1) FROM t', false];
+    $cases['blocked procedure at the end of an empty-part chain, sqlsrv'] = [DbDriver::Sqlsrv, 'EXEC a', '..a', '..xp_cmdshell', false];
+
+    return $cases;
+});
+
+test('a dotted name chain is judged by its last part, however long the chain is', function (string $sql, ?DbDriver $driver, bool $passes) {
+    expect(inspect($sql, $driver)->passes())->toBe($passes);
+})->with([
+    'a long chain ending in a blocked remote-rowset function' => ['SELECT '.str_repeat('a.', 200).'openrowset(1) FROM t', DbDriver::Sqlsrv, false],
+    'a long chain ending in a code-loading function' => ['SELECT '.str_repeat('a.', 200).'load_extension(1)', DbDriver::Sqlite, false],
+    'a long chain ending in a blocked procedure' => ['EXEC '.str_repeat('a.', 200).'xp_cmdshell', DbDriver::Sqlsrv, false],
+    'a bracketed chain ending in a blocked procedure' => ['EXEC '.str_repeat('[a].', 200).'[xp_cmdshell]', DbDriver::Sqlsrv, false],
+    'a short empty-part chain ending in a blocked procedure' => ['EXEC master..xp_cmdshell', DbDriver::Sqlsrv, false],
+    'a long empty-part chain ending in a blocked procedure' => ['EXEC '.str_repeat('a..', 200).'xp_cmdshell', DbDriver::Sqlsrv, false],
+    'a long empty-part chain ending in a blocked function' => ['SELECT '.str_repeat('a..', 200).'openrowset(1) FROM t', DbDriver::Sqlsrv, false],
+    'a long ordinary chain' => ['SELECT '.rtrim(str_repeat('a.', 200), '.').' FROM t', DbDriver::Mysql, true],
+]);

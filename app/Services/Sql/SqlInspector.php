@@ -4856,13 +4856,14 @@ class SqlInspector
         $sqlsrv = $driver === null || $driver === DbDriver::Sqlsrv;
         $procedures = $this->blockedProcedures();
         $violations = [];
+        $names = [];
 
         for ($index = 0, $count = count($tokens); $index < $count; $index++) {
             $exec = $this->isWordAt($tokens, $index, 'EXEC') || $this->isWordAt($tokens, $index, 'EXECUTE');
             $start = $exec ? $this->execTargetAt($tokens, $index) : ($index === 0 ? 0 : null);
 
             if ($start !== null) {
-                [$procedure] = $this->multipartNameAt($tokens, $start);
+                [$procedure] = $this->multipartNameAt($tokens, $start, $names);
 
                 if ($procedure !== null && $this->matchesFunctionList($procedure, $procedures)) {
                     $violations[] = "{$procedure} is not allowed through QueryProxy: it runs operating-system commands, changes the server configuration or reaches another server.";
@@ -4885,7 +4886,7 @@ class SqlInspector
                 array_push($violations, ...$this->sqliteCommandViolations($tokens, $index));
             }
 
-            [$name, $end] = $this->multipartNameAt($tokens, $index);
+            [$name, $end] = $this->multipartNameAt($tokens, $index, $names);
             $next = $tokens[$end + 1] ?? null;
 
             if ($name === null || $next === null || ! $this->isOperator($next, '(')) {
@@ -5187,22 +5188,38 @@ class SqlInspector
      * case-folded, and the index of its last token. The name is null when
      * the token there cannot name an object.
      *
+     * $memo, when given, is shared by the calls that scan one token list
+     * (see dialectViolations()): every call from a part of a name reuses the
+     * result of the call that read the name first, so a long chain of dotted
+     * parts is read once and not once per part.
+     *
      * @param  list<Token>  $tokens
+     * @param  array<int, array{0: ?string, 1: int}>|null  $memo
      * @return array{0: ?string, 1: int}
      */
-    private function multipartNameAt(array $tokens, int $index): array
+    private function multipartNameAt(array $tokens, int $index, ?array &$memo = null): array
     {
         $name = null;
         $end = $index;
         $i = $index;
+        $starts = [];
 
         while (isset($tokens[$i])) {
+            // A scan that begins on a part of a name already read ends where
+            // that name ended: the answer is shared, not worked out again.
+            if (isset($memo[$i])) {
+                [$name, $end] = $memo[$i];
+
+                break;
+            }
+
             [$part, $partEnd] = $this->namePartAt($tokens, $i);
 
             if ($part === null) {
                 break;
             }
 
+            $starts[] = $i;
             $name = $part;
             $end = $partEnd;
             $i = $partEnd + 1;
@@ -5219,6 +5236,12 @@ class SqlInspector
             }
 
             $i = $dots;
+        }
+
+        if ($memo !== null) {
+            foreach ($starts as $start) {
+                $memo[$start] = [$name, $end];
+            }
         }
 
         return [$name, $end];
