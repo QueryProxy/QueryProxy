@@ -7,12 +7,13 @@ use App\Enums\StatementType;
 use InvalidArgumentException;
 use OverflowException;
 use PhpMyAdmin\SqlParser\Lexer;
-use PhpMyAdmin\SqlParser\Parser;
 use PhpMyAdmin\SqlParser\Statements\DeleteStatement;
 use PhpMyAdmin\SqlParser\Statements\ExplainStatement;
+use PhpMyAdmin\SqlParser\Statements\KillStatement;
 use PhpMyAdmin\SqlParser\Statements\SelectStatement;
 use PhpMyAdmin\SqlParser\Statements\ShowStatement;
 use PhpMyAdmin\SqlParser\Statements\UpdateStatement;
+use PhpMyAdmin\SqlParser\Statements\WithStatement;
 use PhpMyAdmin\SqlParser\Token;
 use PhpMyAdmin\SqlParser\TokensList;
 use PhpMyAdmin\SqlParser\TokenType;
@@ -1157,26 +1158,7 @@ class SqlInspector
             }
         }
 
-        // Only whether the parser reported an error is read, so it keeps the
-        // first one: every later error would otherwise carry its own
-        // exception and backtrace, hundreds of megabytes on a maximum-size
-        // statement the parser stumbles over token after token.
-        $parser = new class(new TokensList($this->lexTokens($sql))) extends Parser
-        {
-            public function error(string $msg, ?Token $token = null, int $code = 0): void
-            {
-                if ($this->errors === []) {
-                    parent::error($msg, $token, $code);
-                }
-            }
-        };
-        $statement = $parser->statements[0] ?? null;
-        $parsed = $statement !== null && $parser->errors === [];
-
-        // The kept exception's backtrace references the parser and through
-        // it every token: dropping it lets the parse tree be freed when this
-        // method returns instead of lingering as cyclic garbage.
-        $parser->errors = [];
+        [$statement, $parsed] = $this->parseStatement($this->lexTokens($sql));
 
         $type = $this->classify($statement, $keyword, $sql, $parsed);
         $isDdl = in_array($keyword, self::DDL_KEYWORDS, true);
@@ -1203,8 +1185,11 @@ class SqlInspector
 
         if ($statement instanceof UpdateStatement || $statement instanceof DeleteStatement) {
             $hasWhere = $statement->where !== null && $statement->where !== [];
-        } elseif (! $parsed && in_array($keyword, ['UPDATE', 'DELETE'], true)) {
-            $hasWhere = (bool) preg_match('/\bWHERE\b/i', $normalized);
+        } elseif (in_array($keyword, ['UPDATE', 'DELETE'], true)) {
+            // No parse tree to read the WHERE clause from. A scan of the text
+            // would count the WHERE of a subquery, so the statement is
+            // refused instead of guessed at.
+            $violations[] = "{$label}: ".strtoupper($keyword).' with a WHERE clause too complex to verify is not allowed.';
         }
 
         if ($hasWhere === false) {
@@ -1238,6 +1223,271 @@ class SqlInspector
             new StatementInfo($sql, $preparedSql, $type, $parsed, $limitInjected, $limitClamped, $isDdl),
             $violations,
         ];
+    }
+
+    /**
+     * Keywords of the vendor statements that hand a nested statement to a
+     * parser of their own, and the keywords that start the nested statement.
+     * That parser is a stock one, which keeps an exception and a stack trace
+     * for every error: a maximum-size statement it stumbles over token after
+     * token took 300 MB, past the memory limit of a worker. ANALYZE is
+     * parsed as EXPLAIN (MariaDB).
+     */
+    private const NESTED_STATEMENT_STARTS = [
+        'EXPLAIN' => ['SELECT', 'TABLE', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE'],
+        'DESCRIBE' => ['SELECT', 'TABLE', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE'],
+        'DESC' => ['SELECT', 'TABLE', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE'],
+        'ANALYZE' => ['SELECT', 'TABLE', 'INSERT', 'REPLACE', 'UPDATE', 'DELETE'],
+        'KILL' => ['SELECT'],
+    ];
+
+    /**
+     * The most nesting keywords that are probed one by one. Past it the
+     * keywords are made unreadable without a probe, which bounds the time
+     * spent on a statement made of nothing but such keywords.
+     */
+    private const MAX_NESTED_PROBES = 16;
+
+    /**
+     * Parses a statement and reports whether it parsed cleanly.
+     *
+     * Only whether the parser reported an error is read, so the parsers here
+     * keep the first one. The vendor parser starts a statement at any
+     * nesting keyword it meets, not only at the first word of the text: after
+     * a word it does not know ("FOO EXPLAIN SELECT ..."), or where a
+     * delimiter is missing. Wherever the keyword sits, the statement it nests
+     * is therefore parsed here first, by itself and with a parser that keeps
+     * its first error, last keyword first so that no probe runs over another
+     * unprobed one. The vendor statement would parse a nested statement that
+     * does not parse again with the stock parser and take every error over.
+     * Its start is therefore made unreadable, a word of no text that is
+     * neither a keyword nor a value the vendor looks for, which costs it one
+     * error, and the statement is parsed once more to learn whether the
+     * vendor reached that keyword at all: a DESC that ends an ORDER BY item
+     * is not a statement of its own, and the text around it must not lose its
+     * parse tree for the SELECT that happens to follow. When it is reached,
+     * the statement of that unreadable copy is returned, reported as not
+     * parsed: it is the statement the vendor would have started with, so the
+     * callers that read its type and its WHERE clause keep reading a parse
+     * tree and never fall back on a weaker reading of the text.
+     *
+     * @param  list<Token>  $tokens
+     * @return array{0: ?object, 1: bool} [statement, parsed cleanly]
+     */
+    private function parseStatement(array $tokens): array
+    {
+        $startsAt = $this->nestedStatementStarts($tokens);
+
+        // $startsAt is in reverse order: the last keyword comes first.
+        $unreadable = $tokens;
+        $broken = false;
+        $unprobed = false;
+
+        foreach ($startsAt as $index => [$from, $length, $start]) {
+            if ($index >= self::MAX_NESTED_PROBES) {
+                // Past the cap the keyword is not probed, which bounds the
+                // time spent on text made of nothing but such keywords, and
+                // so it must not reach a parser of its own either.
+                $unreadable[$start] = new Token('', TokenType::None);
+                $unprobed = true;
+
+                continue;
+            }
+
+            $probe = new FirstErrorParser(new TokensList(array_slice($unreadable, $from, $length)));
+            $clean = $probe->errors === [];
+            // The kept exception's backtrace references the parser.
+            $probe->errors = [];
+
+            if (! $clean) {
+                $unreadable[$start] = new Token('', TokenType::None);
+                $broken = true;
+            }
+        }
+
+        if ($broken || $unprobed) {
+            $parser = new FirstErrorParser(new TokensList($unreadable));
+            $reached = $unprobed;
+
+            foreach ($parser->statements as $statement) {
+                if ($statement instanceof ExplainStatement
+                    || $statement instanceof KillStatement
+                    || $statement instanceof WithStatement) {
+                    $reached = true;
+                }
+            }
+
+            $statement = $parser->statements[0] ?? null;
+            $parser->errors = [];
+
+            if ($reached) {
+                return [$statement, false];
+            }
+        }
+
+        $parser = new FirstErrorParser(new TokensList($tokens));
+        $statement = $parser->statements[0] ?? null;
+        $parsed = $statement !== null && $parser->errors === [];
+
+        // The kept exception's backtrace references the parser and through
+        // it every token: dropping it lets the parse tree be freed when this
+        // method returns instead of lingering as cyclic garbage.
+        $parser->errors = [];
+
+        return [$statement, $parsed];
+    }
+
+    /**
+     * Finds every statement the vendor hands to a parser of its own: the
+     * statement after EXPLAIN, DESCRIBE, DESC, ANALYZE and KILL, and the
+     * bodies and the main statement of a WITH.
+     *
+     * For each, it returns the part of the token list the vendor hands over
+     * and the token the nested statement starts at. The slices are the
+     * vendor's own; where it counts a parenthesis it counts the token's value
+     * and not its type, and so does this.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<array{0: int, 1: ?int, 2: int}> [first token, token count or null for the rest, start token], last first
+     */
+    private function nestedStatementStarts(array $tokens): array
+    {
+        $startsAt = [];
+        $nearest = null;
+        $nearestSelect = null;
+
+        // Backwards, so that each nesting keyword finds the nearest start of
+        // the statement it nests after it.
+        for ($index = count($tokens) - 1; $index >= 0; $index--) {
+            $keyword = $tokens[$index]->keyword;
+
+            if ($keyword === null) {
+                continue;
+            }
+
+            if (isset(self::NESTED_STATEMENT_STARTS[$keyword])) {
+                $start = $keyword === 'KILL' ? $nearestSelect : $nearest;
+
+                if ($start !== null) {
+                    // KILL hands over the token before the nested SELECT as
+                    // well, the opening parenthesis of "KILL (SELECT ...)".
+                    $startsAt[] = [$keyword === 'KILL' ? max(0, $start - 1) : $start, null, $start];
+                }
+            }
+
+            if (in_array($keyword, self::NESTED_STATEMENT_STARTS['EXPLAIN'], true)) {
+                $nearest = $index;
+            }
+
+            if ($keyword === 'SELECT') {
+                $nearestSelect = $index;
+            }
+        }
+
+        foreach ($this->cteStarts($tokens) as $start) {
+            $startsAt[] = $start;
+        }
+
+        usort($startsAt, static fn (array $a, array $b): int => $b[0] <=> $a[0]);
+
+        return $startsAt;
+    }
+
+    /**
+     * The nested statements of a WITH: the SELECT inside the parentheses that
+     * follow an AS, and the statement that follows the last of them.
+     *
+     * @param  list<Token>  $tokens
+     * @return list<array{0: int, 1: ?int, 2: int}>
+     */
+    private function cteStarts(array $tokens): array
+    {
+        $count = count($tokens);
+        $seenWith = false;
+        $previous = null;
+        $opens = [];
+
+        for ($index = 0; $index < $count; $index++) {
+            $token = $tokens[$index];
+
+            if ($token->type === TokenType::Whitespace || $token->type === TokenType::Comment) {
+                continue;
+            }
+
+            if ($token->keyword === 'WITH') {
+                $seenWith = true;
+            } elseif ($seenWith && $token->value === '(' && $previous !== null && $tokens[$previous]->keyword === 'AS') {
+                $opens[] = $index;
+
+                // More than the probes allow is reported as it is; no need to go on.
+                if (count($opens) > self::MAX_NESTED_PROBES) {
+                    break;
+                }
+            }
+
+            $previous = $index;
+        }
+
+        $starts = [];
+
+        foreach ($opens as $open) {
+            $select = $this->nextSignificant($tokens, $open);
+
+            if ($select === null || $tokens[$select]->keyword !== 'SELECT') {
+                continue;
+            }
+
+            $close = $this->closingParenthesis($tokens, $open);
+
+            if ($close === null) {
+                continue;
+            }
+
+            $starts[] = [$open + 1, $close - $open - 1, $select];
+
+            $main = $this->nextSignificant($tokens, $close);
+
+            if ($main !== null && in_array($tokens[$main]->keyword, ['SELECT', 'INSERT', 'UPDATE', 'DELETE'], true)) {
+                $starts[] = [$main, null, $main];
+            }
+        }
+
+        return $starts;
+    }
+
+    /**
+     * @param  list<Token>  $tokens
+     */
+    private function nextSignificant(array $tokens, int $index): ?int
+    {
+        $count = count($tokens);
+
+        for ($next = $index + 1; $next < $count; $next++) {
+            if ($tokens[$next]->type !== TokenType::Whitespace && $tokens[$next]->type !== TokenType::Comment) {
+                return $next;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  list<Token>  $tokens
+     */
+    private function closingParenthesis(array $tokens, int $open): ?int
+    {
+        $count = count($tokens);
+        $depth = 0;
+
+        for ($index = $open + 1; $index < $count; $index++) {
+            if ($tokens[$index]->value === '(') {
+                $depth++;
+            } elseif ($tokens[$index]->value === ')' && --$depth === -1) {
+                return $index;
+            }
+        }
+
+        return null;
     }
 
     /**

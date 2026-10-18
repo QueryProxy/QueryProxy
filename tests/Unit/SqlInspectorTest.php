@@ -2786,6 +2786,117 @@ test('a maximum-size SQLite or SQL Server request is lexed about once', function
     'sqlsrv, strings, names and comments' => [DbDriver::Sqlsrv, 'SELECT 1', ",'a',[b]/**/", ''],
 ]);
 
+test('a maximum-size dotted name chain inside EXPLAIN or KILL is parsed in bounded memory', function (DbDriver $driver, string $head, string $tail, StatementType $type) {
+    // The vendor EXPLAIN and KILL statements parse the statement they nest
+    // with a stock parser, which keeps an exception and a stack trace for each
+    // of the errors a dotted name chain makes it raise: a 63 KB chain took
+    // about 300 MB and ran a 256M worker out of memory. The nested statement
+    // is now checked first with a parser that keeps its first error only.
+    $sql = $head.str_repeat('.a', intdiv(63000 - strlen($head) - strlen($tail), 2)).$tail;
+
+    // See the linear-time lexing test above for the collector.
+    gc_disable();
+
+    try {
+        gc_collect_cycles();
+        memory_reset_peak_usage();
+        $memory = memory_get_usage();
+        $result = inspect($sql, $driver);
+        $peak = memory_get_peak_usage() - $memory;
+        $garbage = gc_collect_cycles();
+    } finally {
+        gc_enable();
+        gc_collect_cycles();
+        gc_mem_caches();
+    }
+
+    expect($result->passes())->toBeTrue()
+        ->and($result->type())->toBe($type)
+        ->and($peak)->toBeLessThan(64 * 1024 * 1024)
+        ->and($garbage)->toBe(0);
+})->with([
+    'EXPLAIN SELECT, mysql' => [DbDriver::Mysql, 'EXPLAIN SELECT a', ' FROM t', StatementType::Read],
+    'EXPLAIN SELECT, pgsql' => [DbDriver::Pgsql, 'EXPLAIN SELECT a', ' FROM t', StatementType::Read],
+    'EXPLAIN FORMAT=JSON SELECT, mysql' => [DbDriver::Mysql, 'EXPLAIN FORMAT=JSON SELECT a', ' FROM t', StatementType::Read],
+    'DESCRIBE SELECT, mysql' => [DbDriver::Mysql, 'DESCRIBE SELECT a', ' FROM t', StatementType::Read],
+    'KILL (SELECT), mysql' => [DbDriver::Mysql, 'KILL (SELECT a', ')', StatementType::Write],
+]);
+
+test('a maximum-size dotted name chain behind a prefix or inside a WITH is parsed in bounded memory', function (DbDriver $driver, string $head, string $tail) {
+    // The vendor parser starts a statement at any EXPLAIN, DESCRIBE or KILL
+    // it meets, whatever stands before it, and a WITH hands its bodies to a
+    // stock parser as well. Whether the statement is allowed is not the point
+    // here: the inspector has to answer instead of running a worker out of
+    // memory, wherever the chain sits.
+    $sql = $head.str_repeat('.a', intdiv(63000 - strlen($head) - strlen($tail), 2)).$tail;
+
+    // See the linear-time lexing test above for the collector.
+    gc_disable();
+
+    try {
+        gc_collect_cycles();
+        memory_reset_peak_usage();
+        $memory = memory_get_usage();
+        $result = inspect($sql, $driver);
+        $peak = memory_get_peak_usage() - $memory;
+        $garbage = gc_collect_cycles();
+    } finally {
+        gc_enable();
+        gc_collect_cycles();
+        gc_mem_caches();
+    }
+
+    expect($result)->toBeInstanceOf(InspectionResult::class)
+        ->and($peak)->toBeLessThan(64 * 1024 * 1024)
+        ->and($garbage)->toBe(0);
+})->with([
+    'unknown word, EXPLAIN, mysql' => [DbDriver::Mysql, 'FOO EXPLAIN SELECT a', ' FROM t'],
+    'unknown word, EXPLAIN, pgsql' => [DbDriver::Pgsql, 'FOO EXPLAIN SELECT a', ' FROM t'],
+    'DENY, EXPLAIN, mysql' => [DbDriver::Mysql, 'DENY EXPLAIN SELECT a', ' FROM t'],
+    'after a WHERE, EXPLAIN, mysql' => [DbDriver::Mysql, 'SELECT 1 FROM t WHERE 1 EXPLAIN SELECT a', ' FROM t'],
+    'after a WHERE, EXPLAIN, pgsql' => [DbDriver::Pgsql, 'SELECT 1 FROM t WHERE 1 EXPLAIN SELECT a', ' FROM t'],
+    'after a delimiter, EXPLAIN, mysql' => [DbDriver::Mysql, 'SELECT 1; FOO EXPLAIN SELECT a', ' FROM t'],
+    'after a WITH, EXPLAIN, mysql' => [DbDriver::Mysql, 'WITH c AS (SELECT 1) EXPLAIN SELECT a', ' FROM t'],
+    'after a WITH, EXPLAIN, pgsql' => [DbDriver::Pgsql, 'WITH c AS (SELECT 1) EXPLAIN SELECT a', ' FROM t'],
+    'unknown word, DESCRIBE, mysql' => [DbDriver::Mysql, 'FOO DESCRIBE SELECT a', ' FROM t'],
+    'repeated EXPLAIN, pgsql' => [DbDriver::Pgsql, 'EXPLAIN EXPLAIN EXPLAIN SELECT a', ' FROM t'],
+    'unknown word, KILL, mysql' => [DbDriver::Mysql, 'FOO KILL (SELECT a', ')'],
+    'WITH body, mysql' => [DbDriver::Mysql, 'WITH c AS (SELECT a', ') SELECT * FROM c'],
+    'WITH body, pgsql' => [DbDriver::Pgsql, 'WITH c AS (SELECT a', ') SELECT * FROM c'],
+    'second WITH body, mysql' => [DbDriver::Mysql, 'WITH c AS (SELECT 1), e AS (SELECT a', ') SELECT * FROM c'],
+    'WITH body behind a prefix, mysql' => [DbDriver::Mysql, 'FOO WITH c AS (SELECT a', ') SELECT * FROM c'],
+    'WITH body after a delimiter, pgsql' => [DbDriver::Pgsql, 'SELECT 1; WITH c AS (SELECT a', ') SELECT * FROM c'],
+    'WITH main statement, pgsql' => [DbDriver::Pgsql, 'WITH c AS (SELECT 1) SELECT a', ' FROM c'],
+]);
+
+test('a nested statement the parser is not run over keeps the WHERE guard of UPDATE and DELETE', function (DbDriver $driver, string $sql, bool $allowed) {
+    // A nested statement that does not parse, or more of them than are
+    // probed one by one, is not handed to the vendor parser. The statement
+    // is still read from a parse tree: reading the WHERE clause off the text
+    // would take the WHERE of a subquery for the one the statement needs.
+    $result = inspect($sql, $driver);
+
+    expect($result->passes())->toBe($allowed);
+
+    if (! $allowed) {
+        expect($result->violations)->toHaveCount(1)
+            ->and($result->violations[0])->toMatch('/^Statement 1: (UPDATE|DELETE) without a WHERE clause is not allowed\.$/');
+    }
+})->with(function () {
+    $descending = str_repeat('a DESC, ', 17);
+    $subquery = '(SELECT 1 FROM u WHERE u.id = 1)';
+
+    return [
+        'explain as a column, UPDATE, pgsql' => [DbDriver::Pgsql, "UPDATE t SET a = explain + {$subquery}", false],
+        'explain as a column, DELETE, pgsql' => [DbDriver::Pgsql, 'DELETE FROM t WHERE explain OR (SELECT 1)', false],
+        'more probes than the cap, DELETE, mysql' => [DbDriver::Mysql, "DELETE FROM t ORDER BY {$descending}{$subquery}", false],
+        'more probes than the cap, UPDATE, mysql' => [DbDriver::Mysql, "UPDATE t SET a = 1 ORDER BY {$descending}{$subquery}", false],
+        'more probes than the cap, DELETE with a WHERE, mysql' => [DbDriver::Mysql, "DELETE FROM t WHERE id = 1 ORDER BY {$descending}a", true],
+        'more probes than the cap, UPDATE with a WHERE, mysql' => [DbDriver::Mysql, "UPDATE t SET a = 1 WHERE id = 1 ORDER BY {$descending}a", true],
+        'below the cap, DELETE, mysql' => [DbDriver::Mysql, "DELETE FROM t ORDER BY a DESC, {$subquery}", false],
+    ];
+});
+
 dataset('invalid utf-8 bypasses', [
     'bad byte in a block comment' => ["DROP DATABASE prod /* \xC3\xA9\xFF */"],
     'bad byte in a string literal' => ["DROP DATABASE prod; SELECT '\xC3\xA9\xFF'"],
