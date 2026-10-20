@@ -21,6 +21,11 @@
         </include>
     </source>
     <php>
+        <!-- Pest loads every test and dataset row up front (about 75 MB before the first test
+             runs), and the linear-time lexing tests in SqlInspectorTest keep the collector
+             off while they hold tens of thousands of tokens. The suite needs about 140 MB
+             at its peak, which is over the 128 MB default. -->
+        <ini name="memory_limit" value="256M"/>
         <env name="APP_ENV" value="testing"/>
         <env name="APP_KEY" value="base64:cXVlcnlwcm94eS1waHB1bml0LWtleS1ub3Qtc2VjcmU="/>
         <env name="APP_MAINTENANCE_DRIVER" value="file"/>

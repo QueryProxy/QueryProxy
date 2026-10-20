@@ -89,9 +89,12 @@
                 @if ($expandedId === $log->id)
                     <tr class="bg-canvas">
                         <td colspan="7" class="border-b border-line px-3.5 py-3.5">
-                            @if ($log->sql)
+                            @if ($log->sqlIsHidden())
                                 <p class="eyebrow mb-1.5">Statement</p>
-                                <x-ui.code class="mb-3 whitespace-pre-wrap">{{ $log->sql }}</x-ui.code>
+                                <p class="mb-3 text-[13px] text-mute-4">SQL hidden — it could not be redacted safely. Review the request in QueryProxy.</p>
+                            @elseif ($log->sql_redacted)
+                                <p class="eyebrow mb-1.5">Statement (literals redacted)</p>
+                                <x-ui.code class="mb-3 whitespace-pre-wrap">{{ $log->sql_redacted }}</x-ui.code>
                             @endif
                             @if ($log->metadata)
                                 <p class="eyebrow mb-1.5">Metadata</p>

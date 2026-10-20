@@ -68,6 +68,16 @@ class QueryRequestPolicy
         return $user->isDbaIn($request->team);
     }
 
+    /**
+     * The raw SQL text carries the literal values (ADR-009 amendment 2026-10-20):
+     * only the requester, the request's team DBA and a system admin see it.
+     * Everyone else who may `view` the request (the auditor) gets redactedSql().
+     */
+    public function viewRawSql(User $user, QueryRequest $request): bool
+    {
+        return $this->viewResult($user, $request);
+    }
+
     public function downloadResult(User $user, QueryRequest $request): bool
     {
         return $request->hasResult() && $this->viewResult($user, $request);

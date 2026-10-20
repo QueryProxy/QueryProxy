@@ -3,10 +3,12 @@
 namespace App\Services\Chat;
 
 use App\Enums\ChatProvider;
+use App\Enums\ChatSqlMode;
 use App\Enums\QueryRequestStatus;
 use App\Models\ChatApprovalToken;
 use App\Models\ChatIntegration;
 use App\Models\QueryRequest;
+use App\Services\Sql\SqlRedactor;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -174,14 +176,29 @@ class ChatNotifier
         ];
     }
 
-    /** SQL literals can carry sensitive values; sending them to chat is opt-out. */
+    /**
+     * SQL literals can carry sensitive values (ADR-017): by default they are
+     * replaced by `?`, and SQL the redactor cannot parse is not sent at all.
+     */
     private function sqlPreview(QueryRequest $request): string
     {
-        if (! config('queryproxy.chat_include_sql', true)) {
+        $mode = ChatSqlMode::fromConfig(config('queryproxy.chat_include_sql'));
+
+        if ($mode === ChatSqlMode::None) {
             return '(SQL preview disabled — review in QueryProxy)';
         }
 
-        return (string) str($request->sql_prepared)->limit(400);
+        $sql = (string) $request->sql_prepared;
+
+        if ($mode === ChatSqlMode::LiteralsRedacted) {
+            $sql = app(SqlRedactor::class)->redact($sql, $request->connection?->driver);
+
+            if ($sql === null) {
+                return '(SQL hidden — review in QueryProxy)';
+            }
+        }
+
+        return (string) str($sql)->limit(400);
     }
 
     /**

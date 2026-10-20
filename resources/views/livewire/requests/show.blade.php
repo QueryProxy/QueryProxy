@@ -46,11 +46,22 @@
 
     <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div class="flex flex-col gap-4 lg:col-span-2">
-            <x-ui.panel title="SQL to execute">
-                <x-ui.code class="rounded-none border-0 bg-canvas">{{ $request->sql_prepared }}</x-ui.code>
-            </x-ui.panel>
+            @can('viewRawSql', $request)
+                <x-ui.panel title="SQL to execute">
+                    <x-ui.code class="rounded-none border-0 bg-canvas">{{ $request->sql_prepared }}</x-ui.code>
+                </x-ui.panel>
+            @else
+                @php($redactedSql = $request->redactedSql())
+                <x-ui.panel title="SQL to execute (literals redacted)">
+                    @if ($redactedSql === null)
+                        <p class="px-4 py-3 text-[13px] text-mute-4">SQL hidden — it could not be redacted safely.</p>
+                    @else
+                        <x-ui.code class="rounded-none border-0 bg-canvas">{{ $redactedSql }}</x-ui.code>
+                    @endif
+                </x-ui.panel>
+            @endcan
 
-            @if ($request->sql_prepared !== $request->sql_original)
+            @if ($request->sql_prepared !== $request->sql_original && auth()->user()->can('viewRawSql', $request))
                 <x-ui.panel>
                     <x-slot:header>
                         <span class="font-display text-[11.5px] font-semibold uppercase tracking-[0.07em] text-ink-4">As submitted</span>

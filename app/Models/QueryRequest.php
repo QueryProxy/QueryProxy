@@ -4,6 +4,7 @@ namespace App\Models;
 
 use App\Enums\QueryRequestStatus;
 use App\Enums\StatementType;
+use App\Services\Sql\SqlRedactor;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -64,6 +65,18 @@ class QueryRequest extends Model
     public function scopePending(Builder $query): Builder
     {
         return $query->where('status', QueryRequestStatus::Pending);
+    }
+
+    /**
+     * The SQL with its literals replaced by `?`, for viewers who may not see the
+     * raw text (see QueryRequestPolicy::viewRawSql). Null when it cannot be
+     * redacted safely: the caller shows no SQL then, never the raw statement.
+     *
+     * @param  'sql_prepared'|'sql_original'  $column
+     */
+    public function redactedSql(string $column = 'sql_prepared'): ?string
+    {
+        return app(SqlRedactor::class)->redact((string) $this->getAttribute($column), $this->getRelationValue('connection')?->driver);
     }
 
     public function isPending(): bool

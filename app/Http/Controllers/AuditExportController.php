@@ -28,7 +28,7 @@ class AuditExportController extends Controller
                 fn ($q) => $q->whereNull('team_id'),
                 fn ($q) => $q->where('team_id', $team->id),
             )
-            ->with('user')
+            ->with(['user', 'connection'])
             ->when($request->filled('action'), fn ($q) => $q->where('action', 'like', $request->string('action').'%'))
             ->when($request->filled('actor'), fn ($q) => $q->whereHas('user', fn ($u) => $u->where('email', 'like', '%'.$request->string('actor').'%')
                 ->orWhere('name', 'like', '%'.$request->string('actor').'%')))
@@ -39,7 +39,8 @@ class AuditExportController extends Controller
         return response()->streamDownload(function () use ($query) {
             $out = fopen('php://output', 'w');
 
-            fputcsv($out, ['timestamp', 'action', 'actor', 'query_request_id', 'connection_id', 'ip', 'sql', 'metadata']);
+            // Raw `sql` is never exported, whoever asks: the CSV carries the redacted statement only.
+            fputcsv($out, ['timestamp', 'action', 'actor', 'query_request_id', 'connection_id', 'ip', 'sql_redacted', 'metadata']);
 
             $query->lazyById(500)->each(function (AuditLog $log) use ($out) {
                 fputcsv($out, array_map([Csv::class, 'sanitize'], [
@@ -49,7 +50,7 @@ class AuditExportController extends Controller
                     $log->query_request_id,
                     $log->connection_id,
                     $log->ip,
-                    $log->sql,
+                    $log->sqlIsHidden() ? '[SQL hidden]' : $log->sql_redacted,
                     $log->metadata ? json_encode($log->metadata) : null,
                 ]));
             });

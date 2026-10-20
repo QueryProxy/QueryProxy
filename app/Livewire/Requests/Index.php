@@ -33,7 +33,7 @@ class Index extends Component
         $team = $this->team();
 
         $query = QueryRequest::forTeam($team)
-            ->with(['connection', 'requester'])
+            ->with(['connection', 'requester', 'team'])
             ->latest();
 
         // Developers only see their own requests; DBAs / auditors / admins see the team's.

@@ -31,7 +31,13 @@
                     </x-ui.td>
                     <x-ui.td truncate>
                         <a href="{{ route('requests.show', $request) }}" class="block truncate text-ink-2 hover:text-accent">
-                            {{ $request->title ?? str($request->sql_original)->limit(60) }}
+                            @if ($request->title)
+                                {{ $request->title }}
+                            @elseif (auth()->user()->can('viewRawSql', $request))
+                                {{ str($request->sql_original)->limit(60) }}
+                            @else
+                                {{ str($request->redactedSql('sql_original') ?? '(SQL hidden)')->limit(60) }}
+                            @endif
                         </a>
                     </x-ui.td>
                     <x-ui.td mono muted nowrap>{{ $request->connection->name }}</x-ui.td>

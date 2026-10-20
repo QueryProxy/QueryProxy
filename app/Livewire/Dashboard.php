@@ -101,7 +101,7 @@ class Dashboard extends Component
 
         return $this->visibleRequests($user, $team)
             ->when($statuses !== [], fn (Builder $query) => $query->whereIn('status', $statuses))
-            ->with(['connection', 'requester'])
+            ->with(['connection', 'requester', 'team'])
             ->latest()
             ->limit(8)
             ->get();

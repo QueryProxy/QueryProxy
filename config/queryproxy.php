@@ -1,5 +1,6 @@
 <?php
 
+use App\Enums\ChatSqlMode;
 use App\Services\Sql\SqlInspector;
 use App\Support\ExecutionTimeout;
 
@@ -161,8 +162,10 @@ return [
     |--------------------------------------------------------------------------
     | Outbound webhook URLs must resolve to one of these host patterns (SSRF
     | guard). Extend with a comma-separated list when your Teams flow lives on
-    | a different domain. `chat_include_sql` embeds a 400-char SQL preview in
-    | the notification messages.
+    | a different domain. `chat_include_sql` controls the 400-char SQL preview in
+    | the notification messages: `full`, `literals_redacted` (default; string and
+    | number literals replaced by `?`) or `none`. The legacy booleans still work:
+    | true -> full, false -> none (see App\Enums\ChatSqlMode).
     */
 
     'chat_webhook_allowed_hosts' => array_values(array_filter(array_merge(
@@ -170,7 +173,7 @@ return [
         array_map('trim', explode(',', (string) env('QUERYPROXY_CHAT_WEBHOOK_ALLOWED_HOSTS', ''))),
     ))),
 
-    'chat_include_sql' => (bool) env('QUERYPROXY_CHAT_INCLUDE_SQL', true),
+    'chat_include_sql' => ChatSqlMode::fromConfig(env('QUERYPROXY_CHAT_INCLUDE_SQL'))->value,
 
     /*
     |--------------------------------------------------------------------------
