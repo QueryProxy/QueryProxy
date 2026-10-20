@@ -64,6 +64,26 @@
                     <x-ui.field label="Password" :hint="$editingId ? 'blank = keep current' : null" :error="$errors->first('password')">
                         <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
                     </x-ui.field>
+
+                    <x-ui.field label="Read-only username" hint="optional" :error="$errors->first('readUsername')">
+                        <x-ui.input type="text" wire:model="readUsername" autocomplete="off" />
+                    </x-ui.field>
+
+                    <x-ui.field label="Read-only password" :hint="$editingId ? 'blank = keep current' : 'optional'" :error="$errors->first('readPassword')">
+                        <x-ui.input type="password" wire:model="readPassword" autocomplete="new-password" />
+                    </x-ui.field>
+
+                    <div></div>
+
+                    @if ($driver === 'sqlsrv')
+                        <x-ui.alert tone="pending" icon="alert" class="sm:col-span-3">
+                            SQL Server has no engine-level READ ONLY mode, and <code class="font-mono">ApplicationIntent=ReadOnly</code> does not protect against writes. Read requests are only as read-only as the database user they run as: set a read-only username and password above, using a login that has SELECT permission only.
+                        </x-ui.alert>
+                    @else
+                        <p class="text-[12.5px] text-mute-4 sm:col-span-3">
+                            Read requests run in a READ ONLY transaction. When a read-only user is set, they also log in as that user instead of the main one.
+                        </p>
+                    @endif
                 @endif
 
                 <div class="flex items-end gap-2 sm:col-span-3">

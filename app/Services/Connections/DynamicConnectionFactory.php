@@ -4,12 +4,15 @@ namespace App\Services\Connections;
 
 use App\Enums\DbDriver;
 use App\Models\Connection;
+use App\Services\Execution\TargetSession;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use Throwable;
 
 class DynamicConnectionFactory
 {
+    public function __construct(private TargetSession $session) {}
+
     /**
      * Register a runtime Laravel database connection for the given target
      * and return its connection name. Always purge() after use.
@@ -21,6 +24,23 @@ class DynamicConnectionFactory
         $name = $this->connectionName($connection);
 
         config(["database.connections.{$name}" => $this->configFor($connection)]);
+
+        return $name;
+    }
+
+    /**
+     * Register a second runtime connection that logs in with the connection's
+     * read-only identity (read_username / read_password) and return its name.
+     * Only call this when $connection->hasReadCredentials(). purge() removes
+     * it together with the main connection.
+     */
+    public function configureRead(Connection $connection): string
+    {
+        $this->assertAllowedTarget($connection);
+
+        $name = $this->readConnectionName($connection);
+
+        config(["database.connections.{$name}" => $this->configFor($connection, readIdentity: true)]);
 
         return $name;
     }
@@ -135,6 +155,8 @@ class DynamicConnectionFactory
         $secrets = array_values(array_filter([
             $connection->password,
             $connection->username,
+            $connection->read_password,
+            $connection->read_username,
             $connection->host,
             $connection->database,
         ], fn ($value) => is_string($value) && $value !== ''));
@@ -144,10 +166,10 @@ class DynamicConnectionFactory
 
     public function purge(Connection $connection): void
     {
-        $name = $this->connectionName($connection);
-
-        DB::purge($name);
-        config(["database.connections.{$name}" => null]);
+        foreach ([$this->connectionName($connection), $this->readConnectionName($connection)] as $name) {
+            DB::purge($name);
+            config(["database.connections.{$name}" => null]);
+        }
     }
 
     /**
@@ -157,6 +179,8 @@ class DynamicConnectionFactory
      */
     public function test(Connection $connection): array
     {
+        $readProbe = false;
+
         try {
             $name = $this->configure($connection);
 
@@ -164,9 +188,20 @@ class DynamicConnectionFactory
             DB::connection($name)->select($this->probeQuery($connection->driver));
             $latency = (hrtime(true) - $start) / 1_000_000;
 
+            if ($connection->hasReadCredentials() && $connection->driver !== DbDriver::Sqlite) {
+                $readProbe = true;
+                DB::connection($this->configureRead($connection))->select($this->probeQuery($connection->driver));
+            }
+
             return ['ok' => true, 'latency_ms' => round($latency, 1), 'error' => null];
         } catch (Throwable $e) {
-            return ['ok' => false, 'latency_ms' => null, 'error' => $this->redactError($e->getMessage(), $connection)];
+            $error = $this->redactError($e->getMessage(), $connection);
+
+            return [
+                'ok' => false,
+                'latency_ms' => null,
+                'error' => $readProbe ? 'Read credentials: '.$error : $error,
+            ];
         } finally {
             $this->purge($connection);
         }
@@ -177,12 +212,19 @@ class DynamicConnectionFactory
         return 'queryproxy_target_'.$connection->id;
     }
 
+    public function readConnectionName(Connection $connection): string
+    {
+        return $this->connectionName($connection).'_read';
+    }
+
     /**
+     * @param  bool  $readIdentity  log in as read_username / read_password instead of the main identity
      * @return array<string, mixed>
      */
-    public function configFor(Connection $connection): array
+    public function configFor(Connection $connection, bool $readIdentity = false): array
     {
         $driver = $connection->driver;
+        $options = $this->session->pdoOptions($driver);
 
         if ($driver === DbDriver::Sqlite) {
             return [
@@ -190,6 +232,7 @@ class DynamicConnectionFactory
                 'database' => $connection->database,
                 'prefix' => '',
                 'foreign_key_constraints' => true,
+                'options' => $options,
             ];
         }
 
@@ -198,10 +241,14 @@ class DynamicConnectionFactory
             'host' => $connection->host,
             'port' => (int) ($connection->port ?: $driver->defaultPort()),
             'database' => $connection->database,
-            'username' => $connection->username,
-            'password' => $connection->password ?? '',
+            'username' => $readIdentity ? $connection->read_username : $connection->username,
+            'password' => ($readIdentity ? $connection->read_password : $connection->password) ?? '',
             'prefix' => '',
         ];
+
+        if ($options !== []) {
+            $config['options'] = $options;
+        }
 
         return match ($driver) {
             DbDriver::Mysql, DbDriver::Mariadb => $config + [

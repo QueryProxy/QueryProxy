@@ -24,22 +24,42 @@ final class ExecutionTimeout
 
     public const MAX = 86400;
 
+    /** Seconds a statement waits for a lock on the target database by default. */
+    public const LOCK_DEFAULT = 5;
+
+    /**
+     * Upper bound for the lock timeout: one hour, far below the point where
+     * the millisecond value would overflow a 32-bit server setting.
+     */
+    public const LOCK_MAX = 3600;
+
     public static function resolve(mixed $raw): int
     {
+        return self::resolveBounded($raw, self::DEFAULT, self::MAX);
+    }
+
+    /** QUERYPROXY_LOCK_TIMEOUT, resolved by the same rule as the execution timeout. */
+    public static function resolveLock(mixed $raw): int
+    {
+        return self::resolveBounded($raw, self::LOCK_DEFAULT, self::LOCK_MAX);
+    }
+
+    private static function resolveBounded(mixed $raw, int $default, int $max): int
+    {
         if (! is_string($raw) || ! ctype_digit($raw)) {
-            return self::DEFAULT;
+            return $default;
         }
 
         $digits = ltrim($raw, '0');
 
         if ($digits === '') {
-            return self::DEFAULT;
+            return $default;
         }
 
-        if (strlen($digits) > strlen((string) self::MAX)) {
-            return self::MAX;
+        if (strlen($digits) > strlen((string) $max)) {
+            return $max;
         }
 
-        return min((int) $digits, self::MAX);
+        return min((int) $digits, $max);
     }
 }

@@ -36,6 +36,10 @@ class Index extends Component
 
     public string $password = '';
 
+    public string $readUsername = '';
+
+    public string $readPassword = '';
+
     /** @var array{ok: bool, latency_ms: float|null, error: string|null}|null */
     public ?array $testResult = null;
 
@@ -67,6 +71,8 @@ class Index extends Component
         $this->database = (string) $connection->database;
         $this->username = (string) $connection->username;
         $this->password = '';
+        $this->readUsername = (string) $connection->read_username;
+        $this->readPassword = '';
         $this->showForm = true;
     }
 
@@ -82,6 +88,8 @@ class Index extends Component
             'database' => ['required', 'string', 'max:1024'],
             'username' => ['nullable', 'string', 'max:255', 'required_unless:driver,sqlite'],
             'password' => ['nullable', 'string', 'max:1024'],
+            'readUsername' => ['nullable', 'string', 'max:255'],
+            'readPassword' => ['nullable', 'string', 'max:1024'],
         ]);
 
         $attributes = [
@@ -92,6 +100,17 @@ class Index extends Component
             'database' => $validated['database'],
             'username' => $validated['username'] ?: null,
         ];
+
+        // The read-only identity is optional and meaningless for SQLite
+        // (a file has no users); a blank username drops the whole identity.
+        $keepReadIdentity = $validated['driver'] !== DbDriver::Sqlite->value && trim($this->readUsername) !== '';
+
+        if ($keepReadIdentity) {
+            $attributes['read_username'] = $this->readUsername;
+        } else {
+            $attributes['read_username'] = null;
+            $attributes['read_password'] = null;
+        }
 
         $violations = $factory->targetViolations(new Connection($attributes));
 
@@ -110,6 +129,10 @@ class Index extends Component
                 $attributes['password'] = $this->password;
             }
 
+            if ($keepReadIdentity && $this->readPassword !== '') {
+                $attributes['read_password'] = $this->readPassword;
+            }
+
             $connection->update($attributes);
             audit()->record('connection.updated', connection: $connection, metadata: ['name' => $connection->name]);
         } else {
@@ -118,6 +141,7 @@ class Index extends Component
             $connection = Connection::create($attributes + [
                 'team_id' => $team->id,
                 'password' => $this->password !== '' ? $this->password : null,
+                'read_password' => $keepReadIdentity && $this->readPassword !== '' ? $this->readPassword : null,
                 'created_by' => auth()->id(),
             ]);
             audit()->record('connection.created', connection: $connection, metadata: ['name' => $connection->name]);
@@ -185,7 +209,7 @@ class Index extends Component
 
     private function resetForm(): void
     {
-        $this->reset('editingId', 'name', 'host', 'port', 'database', 'username', 'password');
+        $this->reset('editingId', 'name', 'host', 'port', 'database', 'username', 'password', 'readUsername', 'readPassword');
         $this->driver = 'pgsql';
         $this->resetErrorBag();
     }

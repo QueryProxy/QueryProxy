@@ -38,6 +38,22 @@ return [
 
     'execution_timeout' => $executionTimeout,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Database lock timeout
+    |--------------------------------------------------------------------------
+    |
+    | Seconds a statement waits for a lock on the target database before the
+    | database gives up (pgsql lock_timeout, mysql / mariadb
+    | innodb_lock_wait_timeout, sqlsrv LOCK_TIMEOUT, sqlite busy timeout).
+    | Digits only, 1 to 3600; anything else falls back to 5 (see ExecutionTimeout).
+    | The statement timeout itself is derived from the execution timeout
+    | above, minus a margin, so the database stops before the job does.
+    |
+    */
+
+    'lock_timeout' => ExecutionTimeout::resolveLock(env('QUERYPROXY_LOCK_TIMEOUT', '5')),
+
     'result_disk' => env('QUERYPROXY_RESULT_DISK', 'local'),
 
     'result_ttl_days' => (int) env('QUERYPROXY_RESULT_TTL_DAYS', 30),

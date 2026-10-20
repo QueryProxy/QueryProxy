@@ -162,3 +162,93 @@ test('the SQLite form shows no warning once an allowed directory is set', functi
         ->set('driver', 'sqlite')
         ->assertDontSee('QUERYPROXY_SQLITE_ALLOWED_DIR');
 });
+
+test('the form saves a read-only identity with an encrypted password', function () {
+    [$team, $dba] = makeTeamUser('dba');
+
+    Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openCreate')
+        ->set('name', 'Reporting')
+        ->set('driver', 'pgsql')
+        ->set('host', 'db.example.test')
+        ->set('database', 'app')
+        ->set('username', 'writer')
+        ->set('password', 'w-secret')
+        ->set('readUsername', 'reader')
+        ->set('readPassword', 'r-secret')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $connection = Connection::where('team_id', $team->id)->where('name', 'Reporting')->firstOrFail();
+    $raw = DB::table('connections')->where('id', $connection->id)->first();
+
+    expect($connection->read_username)->toBe('reader')
+        ->and($connection->read_password)->toBe('r-secret')
+        ->and($raw->read_password)->not->toContain('r-secret')
+        ->and($connection->hasReadCredentials())->toBeTrue();
+});
+
+test('editing with a blank read password keeps the stored one, a blank read username clears the identity', function () {
+    [$team, $dba] = makeTeamUser('dba');
+    $connection = Connection::factory()->create([
+        'team_id' => $team->id, 'read_username' => 'reader', 'read_password' => 'r-secret',
+    ]);
+
+    $component = Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openEdit', $connection->id)
+        ->assertSet('readUsername', 'reader')
+        ->assertSet('readPassword', '')
+        ->set('name', 'Renamed')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect($connection->fresh()->read_username)->toBe('reader')
+        ->and($connection->fresh()->read_password)->toBe('r-secret');
+
+    $component
+        ->call('openEdit', $connection->id)
+        ->set('readUsername', '')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect($connection->fresh()->read_username)->toBeNull()
+        ->and($connection->fresh()->read_password)->toBeNull()
+        ->and($connection->fresh()->hasReadCredentials())->toBeFalse();
+});
+
+test('a SQLite connection never keeps a read-only identity', function () {
+    config(['queryproxy.sqlite_allowed_dir' => sys_get_temp_dir()]);
+    [$team, $dba] = makeTeamUser('dba');
+    $dbFile = tempnam(sys_get_temp_dir(), 'qp_readid_');
+
+    Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openCreate')
+        ->set('driver', 'sqlite')
+        ->set('name', 'Local')
+        ->set('database', $dbFile)
+        ->set('readUsername', 'reader')
+        ->set('readPassword', 'r-secret')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    expect(Connection::where('team_id', $team->id)->firstOrFail()->read_username)->toBeNull();
+
+    @unlink($dbFile);
+});
+
+test('the form warns that SQL Server has no engine-level read-only mode', function () {
+    [, $dba] = makeTeamUser('dba');
+
+    Livewire::actingAs($dba)
+        ->test(Index::class)
+        ->call('openCreate')
+        ->assertSee('Read-only username')
+        ->assertDontSee('no engine-level READ ONLY')
+        ->set('driver', 'sqlsrv')
+        ->assertSee('no engine-level READ ONLY')
+        ->set('driver', 'sqlite')
+        ->assertDontSee('Read-only username');
+});

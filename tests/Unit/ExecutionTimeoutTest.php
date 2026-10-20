@@ -43,3 +43,20 @@ test('an invalid value falls back to the default', function (mixed $raw) {
     'bool' => [true],
     'int' => [60],
 ]);
+
+test('the lock timeout follows the same rule with its own default and a one hour maximum', function (mixed $raw, int $expected) {
+    expect(ExecutionTimeout::resolveLock($raw))->toBe($expected);
+})->with([
+    'valid' => ['7', 7],
+    'leading zeros' => ['0030', 30],
+    'the maximum' => ['3600', 3600],
+    'above the maximum' => ['3601', 3600],
+    'a value that would overflow a 32-bit millisecond setting' => ['3000000', 3600],
+    'huge' => [str_repeat('9', 30), 3600],
+    'text' => ['abc', 5],
+    'empty' => ['', 5],
+    'zero' => ['0', 5],
+    'negative' => ['-1', 5],
+    'decimal' => ['2.5', 5],
+    'not a string' => [null, 5],
+]);

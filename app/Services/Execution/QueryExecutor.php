@@ -44,6 +44,7 @@ class QueryExecutor
         private SqlInspector $inspector,
         private Masker $masker,
         private ErrorMessageSanitizer $errors,
+        private TargetSession $session,
     ) {}
 
     public function execute(QueryRequest $request): void
@@ -89,8 +90,17 @@ class QueryExecutor
                 $this->assertWritableDefaultDatabase($connection, $connectionName);
             }
 
+            // Reads log in as the connection's read-only identity when it has
+            // one; everything else uses the main identity.
+            $readConnectionName = $connectionName;
+
+            if ($isRead && $connection->hasReadCredentials() && $connection->driver !== DbDriver::Sqlite) {
+                $readConnectionName = $this->factory->configureRead($connection);
+                $this->assertDefaultQuoting($connection, $readConnectionName);
+            }
+
             $outcome = $isRead
-                ? $this->executeRead($request, $connectionName, $statements[0])
+                ? $this->executeRead($request, $readConnectionName, $statements[0])
                 : $this->executeWrite($request, $connectionName, $statements);
 
             $durationMs = intdiv(hrtime(true) - $start, 1_000_000);
@@ -142,11 +152,12 @@ class QueryExecutor
                 return;
             }
 
-            Log::warning('Query execution failed.', [
+            Log::warning('Query execution failed.', array_filter([
                 'query_request_id' => $request->id,
                 'exception' => $e::class,
                 'message' => $e->getMessage(),
-            ]);
+                'previous' => $e->getPrevious()?->getMessage(),
+            ], fn ($value) => $value !== null));
 
             $durationMs = intdiv(hrtime(true) - $start, 1_000_000);
 
@@ -356,12 +367,21 @@ class QueryExecutor
         // EXPLAIN, ...) can never stream more than the hard cap.
         $hardLimit = max(1, (int) config('queryproxy.select_hard_limit', 10000));
 
+        $db = DB::connection($connectionName);
+        $driver = $request->connection->driver;
+        $sessionOpened = false;
+
         try {
             $columns = [];
             $rowCount = 0;
             $truncated = false;
 
-            foreach (DB::connection($connectionName)->cursor($sql) as $row) {
+            // The database itself refuses writes (and long statements) for the
+            // length of the read, whatever the SQL says.
+            $sessionOpened = true;
+            $this->session->beginReadOnly($db, $driver);
+
+            foreach ($db->cursor($sql) as $row) {
                 if ($rowCount >= $hardLimit) {
                     $truncated = true;
 
@@ -380,6 +400,9 @@ class QueryExecutor
                 $rowCount++;
             }
 
+            $this->session->endReadOnly($db, commit: true);
+            $sessionOpened = false;
+
             rewind($temp);
             Storage::disk($disk)->put($path, $temp);
 
@@ -390,6 +413,20 @@ class QueryExecutor
                 'result_truncated' => $truncated,
                 'result_columns' => json_encode($columns),
             ];
+        } catch (Throwable $e) {
+            if ($sessionOpened) {
+                $this->session->endReadOnly($db, commit: false);
+            }
+
+            if (TargetSession::isReadOnlyViolation($e)) {
+                throw new RuntimeException(
+                    'This statement tried to change data, but read requests run in a read-only database session. '.
+                    'Submit it as a write request if the change is intended.',
+                    previous: $e,
+                );
+            }
+
+            throw $e;
         } finally {
             if (is_resource($temp)) {
                 fclose($temp);
@@ -434,7 +471,15 @@ class QueryExecutor
     {
         $connection = DB::connection($connectionName);
 
-        $run = function () use ($connection, $statements): int {
+        $driver = $request->connection->driver;
+
+        // Multi-statement requests always run atomically; single writes run as-is.
+        $transactional = count($statements) > 1 || $request->is_transaction;
+
+        $run = function () use ($connection, $statements, $driver, $transactional): int {
+            // Inside the transaction so pgsql can scope the limits with SET LOCAL.
+            $this->session->applyLimits($connection, $driver, $transactional);
+
             $affected = 0;
 
             foreach ($statements as $statement) {
@@ -444,10 +489,7 @@ class QueryExecutor
             return $affected;
         };
 
-        // Multi-statement requests always run atomically; single writes run as-is.
-        $affected = count($statements) > 1 || $request->is_transaction
-            ? $connection->transaction($run)
-            : $run();
+        $affected = $transactional ? $connection->transaction($run) : $run();
 
         return ['affected_rows' => $affected];
     }

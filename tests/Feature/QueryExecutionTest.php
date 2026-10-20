@@ -10,6 +10,7 @@ use App\Models\Team;
 use App\Notifications\QueryRequestFinished;
 use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Execution\QueryExecutor;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Notification;
@@ -228,6 +229,20 @@ function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $drive
                 parent::__construct($pdo, $database, $tablePrefix, $config);
             }
 
+            // SQLite does not understand the SET statements the executor issues
+            // for MySQL / MariaDB; swallow them but still report them to
+            // DB::listen so tests can assert on them.
+            public function unprepared($query)
+            {
+                if (str_starts_with($query, 'SET ')) {
+                    $this->event(new QueryExecuted($query, [], 0, $this));
+
+                    return true;
+                }
+
+                return parent::unprepared($query);
+            }
+
             public function scalar($query, $bindings = [], $useReadPdo = true)
             {
                 if ($query === 'SELECT DATABASE()') {
@@ -254,6 +269,18 @@ function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $drive
     test()->partialMock(DynamicConnectionFactory::class, function ($mock) use ($dbFile) {
         $mock->shouldReceive('configure')->andReturnUsing(function ($connection) use ($dbFile) {
             $name = 'queryproxy_target_'.$connection->id;
+
+            config(["database.connections.{$name}" => [
+                'driver' => 'fake_mysql_session',
+                'database' => $dbFile,
+                'prefix' => '',
+            ]]);
+
+            return $name;
+        });
+
+        $mock->shouldReceive('configureRead')->andReturnUsing(function ($connection) use ($dbFile) {
+            $name = 'queryproxy_target_'.$connection->id.'_read';
 
             config(["database.connections.{$name}" => [
                 'driver' => 'fake_mysql_session',

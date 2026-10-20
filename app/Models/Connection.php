@@ -13,7 +13,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'team_id', 'name', 'driver', 'host', 'port', 'database',
-    'username', 'password', 'options', 'created_by',
+    'username', 'password', 'read_username', 'read_password', 'options', 'created_by',
 ])]
 class Connection extends Model
 {
@@ -28,6 +28,8 @@ class Connection extends Model
             'database' => 'encrypted',
             'username' => 'encrypted',
             'password' => 'encrypted',
+            'read_username' => 'encrypted',
+            'read_password' => 'encrypted',
             'options' => 'array',
         ];
     }
@@ -61,6 +63,14 @@ class Connection extends Model
     public function scopeForTeam(Builder $query, Team $team): Builder
     {
         return $query->where('team_id', $team->id);
+    }
+
+    /**
+     * Whether SELECTs should run as a dedicated read-only database user.
+     */
+    public function hasReadCredentials(): bool
+    {
+        return is_string($this->read_username) && trim($this->read_username) !== '';
     }
 
     public function isGrantedTo(User $user): bool
