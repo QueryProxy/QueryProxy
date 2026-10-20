@@ -29,8 +29,47 @@ Please include:
 
 - You will receive a response within 7 days of your report.
 - The report is assessed and you are informed of the result.
+- For a confirmed critical vulnerability, the target is to release a fix within
+  14 days of confirmation. Other severities are fixed on a best-effort basis
+  and scheduled with the reporter. If a fix needs longer, you are told why and
+  given a new date.
 - After a fix is released, a GitHub Security Advisory is published.
 - If you wish, you are credited for the report in the advisory.
+
+## Verifying Release Images
+
+Every release image published to Docker Hub (`queryproxy/queryproxy`) and GitHub
+Container Registry (`ghcr.io/queryproxy/queryproxy`) is signed keyless with
+[cosign](https://github.com/sigstore/cosign) from the release workflow, and
+carries an SBOM and a SLSA provenance attestation. Replace `0.3.0` with the
+version you are checking.
+
+Verify the signature with cosign v3 or later: signatures are stored in the
+Sigstore bundle format as OCI 1.1 referrers, and cosign v2 does not find them
+(`no signatures found`). The identity must be the release workflow of this
+repository at a version tag (pre-release tags such as `v0.3.0-rc.1` included),
+issued by GitHub Actions:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/QueryProxy/QueryProxy/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/queryproxy/queryproxy:0.3.0
+```
+
+Inspect the SBOM and the provenance attached to the image:
+
+```sh
+docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.0 \
+  --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.0 \
+  --format '{{ json .Provenance }}'
+```
+
+An image whose signature does not verify, or that was not built by the release
+workflow, must not be deployed; report it as described above. The project's
+[OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/QueryProxy/QueryProxy)
+results are published weekly.
 
 ## Scope
 
