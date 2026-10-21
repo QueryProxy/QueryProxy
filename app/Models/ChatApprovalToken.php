@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\QueryRequestStatus;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -79,6 +80,26 @@ class ChatApprovalToken extends Model
             ->where('query_request_id', $request->id)
             ->where('token_hash', static::hash($token))
             ->where('expires_at', '>', now())
+            ->whereNull('used_at')
+            ->exists();
+    }
+
+    /**
+     * Did this token authorize the request once, and has it merely timed out
+     * while the request is still waiting? Only someone holding the real
+     * plaintext can match the hash, so telling them "expired" reveals nothing
+     * a stranger could probe for.
+     */
+    public static function hasExpiredFor(QueryRequest $request, string $token): bool
+    {
+        if ($token === '' || $request->status !== QueryRequestStatus::Pending) {
+            return false;
+        }
+
+        return static::query()
+            ->where('query_request_id', $request->id)
+            ->where('token_hash', static::hash($token))
+            ->where('expires_at', '<=', now())
             ->whereNull('used_at')
             ->exists();
     }

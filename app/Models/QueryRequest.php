@@ -10,11 +10,13 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 #[Fillable([
     'team_id', 'connection_id', 'user_id', 'title', 'sql_original', 'sql_prepared',
     'statement_count', 'is_transaction', 'is_ddl', 'type', 'status', 'note',
     'reviewed_by', 'reviewed_at', 'rejection_reason', 'review_channel',
+    'reminded_at', 'chat_renewed_at',
     'executed_at', 'duration_ms', 'affected_rows',
     'result_disk', 'result_path', 'result_row_count', 'result_truncated', 'result_columns',
     'error_message',
@@ -32,6 +34,8 @@ class QueryRequest extends Model
             'is_ddl' => 'boolean',
             'result_truncated' => 'boolean',
             'reviewed_at' => 'datetime',
+            'reminded_at' => 'datetime',
+            'chat_renewed_at' => 'datetime',
             'executed_at' => 'datetime',
             'result_columns' => 'array',
         ];
@@ -55,6 +59,11 @@ class QueryRequest extends Model
     public function reviewer(): BelongsTo
     {
         return $this->belongsTo(User::class, 'reviewed_by');
+    }
+
+    public function chatApprovalTokens(): HasMany
+    {
+        return $this->hasMany(ChatApprovalToken::class);
     }
 
     public function scopeForTeam(Builder $query, Team $team): Builder

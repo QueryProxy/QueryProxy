@@ -169,11 +169,24 @@ return [
     */
 
     'chat_webhook_allowed_hosts' => array_values(array_filter(array_merge(
-        ['hooks.slack.com', '*.webhook.office.com', '*.logic.azure.com'],
+        ['hooks.slack.com', '*.webhook.office.com', '*.logic.azure.com', '*.powerplatform.com'],
         array_map('trim', explode(',', (string) env('QUERYPROXY_CHAT_WEBHOOK_ALLOWED_HOSTS', ''))),
     ))),
 
     'chat_include_sql' => ChatSqlMode::fromConfig(env('QUERYPROXY_CHAT_INCLUDE_SQL'))->value,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Pending request reminder
+    |--------------------------------------------------------------------------
+    | A request still pending after this many hours is reminded about once (the
+    | team's DBAs and admins in-app, plus the chat channels with a fresh action
+    | token). Requests never expire. 0 disables the reminder only: chat cards
+    | whose buttons timed out are still re-posted (at most daily) while a
+    | request stays pending.
+    */
+
+    'pending_remind_after_hours' => max(0, (int) env('QUERYPROXY_PENDING_REMIND_AFTER', 4)),
 
     /*
     |--------------------------------------------------------------------------

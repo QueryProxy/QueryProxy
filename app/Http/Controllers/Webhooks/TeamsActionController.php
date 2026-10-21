@@ -37,6 +37,9 @@ class TeamsActionController extends Controller
     /** Vague on purpose — see SlackInteractionController::UNVERIFIED_ACTION. */
     private const UNVERIFIED_ACTION = 'This approval action could not be verified. Decide on the request in QueryProxy.';
 
+    /** The control timed out but the request is still waiting: point at the newer card. */
+    private const EXPIRED_ACTION = 'This approval action could not be verified: this button has expired. Use the button in the newer message, or decide on the request in QueryProxy.';
+
     public function __invoke(Request $request, ApprovalService $approvals): JsonResponse
     {
         $validated = $request->validate([
@@ -59,7 +62,12 @@ class TeamsActionController extends Controller
         }
 
         if (! ChatApprovalToken::isValidFor($queryRequest, $validated['token'])) {
-            return response()->json(['ok' => false, 'message' => self::UNVERIFIED_ACTION], 422);
+            return response()->json([
+                'ok' => false,
+                'message' => ChatApprovalToken::hasExpiredFor($queryRequest, $validated['token'])
+                    ? self::EXPIRED_ACTION
+                    : self::UNVERIFIED_ACTION,
+            ], 422);
         }
 
         $identity = ChatIdentity::query()

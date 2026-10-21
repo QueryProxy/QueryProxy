@@ -38,6 +38,9 @@ class SlackInteractionController extends Controller
      */
     private const UNVERIFIED_ACTION = 'This approval action could not be verified. Open the request in QueryProxy to decide.';
 
+    /** The control timed out but the request is still waiting: point at the newer card. */
+    private const EXPIRED_ACTION = 'This approval action could not be verified: this button has expired. Use the button in the newer message, or open the request in QueryProxy.';
+
     public function __invoke(Request $request, ApprovalService $approvals): JsonResponse
     {
         $payload = json_decode((string) $request->input('payload'), true);
@@ -74,7 +77,9 @@ class SlackInteractionController extends Controller
         }
 
         if (! ChatApprovalToken::isValidFor($queryRequest, $token)) {
-            return $this->ephemeral(self::UNVERIFIED_ACTION);
+            return $this->ephemeral(
+                ChatApprovalToken::hasExpiredFor($queryRequest, $token) ? self::EXPIRED_ACTION : self::UNVERIFIED_ACTION,
+            );
         }
 
         $identity = ChatIdentity::query()
