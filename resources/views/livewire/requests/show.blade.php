@@ -15,6 +15,7 @@
                 @if ($request->is_transaction)
                     <x-ui.badge tone="accent">transaction</x-ui.badge>
                 @endif
+                <x-ui.sensitive-filter :columns="$request->sensitiveFilterColumns()" />
             </h1>
             @if ($request->title)
                 <p class="mt-1.5 text-[12.5px] text-mute">{{ $request->title }}</p>
@@ -46,6 +47,8 @@
 
     <div class="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div class="flex flex-col gap-4 lg:col-span-2">
+            <x-ui.sensitive-filter :columns="$request->sensitiveFilterColumns()" variant="alert" />
+
             @can('viewRawSql', $request)
                 <x-ui.panel title="SQL to execute">
                     <x-ui.code class="rounded-none border-0 bg-canvas">{{ $request->sql_prepared }}</x-ui.code>

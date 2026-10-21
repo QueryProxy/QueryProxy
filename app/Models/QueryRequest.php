@@ -19,7 +19,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'reminded_at', 'chat_renewed_at',
     'executed_at', 'duration_ms', 'affected_rows',
     'result_disk', 'result_path', 'result_row_count', 'result_truncated', 'result_columns',
-    'error_message',
+    'error_message', 'sensitive_filter_columns',
 ])]
 class QueryRequest extends Model
 {
@@ -38,6 +38,7 @@ class QueryRequest extends Model
             'chat_renewed_at' => 'datetime',
             'executed_at' => 'datetime',
             'result_columns' => 'array',
+            'sensitive_filter_columns' => 'array',
         ];
     }
 
@@ -96,5 +97,15 @@ class QueryRequest extends Model
     public function hasResult(): bool
     {
         return $this->status === QueryRequestStatus::Completed && $this->result_path !== null;
+    }
+
+    /**
+     * Masked columns this request filters on; empty when none or not analysed.
+     *
+     * @return list<string>
+     */
+    public function sensitiveFilterColumns(): array
+    {
+        return array_values($this->sensitive_filter_columns ?? []);
     }
 }

@@ -7,6 +7,7 @@ use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Services\Approvals\ApprovalNotifier;
+use App\Services\Masking\SensitiveFilterDetector;
 use App\Services\Sql\SqlInspector;
 use Livewire\Attributes\Title;
 use Livewire\Component;
@@ -73,7 +74,7 @@ class QueryStudio extends Component
         return $result->passes();
     }
 
-    public function submit(SqlInspector $inspector): void
+    public function submit(SqlInspector $inspector, SensitiveFilterDetector $sensitiveFilters): void
     {
         $this->validate([
             'connectionId' => ['required', 'integer'],
@@ -90,6 +91,14 @@ class QueryStudio extends Component
 
         $result = $inspector->inspect($this->sql, $connection->driver);
 
+        // A warning for the approver only: a failure here must never stop the submission.
+        try {
+            $sensitiveFilterColumns = $sensitiveFilters->detect($result->preparedSql(), $connection);
+        } catch (\Throwable $e) {
+            report($e);
+            $sensitiveFilterColumns = null;
+        }
+
         $request = QueryRequest::create([
             'team_id' => $this->team()->id,
             'connection_id' => $connection->id,
@@ -102,6 +111,7 @@ class QueryStudio extends Component
             'is_ddl' => $result->hasDdl(),
             'type' => $result->type(),
             'status' => QueryRequestStatus::Pending,
+            'sensitive_filter_columns' => $sensitiveFilterColumns,
         ]);
 
         audit()->record('request.submitted', request: $request, sql: $request->sql_prepared, metadata: [

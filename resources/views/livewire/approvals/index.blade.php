@@ -9,7 +9,10 @@
 
     <div class="flex flex-col gap-3">
         @forelse ($requests as $request)
-            @php $isOwnRequest = $request->user_id === auth()->id() && ! auth()->user()->isAdmin(); @endphp
+            @php
+                $isOwnRequest = $request->user_id === auth()->id() && ! auth()->user()->isAdmin();
+                $sensitiveFilterColumns = $request->sensitiveFilterColumns();
+            @endphp
 
             <x-ui.panel>
                 <x-slot:header>
@@ -24,12 +27,14 @@
                     @if ($request->is_transaction)
                         <x-ui.badge tone="accent">transaction · {{ $request->statement_count }}</x-ui.badge>
                     @endif
+                    <x-ui.sensitive-filter :columns="$sensitiveFilterColumns" />
                     <span class="ml-auto shrink-0 font-mono text-[11px] text-mute-3">
                         {{ $request->requester->name }} · {{ $request->connection->name }} · {{ $request->created_at->diffForHumans() }}
                     </span>
                 </x-slot:header>
 
-                <div class="p-3.5">
+                <div class="flex flex-col gap-2.5 p-3.5">
+                    <x-ui.sensitive-filter :columns="$sensitiveFilterColumns" variant="alert" />
                     <x-ui.code>{{ $request->sql_prepared }}</x-ui.code>
                 </div>
 
