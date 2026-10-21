@@ -57,7 +57,7 @@ class MaskingRule extends Model
      * narrow: this set is installed for every new team, and an over-broad pattern
      * would mask ordinary rows and make results useless.
      *
-     * @return list<array{name: string, match_type: string, pattern: string, strategy: string}>
+     * @return list<array{name: string, match_type: string, pattern: string, strategy: string, enabled?: bool}>
      */
     public static function defaults(): array
     {
@@ -67,19 +67,12 @@ class MaskingRule extends Model
             ['name' => 'Credit cards (column)', 'match_type' => 'column', 'pattern' => '*card*', 'strategy' => 'partial'],
             ['name' => 'Secrets & tokens (column)', 'match_type' => 'column', 'pattern' => '*password*|*secret*|*token*|*api_key*', 'strategy' => 'full'],
             ['name' => 'Email addresses (content)', 'match_type' => 'regex', 'pattern' => '/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/', 'strategy' => 'partial'],
-            // Anchored to real issuer identification numbers rather than to a
-            // bare 13-16 digit run. Content rules see native int/float values
-            // (PDO does not stringify BIGINT), and "any long digit run" turns
-            // every 13-digit millisecond epoch, snowflake id and sequential
-            // order number into a masked cell — noise that pushes operators to
-            // switch masking off altogether. Networks covered: Visa (4, 13 or
-            // 16 digits), Mastercard (51-55 and the 2221-2720 range),
-            // Amex (34/37), Discover (6011, 65, 644-649), Diners (300-305, 36,
-            // 38), JCB (35). Space/hyphen grouping stays tolerated; the closing
-            // guard rejects a run that continues past the card length, so a
-            // 17+ digit id can never match a 16-digit prefix. No Luhn check —
-            // a regex cannot express one, and the IIN narrowing carries it.
-            ['name' => 'Credit card numbers (content)', 'match_type' => 'regex', 'pattern' => '/\b(?:4(?:[ -]?\d){12}(?:(?:[ -]?\d){3})?|5[1-5](?:[ -]?\d){14}|(?:222[1-9]|22[3-9]\d|2[3-6]\d\d|27[01]\d|2720)(?:[ -]?\d){12}|3[47](?:[ -]?\d){13}|6011(?:[ -]?\d){12}|65(?:[ -]?\d){14}|64[4-9](?:[ -]?\d){13}|30[0-5](?:[ -]?\d){11}|3[68](?:[ -]?\d){12}|35(?:[ -]?\d){14})\b(?![ -]\d)/', 'strategy' => 'partial'],
+            // Card numbers: the candidate regex (real issuer identification
+            // numbers, not a bare 13-16 digit run — see MaskValidator::Luhn)
+            // is only a pre-filter; the Luhn checksum removes the false
+            // positives, so an order number that merely looks like a card
+            // stays readable.
+            ['name' => 'Credit card numbers (content, Luhn)', 'match_type' => 'validator', 'pattern' => 'luhn', 'strategy' => 'partial'],
 
             // Vendor-issued credentials that announce themselves with a fixed
             // prefix: OpenAI (sk-), Slack bot/user/app (xox?-, xapp-), GitHub
@@ -105,6 +98,55 @@ class MaskingRule extends Model
             // and hex digests (lower-case only), ULIDs and enum-ish codes
             // (upper-case only), slugs and identifiers (no case mix at 32+).
             ['name' => 'High-entropy secrets (content)', 'match_type' => 'regex', 'pattern' => '/\A(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}\z/', 'strategy' => 'full'],
+
+            ...self::turkeyDefaults(),
+        ];
+    }
+
+    /**
+     * Turkey PII pack: national id (TCKN), tax id (VKN), TR IBAN, mobile and
+     * international phone numbers, vehicle plates. Part of defaults(), and
+     * also installable on its own for teams that already exist ("Add TR
+     * rules" on the masking page).
+     *
+     * Identifiers are masked with `hmac` so the same person still joins and
+     * groups across result sets. Checksum validators keep ordinary numbers
+     * readable; the VKN content validator ships disabled because roughly one
+     * in ten random 10-digit numbers passes its checksum, which would mask
+     * epoch timestamps and ids — the `*vkn*` / `*tax_no*` column rule covers
+     * the common case and a DBA can enable the validator deliberately. This
+     * "ships disabled" default is a product decision (user, 2026-10-20).
+     *
+     * @return list<array{name: string, match_type: string, pattern: string, strategy: string, enabled?: bool}>
+     */
+    public static function turkeyDefaults(): array
+    {
+        return [
+            ['name' => 'TR national id (column)', 'match_type' => 'column', 'pattern' => '*tckn*|*tc_kimlik*|*national_id*', 'strategy' => 'hmac'],
+            ['name' => 'IBAN (column)', 'match_type' => 'column', 'pattern' => '*iban*', 'strategy' => 'hmac'],
+            ['name' => 'TR tax id (column)', 'match_type' => 'column', 'pattern' => '*vkn*|*tax_no*', 'strategy' => 'hmac'],
+            ['name' => 'Vehicle plate (column)', 'match_type' => 'column', 'pattern' => '*plate*', 'strategy' => 'partial'],
+
+            ['name' => 'TR national id (content, checksum)', 'match_type' => 'validator', 'pattern' => 'tckn', 'strategy' => 'hmac'],
+            ['name' => 'TR IBAN (content, checksum)', 'match_type' => 'validator', 'pattern' => 'iban_tr', 'strategy' => 'hmac'],
+            // Disabled on purpose: the VKN check digit is derived from the first
+            // nine digits, so 1 in 10 random 10-digit numbers is "valid" and an
+            // active content rule would mask ids and epoch timestamps.
+            ['name' => 'TR tax id (content, checksum)', 'match_type' => 'validator', 'pattern' => 'vkn', 'strategy' => 'hmac', 'enabled' => false],
+
+            // Token boundaries exclude word characters and `-` (the digit run
+            // inside a GUID, `...-A5382587265D`, is not a phone number) and the
+            // fraction of a dotted decimal (`3.5123456789`). `,` stays a
+            // separator on purpose: GROUP_CONCAT lists numbers as `a,b` and
+            // each one must still be masked (fail-closed).
+            ['name' => 'TR mobile phone (content)', 'match_type' => 'regex', 'pattern' => '/(?<![\w-])(?<!\d\.)(?:\+90|0)?\s?5\d{2}[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}(?![\w-]|\.\d)/', 'strategy' => 'partial'],
+            ['name' => 'International phone, E.164 (content)', 'match_type' => 'regex', 'pattern' => '/(?<![\w+])\+[1-9]\d{7,14}\b/', 'strategy' => 'partial'],
+            // Province code 01-81 followed by 1-3 letters and 2-4 digits; upper
+            // case only, so ordinary lower-case words never match. `-` and `_`
+            // count as part of a token: without that, the first segment of an
+            // upper-case GUID (SQL Server prints them that way) such as
+            // `44FA2749-...` looks like a plate and about 1% of ids get masked.
+            ['name' => 'TR vehicle plate (content)', 'match_type' => 'regex', 'pattern' => '/(?<![A-Za-z0-9_-])(?:0[1-9]|[1-7]\d|8[01])\s?(?:[A-Z]\s?\d{4}|[A-Z]{2}\s?\d{3,4}|[A-Z]{3}\s?\d{2,3})(?![A-Za-z0-9_-])/', 'strategy' => 'partial'],
         ];
     }
 }

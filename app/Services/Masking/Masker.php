@@ -4,8 +4,10 @@ namespace App\Services\Masking;
 
 use App\Enums\MaskMatchType;
 use App\Enums\MaskStrategy;
+use App\Enums\MaskValidator;
 use App\Models\Connection;
 use App\Models\MaskingRule;
+use App\Models\Team;
 use Illuminate\Support\Collection;
 
 /**
@@ -38,6 +40,15 @@ class Masker
         | "(?<double>(?:[^"\\]++|\\.|"")*+)(?:"|\z)
         ~xsiu
         REGEX;
+
+    /**
+     * Decrypted masking keys by team id. Kept per instance only: the container
+     * builds a Masker per job/request, so a rotated key is picked up by the
+     * next job without any cache invalidation.
+     *
+     * @var array<int, string>
+     */
+    private array $teamKeys = [];
 
     /**
      * @return Collection<int, MaskingRule>
@@ -80,7 +91,7 @@ class Masker
 
         foreach ($rules as $rule) {
             if ($rule->match_type === MaskMatchType::Column && $this->columnMatches($rule->pattern, $column)) {
-                return $this->apply($rule->strategy, (string) $value);
+                return $this->apply($rule->strategy, (string) $value, $rule->team_id);
             }
         }
 
@@ -94,23 +105,40 @@ class Masker
             $subject = (string) $value;
 
             foreach ($rules as $rule) {
-                if ($rule->match_type !== MaskMatchType::Regex) {
-                    continue;
-                }
-
-                $matched = @preg_match($rule->pattern, $subject);
-
-                // Fail closed: when PCRE cannot evaluate the pattern against
-                // this value (backtrack/recursion limit), treat it as a match —
-                // emitting the raw value on evaluation failure would silently
-                // bypass masking exactly when the data is most pathological.
-                if ($matched === 1 || $matched === false) {
-                    return $this->apply($rule->strategy, $subject);
+                if ($this->contentRuleMatches($rule, $subject)) {
+                    return $this->apply($rule->strategy, $subject, $rule->team_id);
                 }
             }
         }
 
         return $value;
+    }
+
+    /**
+     * Whether a content rule (regex or validator) fires on a whole value;
+     * false for column rules.
+     *
+     * Fail closed: when PCRE cannot evaluate the pattern against this value
+     * (backtrack/recursion limit), or a validator rule names a validator that
+     * does not exist, the rule counts as a match — emitting the raw value on
+     * evaluation failure would silently bypass masking exactly when the data is
+     * most pathological.
+     */
+    private function contentRuleMatches(MaskingRule $rule, string $subject): bool
+    {
+        if ($rule->match_type === MaskMatchType::Regex) {
+            $matched = @preg_match($rule->pattern, $subject);
+
+            return $matched === 1 || $matched === false;
+        }
+
+        if ($rule->match_type === MaskMatchType::Validator) {
+            $validator = MaskValidator::tryFrom($rule->pattern);
+
+            return $validator === null || $validator->matches($subject);
+        }
+
+        return false;
     }
 
     /**
@@ -202,15 +230,24 @@ class Masker
         }
 
         foreach ($rules as $rule) {
-            if ($rule->match_type !== MaskMatchType::Regex) {
+            if ($rule->match_type === MaskMatchType::Regex) {
+                $masked = @preg_replace_callback(
+                    $rule->pattern,
+                    fn (array $match): string => $match[0] === '' ? '' : $this->apply($rule->strategy, $match[0], $rule->team_id),
+                    $masked,
+                );
+            } elseif ($rule->match_type === MaskMatchType::Validator) {
+                $validator = MaskValidator::tryFrom($rule->pattern);
+
+                // An unknown validator cannot be evaluated: fail closed.
+                if ($validator === null) {
+                    return '*****';
+                }
+
+                $masked = $validator->replaceIn($masked, fn (string $match): string => $this->apply($rule->strategy, $match, $rule->team_id));
+            } else {
                 continue;
             }
-
-            $masked = @preg_replace_callback(
-                $rule->pattern,
-                fn (array $match): string => $match[0] === '' ? '' : $this->apply($rule->strategy, $match[0]),
-                $masked,
-            );
 
             if ($masked === null) {
                 return '*****';
@@ -265,7 +302,8 @@ class Masker
 
         foreach ($strategies as $strategy) {
             $weight = match ($strategy) {
-                MaskStrategy::Full => 3,
+                MaskStrategy::Full => 4,
+                MaskStrategy::Hmac => 3,
                 MaskStrategy::Hash => 2,
                 MaskStrategy::Partial => 1,
             };
@@ -321,24 +359,18 @@ class Masker
      */
     private function maskLiteral(string $value, ?MaskStrategy $strategy, Collection $rules): string
     {
-        if ($value === '' || preg_match('/\A(?:\*{5}|sha256:[0-9a-f]{12})\z/', $value) === 1) {
+        if ($value === '' || preg_match('/\A(?:\*{5}|sha256:[0-9a-f]{12}|hmac:[0-9a-f]{16})\z/', $value) === 1) {
             return $value;
         }
 
         if ($strategy !== null) {
-            return $this->apply($strategy, $value);
+            return $this->apply($strategy, $value, $rules->first()?->team_id);
         }
 
         foreach ($rules as $rule) {
-            if ($rule->match_type !== MaskMatchType::Regex) {
-                continue;
-            }
-
-            $matched = @preg_match($rule->pattern, $value);
-
             // Fail closed on a PCRE failure, exactly like maskValue().
-            if ($matched === 1 || $matched === false) {
-                return $this->apply($rule->strategy, $value);
+            if ($this->contentRuleMatches($rule, $value)) {
+                return $this->apply($rule->strategy, $value, $rule->team_id);
             }
         }
 
@@ -357,13 +389,59 @@ class Masker
         return false;
     }
 
-    public function apply(MaskStrategy $strategy, string $value): string
+    /**
+     * @param  int|null  $teamId  Owner of the rule; `hmac` needs it to find the team's masking key.
+     */
+    public function apply(MaskStrategy $strategy, string $value, ?int $teamId = null): string
     {
         return match ($strategy) {
             MaskStrategy::Full => '*****',
             MaskStrategy::Hash => 'sha256:'.substr(hash('sha256', $value), 0, 12),
+            MaskStrategy::Hmac => $this->hmac($value, $teamId),
             MaskStrategy::Partial => $this->partial($value),
         };
+    }
+
+    /**
+     * Keyed pseudonym: `hmac:` + first 16 hex characters of
+     * HMAC-SHA256(team masking key, value). Equal values give equal output
+     * inside one team, so joins and group-bys on a masked column still work.
+     * Outside the team the output cannot be rebuilt from a dictionary of
+     * guessed values without the team's key. Inside the team it can: the key
+     * is per team, so anyone who may run queries there can feed candidate
+     * values through the same rule and read the pseudonyms back (a chosen
+     * plaintext oracle). Query approval (PRD 3.4) limits this, it does not
+     * prevent it. Fail-closed: a team without a key (or an unknown team)
+     * gets `*****`, never an unkeyed digest.
+     */
+    private function hmac(string $value, ?int $teamId): string
+    {
+        $key = $this->teamKey($teamId);
+
+        if ($key === null) {
+            return '*****';
+        }
+
+        return 'hmac:'.substr(hash_hmac('sha256', $value, $key), 0, 16);
+    }
+
+    private function teamKey(?int $teamId): ?string
+    {
+        if ($teamId === null) {
+            return null;
+        }
+
+        if (! isset($this->teamKeys[$teamId])) {
+            $key = Team::query()->whereKey($teamId)->value('masking_key');
+
+            if (! is_string($key) || $key === '') {
+                return null;
+            }
+
+            $this->teamKeys[$teamId] = $key;
+        }
+
+        return $this->teamKeys[$teamId];
     }
 
     private function partial(string $value): string

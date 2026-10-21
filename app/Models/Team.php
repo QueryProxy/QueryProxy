@@ -3,13 +3,16 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\DB;
 
 #[Fillable(['name', 'slug'])]
+#[Hidden(['masking_key'])]
 class Team extends Model
 {
     use HasFactory;
@@ -22,9 +25,48 @@ class Team extends Model
      */
     protected static function booted(): void
     {
+        static::creating(function (Team $team) {
+            if (blank($team->masking_key)) {
+                $team->masking_key = self::generateMaskingKey();
+            }
+        });
+
         static::created(function (Team $team) {
             $team->installDefaultMaskingRules();
         });
+    }
+
+    protected function casts(): array
+    {
+        return [
+            'masking_key' => 'encrypted',
+        ];
+    }
+
+    /**
+     * 256-bit random key for the `hmac` masking strategy. The key is never
+     * fillable and never serialised (hidden); only Masker reads it.
+     */
+    public static function generateMaskingKey(): string
+    {
+        return base64_encode(random_bytes(32));
+    }
+
+    /**
+     * Replace the team's masking key. Pseudonyms produced before and after no
+     * longer match each other, so joins across old and new results break.
+     */
+    public function rotateMaskingKey(): void
+    {
+        // Write the ciphertext straight to the row. Going through save()
+        // makes Eloquent decrypt the old value for its dirty check, so a key
+        // that no longer decrypts (APP_KEY changed without APP_PREVIOUS_KEYS)
+        // could not be replaced, which is exactly when rotation is needed.
+        static::query()->whereKey($this->getKey())->update([
+            'masking_key' => Crypt::encryptString(self::generateMaskingKey()),
+        ]);
+
+        $this->refresh();
     }
 
     public function users(): BelongsToMany
@@ -55,10 +97,29 @@ class Team extends Model
      */
     public function installDefaultMaskingRules(): int
     {
-        return DB::transaction(function () {
+        return $this->installMaskingRules(MaskingRule::defaults());
+    }
+
+    /**
+     * Install the Turkey PII pack (MaskingRule::turkeyDefaults()) only.
+     * Idempotent, like installDefaultMaskingRules().
+     *
+     * @return int number of rules actually created
+     */
+    public function installTurkeyMaskingRules(): int
+    {
+        return $this->installMaskingRules(MaskingRule::turkeyDefaults());
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $rules
+     */
+    private function installMaskingRules(array $rules): int
+    {
+        return DB::transaction(function () use ($rules) {
             $created = 0;
 
-            foreach (MaskingRule::defaults() as $default) {
+            foreach ($rules as $default) {
                 $rule = MaskingRule::firstOrCreate(
                     ['team_id' => $this->id, 'pattern' => $default['pattern'], 'match_type' => $default['match_type']],
                     $default,

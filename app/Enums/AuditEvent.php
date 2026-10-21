@@ -51,6 +51,8 @@ enum AuditEvent: string
     case MaskingRuleToggled = 'masking_rule.toggled';
     case MaskingRuleDeleted = 'masking_rule.deleted';
     case MaskingRuleDefaultsAdded = 'masking_rule.defaults_added';
+    case MaskingRuleTurkeyPackAdded = 'masking_rule.tr_rules_added';
+    case MaskingKeyRotated = 'masking_key.rotated';
     case ErrorMessagesMasked = 'error_messages.masked';
 
     // ChatOps
@@ -108,6 +110,8 @@ enum AuditEvent: string
             self::MaskingRuleToggled => 'A masking rule was enabled or disabled.',
             self::MaskingRuleDeleted => 'A masking rule was deleted.',
             self::MaskingRuleDefaultsAdded => 'The default masking rules were added to a team.',
+            self::MaskingRuleTurkeyPackAdded => 'The Turkey PII masking rule pack was added to a team (metadata.created is the number of rules added).',
+            self::MaskingKeyRotated => 'The HMAC masking key of a team was rotated; pseudonyms made before and after no longer match. The key is never recorded.',
             self::ErrorMessagesMasked => 'Stored error messages were re-masked by the backfill command.',
 
             self::ChatIntegrationSaved => 'A ChatOps integration was saved.',

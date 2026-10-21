@@ -4,6 +4,7 @@
         subtitle="PII is masked while results are written — unmasked data never reaches the result store.">
         <x-slot:actions>
             <x-ui.btn wire:click="addDefaults">Add default rules</x-ui.btn>
+            <x-ui.btn wire:click="addTurkeyRules">Add TR rules</x-ui.btn>
             <x-ui.btn wire:click="openCreate" variant="primary" icon="plus">New rule</x-ui.btn>
         </x-slot:actions>
     </x-ui.page-header>
@@ -37,14 +38,24 @@
                     </x-ui.select>
                 </x-ui.field>
 
-                @php
-                    $patternHint = $matchType === 'column'
-                        ? 'wildcards, e.g. *email* — use | for alternatives'
-                        : 'PCRE regex, e.g. /\d{16}/';
-                @endphp
-                <x-ui.field label="Pattern" :hint="$patternHint" :error="$errors->first('pattern')">
-                    <x-ui.input type="text" wire:model="pattern" class="font-mono" />
-                </x-ui.field>
+                @if ($matchType === 'validator')
+                    <x-ui.field label="Validator" hint="matches a candidate only when its checksum is valid" :error="$errors->first('pattern')">
+                        <x-ui.select wire:model="pattern">
+                            @foreach ($validators as $v)
+                                <option value="{{ $v->value }}">{{ $v->label() }}</option>
+                            @endforeach
+                        </x-ui.select>
+                    </x-ui.field>
+                @else
+                    @php
+                        $patternHint = $matchType === 'column'
+                            ? 'wildcards, e.g. *email* — use | for alternatives'
+                            : 'PCRE regex, e.g. /\d{16}/';
+                    @endphp
+                    <x-ui.field label="Pattern" :hint="$patternHint" :error="$errors->first('pattern')">
+                        <x-ui.input type="text" wire:model="pattern" class="font-mono" />
+                    </x-ui.field>
+                @endif
 
                 <x-ui.field label="Strategy">
                     <x-ui.select wire:model="strategy">
@@ -90,7 +101,12 @@
                     <x-ui.td class="text-ink-2">{{ $rule->name }}</x-ui.td>
                     <x-ui.td mono muted>{{ $rule->match_type->value }}</x-ui.td>
                     <x-ui.td mono truncate>{{ $rule->pattern }}</x-ui.td>
-                    <x-ui.td mono muted>{{ $rule->strategy->value }}</x-ui.td>
+                    <x-ui.td mono muted>
+                        {{ $rule->strategy->value }}
+                        @if ($rule->strategy->isDeprecated())
+                            <x-ui.badge tone="warn">deprecated</x-ui.badge>
+                        @endif
+                    </x-ui.td>
                     <x-ui.td muted>{{ $rule->connection?->name ?? 'Team-wide' }}</x-ui.td>
                     <x-ui.td>
                         <button type="button" wire:click="toggle({{ $rule->id }})">

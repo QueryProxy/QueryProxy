@@ -2,8 +2,10 @@
 
 namespace App\Livewire\Masking;
 
+use App\Enums\AuditEvent;
 use App\Enums\MaskMatchType;
 use App\Enums\MaskStrategy;
+use App\Enums\MaskValidator;
 use App\Models\Connection;
 use App\Models\MaskingRule;
 use App\Models\Team;
@@ -62,6 +64,26 @@ class Index extends Component
         $this->showForm = true;
     }
 
+    /**
+     * A validator rule's pattern is one of a fixed list, not free text: pick
+     * a valid default when switching to it, and clear it when switching away
+     * so a stale validator name is never saved as a regex.
+     */
+    public function updatedMatchType(string $value): void
+    {
+        $validators = array_column(MaskValidator::cases(), 'value');
+
+        if ($value === MaskMatchType::Validator->value) {
+            if (! in_array($this->pattern, $validators, true)) {
+                $this->pattern = $validators[0];
+            }
+        } elseif (in_array($this->pattern, $validators, true)) {
+            $this->pattern = '';
+        }
+
+        $this->resetErrorBag('pattern');
+    }
+
     public function openEdit(int $ruleId): void
     {
         $rule = MaskingRule::forTeam($this->team())->findOrFail($ruleId);
@@ -84,7 +106,9 @@ class Index extends Component
         $validated = $this->validate([
             'name' => ['required', 'string', 'max:100'],
             'matchType' => ['required', Rule::enum(MaskMatchType::class)],
-            'pattern' => ['required', 'string', 'max:255'],
+            'pattern' => ['required', 'string', 'max:255', $this->matchType === MaskMatchType::Validator->value
+                ? Rule::enum(MaskValidator::class)
+                : 'string'],
             'strategy' => ['required', Rule::enum(MaskStrategy::class)],
             'connectionId' => ['nullable', Rule::exists('connections', 'id')->where('team_id', $team->id)],
         ]);
@@ -159,6 +183,16 @@ class Index extends Component
         audit()->record('masking_rule.defaults_added', team: $team);
     }
 
+    public function addTurkeyRules(): void
+    {
+        $team = $this->team();
+        $this->assertDba($team);
+
+        $created = $team->installTurkeyMaskingRules();
+
+        audit()->record(AuditEvent::MaskingRuleTurkeyPackAdded, team: $team, metadata: ['created' => $created]);
+    }
+
     public function preview(Masker $masker): void
     {
         $rules = MaskingRule::forTeam($this->team())->where('enabled', true)->get();
@@ -180,6 +214,7 @@ class Index extends Component
             'connections' => Connection::forTeam($team)->orderBy('name')->get(),
             'matchTypes' => MaskMatchType::cases(),
             'strategies' => MaskStrategy::cases(),
+            'validators' => MaskValidator::cases(),
         ]);
     }
 }

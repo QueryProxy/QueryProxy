@@ -29,6 +29,14 @@ test('hash strategy is deterministic and prefixed', function () {
         ->not->toContain('secret');
 });
 
+test('hmac strategy fails closed without a team and is not a plain sha256 prefix', function () {
+    $masker = app(Masker::class);
+
+    // Needs a team key; the keyed, DB-backed cases are in tests/Feature/MaskHmacTest.php.
+    expect($masker->apply(MaskStrategy::Hmac, 'secret'))->toBe('*****')
+        ->not->toContain(substr(hash('sha256', 'secret'), 0, 12));
+});
+
 test('partial strategy keeps email shape readable', function () {
     expect(app(Masker::class)->apply(MaskStrategy::Partial, 'ada@example.com'))->toBe('a***@***.com');
 });
