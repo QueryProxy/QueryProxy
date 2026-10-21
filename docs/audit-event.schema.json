@@ -1,0 +1,194 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "QueryProxy audit event",
+    "description": "One audit record as exported to SIEM sinks (stdout JSON lines, syslog message body, webhook request body). Delivery is at-least-once: receivers dedupe on `id`. Changing or removing a field bumps schema_version; adding an optional field does not. The raw SQL is never exported, only `sql_redacted`. The audit hash chain values are deliberately not exported.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "schema_version",
+        "id",
+        "timestamp",
+        "instance",
+        "action",
+        "category",
+        "actor",
+        "team_id",
+        "connection_id",
+        "query_request_id",
+        "ip",
+        "sql_redacted",
+        "sql_hidden",
+        "metadata"
+    ],
+    "properties": {
+        "schema_version": {
+            "description": "Version of this schema.",
+            "const": 1
+        },
+        "id": {
+            "description": "Audit record id; unique per installation. Use it to dedupe redeliveries.",
+            "type": "integer",
+            "minimum": 1
+        },
+        "timestamp": {
+            "description": "When the event happened, UTC, second precision.",
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "instance": {
+            "description": "Host name of the QueryProxy installation that produced the event.",
+            "type": [
+                "string",
+                "null"
+            ]
+        },
+        "action": {
+            "description": "Event name from the audit event catalog.",
+            "type": "string",
+            "enum": [
+                "audit.checkpoint",
+                "auth.login",
+                "auth.logout",
+                "auth.password_reset",
+                "user.created",
+                "user.deleted",
+                "user.admin_toggled",
+                "user.name_changed",
+                "user.password_changed",
+                "user.password_reset",
+                "user.two_factor_enabled",
+                "user.two_factor_disabled",
+                "user.two_factor_reset",
+                "team.created",
+                "team.deleted",
+                "team.member_added",
+                "team.member_removed",
+                "team.member_role_changed",
+                "connection.created",
+                "connection.updated",
+                "connection.deleted",
+                "connection.tested",
+                "connection.grant_added",
+                "connection.grant_revoked",
+                "masking_rule.created",
+                "masking_rule.updated",
+                "masking_rule.toggled",
+                "masking_rule.deleted",
+                "masking_rule.defaults_added",
+                "masking_rule.tr_rules_added",
+                "masking_key.rotated",
+                "error_messages.masked",
+                "chat_integration.saved",
+                "chat_integration.secret_rotated",
+                "chat_integration.removed",
+                "chat_identity.linked",
+                "chat_identity.removed",
+                "request.submitted",
+                "request.approved",
+                "request.rejected",
+                "request.cancelled",
+                "request.execution_started",
+                "request.execution_completed",
+                "request.execution_failed",
+                "execution.late_completion",
+                "result.downloaded"
+            ]
+        },
+        "category": {
+            "description": "The part of `action` before the dot.",
+            "type": "string",
+            "enum": [
+                "audit",
+                "auth",
+                "user",
+                "team",
+                "connection",
+                "masking_rule",
+                "masking_key",
+                "error_messages",
+                "chat_integration",
+                "chat_identity",
+                "request",
+                "execution",
+                "result"
+            ]
+        },
+        "actor": {
+            "description": "The user who caused the event; null for system events.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "id",
+                        "email"
+                    ],
+                    "properties": {
+                        "id": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "email": {
+                            "type": [
+                                "string",
+                                "null"
+                            ]
+                        }
+                    }
+                },
+                {
+                    "type": "null"
+                }
+            ]
+        },
+        "team_id": {
+            "description": "Team the event belongs to, if any.",
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1
+        },
+        "connection_id": {
+            "description": "Database connection involved, if any.",
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1
+        },
+        "query_request_id": {
+            "description": "Query request involved, if any.",
+            "type": [
+                "integer",
+                "null"
+            ],
+            "minimum": 1
+        },
+        "ip": {
+            "description": "Client IP address; null for console and queue events.",
+            "type": [
+                "string",
+                "null"
+            ]
+        },
+        "sql_redacted": {
+            "description": "The SQL with literal values replaced by placeholders (ADR-009); null when there is no SQL or it could not be redacted.",
+            "type": [
+                "string",
+                "null"
+            ]
+        },
+        "sql_hidden": {
+            "description": "True when the record has SQL that was withheld because it could not be redacted safely.",
+            "type": "boolean"
+        },
+        "metadata": {
+            "description": "Event-specific details; the keys depend on `action`. Null when there are none.",
+            "type": [
+                "object",
+                "null"
+            ]
+        }
+    }
+}

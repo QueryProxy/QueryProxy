@@ -217,4 +217,57 @@ return [
         explode(',', (string) env('TRUSTED_HOSTS', '')),
     ))),
 
+    /*
+    |--------------------------------------------------------------------------
+    | SIEM sinks (ADR-021)
+    |--------------------------------------------------------------------------
+    | Every audit event can also be exported to external systems. All sinks are
+    | off by default; `sinks` is a comma-separated list of the ones to turn on
+    | (`stdout`, `syslog`, `webhook`, any combination). Delivery runs on the
+    | queue after the audit record is committed, so a sink that is down never
+    | blocks or rolls back the audit write. Webhook and syslog deliveries are
+    | retried; one that keeps failing lands in `failed_jobs`, which is the
+    | dead-letter queue. Delivery is at-least-once: receivers dedupe on `id`.
+    |
+    | Run a queue worker on `queue` (the default worker already serves
+    | `default`). The event format is docs/audit-event.schema.json.
+    */
+
+    'siem' => [
+        'sinks' => array_values(array_filter(array_map(
+            fn ($name) => strtolower(trim($name)),
+            explode(',', (string) env('QUERYPROXY_SIEM_SINKS', '')),
+        ))),
+
+        'queue' => (string) env('QUERYPROXY_SIEM_QUEUE', 'default'),
+
+        // JSON lines, one event per line. Container logging picks up stdout.
+        'stdout' => [
+            'stream' => (string) env('QUERYPROXY_SIEM_STDOUT_STREAM', 'php://stdout'),
+        ],
+
+        // RFC 5424 message with the JSON event as its body.
+        'syslog' => [
+            'host' => (string) env('QUERYPROXY_SIEM_SYSLOG_HOST', ''),
+            // Empty = the standard port of the transport: 514 (udp/tcp), 6514 (tls, RFC 5425).
+            'port' => (int) env('QUERYPROXY_SIEM_SYSLOG_PORT') ?: (strtolower((string) env('QUERYPROXY_SIEM_SYSLOG_TRANSPORT', 'udp')) === 'tls' ? 6514 : 514),
+            'transport' => strtolower((string) env('QUERYPROXY_SIEM_SYSLOG_TRANSPORT', 'udp')), // udp | tcp | tls
+            'framing' => strtolower((string) env('QUERYPROXY_SIEM_SYSLOG_FRAMING', 'octet-counting')), // tcp/tls: octet-counting | newline
+            'facility' => (int) env('QUERYPROXY_SIEM_SYSLOG_FACILITY', 13), // 13 = log audit
+            'app_name' => (string) env('QUERYPROXY_SIEM_SYSLOG_APP_NAME', 'queryproxy'),
+            'hostname' => (string) env('QUERYPROXY_SIEM_SYSLOG_HOSTNAME', ''),
+            'tls_ca_file' => (string) env('QUERYPROXY_SIEM_SYSLOG_TLS_CA_FILE', ''),
+            'timeout' => (int) env('QUERYPROXY_SIEM_SYSLOG_TIMEOUT', 5),
+        ],
+
+        // HTTPS POST signed with `X-QueryProxy-Signature: sha256=<hmac>`.
+        // The secret must be at least 16 characters.
+        'webhook' => [
+            'url' => (string) env('QUERYPROXY_SIEM_WEBHOOK_URL', ''),
+            'secret' => (string) env('QUERYPROXY_SIEM_WEBHOOK_SECRET', ''),
+            'timeout' => (int) env('QUERYPROXY_SIEM_WEBHOOK_TIMEOUT', 5),
+            'tries' => (int) env('QUERYPROXY_SIEM_WEBHOOK_TRIES', 6),
+        ],
+    ],
+
 ];

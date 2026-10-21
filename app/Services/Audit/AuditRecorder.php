@@ -8,6 +8,8 @@ use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\Audit\Sinks\AuditEventDispatcher;
+use Throwable;
 
 class AuditRecorder
 {
@@ -22,7 +24,7 @@ class AuditRecorder
     ): AuditLog {
         $actor ??= auth()->user();
 
-        return AuditLog::create([
+        $log = AuditLog::create([
             'team_id' => $team?->id ?? $request?->team_id ?? $connection?->team_id,
             'user_id' => $actor?->id,
             'action' => $action instanceof AuditEvent ? $action->value : $action,
@@ -32,5 +34,15 @@ class AuditRecorder
             'metadata' => $metadata ?: null,
             'ip' => app()->runningInConsole() ? null : request()->ip(),
         ]);
+
+        // Hand the stored record to the SIEM sinks (ADR-021). A sink problem,
+        // even one in resolving the dispatcher, must never fail the audit write.
+        try {
+            app(AuditEventDispatcher::class)->dispatch($log);
+        } catch (Throwable $e) {
+            report($e);
+        }
+
+        return $log;
     }
 }
