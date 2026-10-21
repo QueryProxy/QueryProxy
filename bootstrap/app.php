@@ -2,6 +2,7 @@
 
 use App\Http\Middleware\EnsureAdmin;
 use App\Http\Middleware\EnsureTeamRole;
+use App\Http\Middleware\EnsureUserIsActive;
 use App\Http\Middleware\RequireTwoFactor;
 use App\Http\Middleware\SecurityHeaders;
 use App\Http\Middleware\VerifySlackSignature;
@@ -87,6 +88,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // password changes; SecurityHeaders adds the baseline response headers.
         $middleware->web(append: [
             AuthenticateSession::class,
+            EnsureUserIsActive::class,
             SecurityHeaders::class,
         ]);
 

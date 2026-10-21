@@ -5,6 +5,8 @@ namespace App\Livewire\Admin;
 use App\Models\ChatIdentity;
 use App\Models\User;
 use App\Services\Auth\TwoFactorService;
+use App\Services\Users\UserLifecycle;
+use Closure;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Title;
@@ -37,7 +39,18 @@ class Users extends Component
 
         $this->validate([
             'name' => ['required', 'string', 'max:100'],
-            'email' => ['required', 'email', 'unique:users,email'],
+            'email' => [
+                'required',
+                'email',
+                'unique:users,email,NULL,id,deleted_at,NULL',
+                // A soft deleted account keeps its address reserved (the unique
+                // index still covers it) but is not listed; say why.
+                function (string $attribute, mixed $value, Closure $fail) {
+                    if (User::onlyTrashed()->where('email', $value)->exists()) {
+                        $fail('A deleted account still holds this address, so it cannot be reused.');
+                    }
+                },
+            ],
             'password' => ['nullable', 'string', 'min:8'],
         ]);
 
@@ -128,7 +141,36 @@ class Users extends Component
         session()->flash('status', "Two-factor authentication reset for \"{$user->email}\".");
     }
 
-    public function deleteUser(int $userId): void
+    /** Block sign-in and end live sessions. Pending requests stay pending. */
+    public function suspendUser(int $userId, UserLifecycle $lifecycle): void
+    {
+        $this->assertAdmin();
+
+        $user = User::findOrFail($userId);
+
+        if ($user->id === auth()->id()) {
+            $this->addError('email', 'You cannot suspend your own account.');
+
+            return;
+        }
+
+        $lifecycle->suspend($user);
+
+        session()->flash('status', "User \"{$user->email}\" suspended.");
+    }
+
+    public function unsuspendUser(int $userId, UserLifecycle $lifecycle): void
+    {
+        $this->assertAdmin();
+
+        $lifecycle->unsuspend(User::findOrFail($userId));
+    }
+
+    /**
+     * Soft delete. The user's pending requests are cancelled in the same
+     * transaction; their request history stays.
+     */
+    public function deleteUser(int $userId, UserLifecycle $lifecycle): void
     {
         $this->assertAdmin();
 
@@ -140,9 +182,7 @@ class Users extends Component
             return;
         }
 
-        audit()->record('user.deleted', metadata: ['user' => $user->email]);
-
-        $user->delete();
+        $lifecycle->delete($user);
     }
 
     public function updateSlackId(int $userId, string $slackId): void

@@ -6,9 +6,11 @@ use App\Enums\QueryRequestStatus;
 use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
+use App\Models\User;
 use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Masking\SensitiveFilterDetector;
 use App\Services\Sql\SqlInspector;
+use Illuminate\Support\Facades\DB;
 use Livewire\Attributes\Title;
 use Livewire\Component;
 
@@ -18,6 +20,8 @@ class QueryStudio extends Component
     public ?int $connectionId = null;
 
     public string $title = '';
+
+    public string $note = '';
 
     public string $sql = '';
 
@@ -79,6 +83,7 @@ class QueryStudio extends Component
         $this->validate([
             'connectionId' => ['required', 'integer'],
             'title' => ['nullable', 'string', 'max:150'],
+            'note' => ['nullable', 'string', 'max:1000'],
             'sql' => ['required', 'string', 'max:65535'],
         ]);
 
@@ -99,25 +104,35 @@ class QueryStudio extends Component
             $sensitiveFilterColumns = null;
         }
 
-        $request = QueryRequest::create([
-            'team_id' => $this->team()->id,
-            'connection_id' => $connection->id,
-            'user_id' => auth()->id(),
-            'title' => $this->title ?: null,
-            'sql_original' => $this->sql,
-            'sql_prepared' => $result->preparedSql(),
-            'statement_count' => count($result->statements),
-            'is_transaction' => $result->isTransaction,
-            'is_ddl' => $result->hasDdl(),
-            'type' => $result->type(),
-            'status' => QueryRequestStatus::Pending,
-            'sensitive_filter_columns' => $sensitiveFilterColumns,
-        ]);
+        $request = DB::transaction(function () use ($connection, $result, $sensitiveFilterColumns) {
+            // Same row lock as UserLifecycle::delete: a user deleted or
+            // suspended since the request began cannot leave a pending request.
+            $owner = User::whereKey(auth()->id())->lockForUpdate()->first();
+            abort_if($owner === null || $owner->isSuspended(), 403);
 
-        audit()->record('request.submitted', request: $request, sql: $request->sql_prepared, metadata: [
-            'type' => $request->type->value,
-            'statements' => $request->statement_count,
-        ]);
+            $request = QueryRequest::create([
+                'team_id' => $this->team()->id,
+                'connection_id' => $connection->id,
+                'user_id' => auth()->id(),
+                'title' => $this->title ?: null,
+                'note' => trim($this->note) !== '' ? trim($this->note) : null,
+                'sql_original' => $this->sql,
+                'sql_prepared' => $result->preparedSql(),
+                'statement_count' => count($result->statements),
+                'is_transaction' => $result->isTransaction,
+                'is_ddl' => $result->hasDdl(),
+                'type' => $result->type(),
+                'status' => QueryRequestStatus::Pending,
+                'sensitive_filter_columns' => $sensitiveFilterColumns,
+            ]);
+
+            audit()->record('request.submitted', request: $request, sql: $request->sql_prepared, metadata: [
+                'type' => $request->type->value,
+                'statements' => $request->statement_count,
+            ]);
+
+            return $request;
+        });
 
         ApprovalNotifier::requestSubmitted($request);
 

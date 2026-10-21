@@ -49,6 +49,8 @@ class Show extends Component
         return view('livewire.requests.show', [
             'request' => $this->queryRequest->load(['connection', 'requester', 'reviewer']),
             'canReview' => auth()->user()->can('review', $this->queryRequest),
+            'isOverride' => $this->queryRequest->isPending()
+                && app(ApprovalService::class)->isOverride($this->queryRequest, auth()->user()),
             'canCancel' => auth()->user()->can('cancel', $this->queryRequest),
         ]);
     }

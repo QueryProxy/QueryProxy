@@ -11,6 +11,7 @@ use App\Services\Approvals\ApprovalService;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Gate;
 
 /**
  * Slack Block Kit callback endpoint.
@@ -85,6 +86,8 @@ class SlackInteractionController extends Controller
         $identity = ChatIdentity::query()
             ->where('provider', 'slack')
             ->where('external_id', $slackUserId)
+            // Suspended and soft-deleted users do not resolve: their chat identity is dead.
+            ->whereHas('user', fn ($query) => $query->active())
             ->first();
 
         if (! $identity) {
@@ -100,6 +103,19 @@ class SlackInteractionController extends Controller
         // team, but an identity mapped to an outsider must never even reach it.
         if (! $reviewer->belongsToTeam($integration->team)) {
             return $this->ephemeral('You are not allowed to decide on this request.');
+        }
+
+        // An override needs a written reason, and the card has no place to
+        // type one. Nothing is applied and the token stays unspent: the
+        // reviewer is sent to the web form, which collects the reason and
+        // applies the override there.
+        if ($verb === 'approve'
+            && Gate::forUser($reviewer)->allows('review', $queryRequest)
+            && $approvals->isOverride($queryRequest, $reviewer)) {
+            return $this->ephemeral(
+                'Approving this request would be an override, which needs a written reason. '
+                .'Nothing was approved. Give the reason here: '.route('requests.override', $queryRequest),
+            );
         }
 
         try {

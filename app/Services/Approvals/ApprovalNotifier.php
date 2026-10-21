@@ -22,6 +22,7 @@ class ApprovalNotifier
         $dbas = $request->team->users()
             ->wherePivot('role', TeamRole::Dba->value)
             ->where('users.id', '!=', $request->user_id)
+            ->whereNull('users.suspended_at')
             ->get();
 
         Notification::send($dbas, new QueryRequestSubmitted($request));
@@ -60,7 +61,10 @@ class ApprovalNotifier
 
     public static function requestDecided(QueryRequest $request): void
     {
-        $request->requester->notify(new QueryRequestDecided($request));
+        // A deleted requester (their request was approved before the delete) has no inbox left.
+        if (! $request->requester->trashed()) {
+            $request->requester->notify(new QueryRequestDecided($request));
+        }
 
         if (class_exists(ChatNotifier::class)) {
             app(ChatNotifier::class)->requestDecided($request);
@@ -69,6 +73,8 @@ class ApprovalNotifier
 
     public static function requestFinished(QueryRequest $request): void
     {
-        $request->requester->notify(new QueryRequestFinished($request));
+        if (! $request->requester->trashed()) {
+            $request->requester->notify(new QueryRequestFinished($request));
+        }
     }
 }

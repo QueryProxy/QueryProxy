@@ -11,6 +11,7 @@ use App\Services\Approvals\ApprovalService;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\ValidationException;
 
 /**
  * Generic HMAC-verified action endpoint for Microsoft Teams automations
@@ -19,7 +20,7 @@ use Illuminate\Http\Request;
  * Expected JSON body:
  *   { "action": "approve"|"reject", "request_id": 123,
  *     "actor_id": "<AAD object id>", "token": "<action token>",
- *     "reason": "optional for reject" }
+ *     "reason": "optional for reject; required for an approve that is an override" }
  *
  * `token` is the single-use action token QueryProxy put in the `queryproxy`
  * envelope of the card it posted for this request. The HMAC alone proves only
@@ -73,6 +74,8 @@ class TeamsActionController extends Controller
         $identity = ChatIdentity::query()
             ->where('provider', 'teams')
             ->where('external_id', $validated['actor_id'])
+            // Suspended and soft-deleted users do not resolve: their chat identity is dead.
+            ->whereHas('user', fn ($query) => $query->active())
             ->first();
 
         if (! $identity) {
@@ -95,13 +98,20 @@ class TeamsActionController extends Controller
 
         try {
             if ($validated['action'] === 'approve') {
-                $approvals->approve($queryRequest, $reviewer, 'teams');
+                $approvals->approve($queryRequest, $reviewer, 'teams', $validated['reason'] ?? null);
                 $message = "Request #{$queryRequest->id} approved and queued.";
             } else {
                 $reason = $validated['reason'] ?? "Rejected via Teams by {$reviewer->name}.";
                 $approvals->reject($queryRequest, $reviewer, $reason, 'teams');
                 $message = "Request #{$queryRequest->id} rejected.";
             }
+        } catch (ValidationException $e) {
+            // An override without a reason: nothing was applied and the token
+            // is still unspent, so the card can be answered again with a reason.
+            return response()->json([
+                'ok' => false,
+                'message' => $e->errors()['reason'][0] ?? 'The reason is invalid.',
+            ], 422);
         } catch (AuthorizationException) {
             return response()->json([
                 'ok' => false,

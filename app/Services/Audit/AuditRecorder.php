@@ -13,6 +13,11 @@ use Throwable;
 
 class AuditRecorder
 {
+    /**
+     * @param  bool  $system  Record the entry as made by the system itself: no
+     *                        user is attributed (the signed-in user, if any, is
+     *                        NOT used as a fallback) and metadata.actor = system.
+     */
     public function record(
         AuditEvent|string $action,
         ?Team $team = null,
@@ -21,8 +26,14 @@ class AuditRecorder
         ?Connection $connection = null,
         ?string $sql = null,
         array $metadata = [],
+        bool $system = false,
     ): AuditLog {
-        $actor ??= auth()->user();
+        if ($system) {
+            $actor = null;
+            $metadata = ['actor' => 'system'] + $metadata;
+        } else {
+            $actor ??= auth()->user();
+        }
 
         $log = AuditLog::create([
             'team_id' => $team?->id ?? $request?->team_id ?? $connection?->team_id,

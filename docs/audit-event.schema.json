@@ -52,6 +52,8 @@
                 "auth.password_reset",
                 "user.created",
                 "user.deleted",
+                "user.suspended",
+                "user.unsuspended",
                 "user.admin_toggled",
                 "user.name_changed",
                 "user.password_changed",

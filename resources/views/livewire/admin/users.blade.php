@@ -6,7 +6,7 @@
         </a>
         <h1 class="mt-1.5 font-display text-[19px] font-semibold tracking-[-0.012em] text-ink">Users</h1>
         <p class="mt-1.5 max-w-[78ch] text-[12.5px] leading-[1.55] text-mute">
-            Create accounts, grant system-admin, or remove users. Team roles are managed per team.
+            Create accounts, grant system-admin, suspend or remove users. Team roles are managed per team.
         </p>
     </div>
 
@@ -56,7 +56,12 @@
 
             @foreach ($users as $u)
                 <x-ui.tr>
-                    <x-ui.td class="text-ink-2">{{ $u->name }}</x-ui.td>
+                    <x-ui.td class="text-ink-2">
+                        {{ $u->name }}
+                        @if ($u->isSuspended())
+                            <x-ui.badge tone="pending" class="ml-1.5">Suspended</x-ui.badge>
+                        @endif
+                    </x-ui.td>
                     <x-ui.td mono muted>{{ $u->email }}</x-ui.td>
                     <x-ui.td mono>{{ $u->teams_count }}</x-ui.td>
                     <x-ui.td>
@@ -88,7 +93,14 @@
                                     <x-ui.action wire:click="resetTwoFactor({{ $u->id }})"
                                                  wire:confirm="Reset two-factor authentication for {{ $u->email }}? They will log in with password only until they re-enroll.">Reset 2FA</x-ui.action>
                                 @endif
-                                <x-ui.action wire:click="deleteUser({{ $u->id }})" wire:confirm="Delete user {{ $u->email }}?" tone="danger">Delete</x-ui.action>
+                                @if ($u->isSuspended())
+                                    <x-ui.action wire:click="unsuspendUser({{ $u->id }})" tone="accent">Resume</x-ui.action>
+                                @else
+                                    <x-ui.action wire:click="suspendUser({{ $u->id }})"
+                                                 wire:confirm="Suspend {{ $u->email }}? They are signed out and cannot log in. Their pending requests stay pending.">Suspend</x-ui.action>
+                                @endif
+                                <x-ui.action wire:click="deleteUser({{ $u->id }})"
+                                             wire:confirm="Delete user {{ $u->email }}? Their pending requests are cancelled; request history is kept." tone="danger">Delete</x-ui.action>
                             </div>
                         @else
                             <span class="font-mono text-[11px] text-mute-4">you</span>

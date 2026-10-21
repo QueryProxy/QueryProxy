@@ -27,7 +27,11 @@
                 <x-ui.btn wire:click="cancel" wire:confirm="Cancel this request?">Cancel request</x-ui.btn>
             @endif
             @if ($canReview)
-                <x-ui.btn wire:click="approve" wire:confirm="Approve and execute this query?" variant="ok" icon="check">Approve</x-ui.btn>
+                @if ($isOverride)
+                    <x-ui.btn href="{{ route('requests.override', $request) }}" variant="ok" icon="check">Approve (override)…</x-ui.btn>
+                @else
+                    <x-ui.btn wire:click="approve" wire:confirm="Approve and execute this query?" variant="ok" icon="check">Approve</x-ui.btn>
+                @endif
                 <x-ui.btn wire:click="$set('showRejectForm', true)" variant="danger" icon="x">Reject</x-ui.btn>
             @endif
         </div>
@@ -126,6 +130,12 @@
                     @endif
                 </dl>
             </x-ui.panel>
+
+            @if ($request->note)
+                <x-ui.panel title="Requester's reason" padded>
+                    <p class="whitespace-pre-line text-[12.5px] leading-[1.6] text-ink-3">{{ $request->note }}</p>
+                </x-ui.panel>
+            @endif
 
             @if ($request->isPending())
                 <x-ui.alert tone="pending" icon="clock">

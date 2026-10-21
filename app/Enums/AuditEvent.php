@@ -22,6 +22,8 @@ enum AuditEvent: string
     // Users
     case UserCreated = 'user.created';
     case UserDeleted = 'user.deleted';
+    case UserSuspended = 'user.suspended';
+    case UserUnsuspended = 'user.unsuspended';
     case UserAdminToggled = 'user.admin_toggled';
     case UserNameChanged = 'user.name_changed';
     case UserPasswordChanged = 'user.password_changed';
@@ -83,7 +85,9 @@ enum AuditEvent: string
             self::AuthPasswordReset => 'A user reset their own password through the reset link.',
 
             self::UserCreated => 'An administrator created a user.',
-            self::UserDeleted => 'An administrator deleted a user.',
+            self::UserDeleted => 'An administrator deleted (soft-deleted) a user; metadata.cancelled_requests lists the pending requests cancelled with it.',
+            self::UserSuspended => 'An administrator suspended a user: sign-in blocked, sessions ended, chat identity disabled. Pending requests are left alone.',
+            self::UserUnsuspended => 'An administrator lifted the suspension of a user.',
             self::UserAdminToggled => 'The system admin flag of a user was changed.',
             self::UserNameChanged => 'A user changed their name.',
             self::UserPasswordChanged => 'A user changed their password.',
@@ -121,9 +125,9 @@ enum AuditEvent: string
             self::ChatIdentityRemoved => 'A chat identity was unlinked from a user.',
 
             self::RequestSubmitted => 'A query request was submitted for approval.',
-            self::RequestApproved => 'A query request was approved (metadata.override marks an admin override).',
+            self::RequestApproved => 'A query request was approved (metadata.override marks an admin override; an override always carries metadata.reason).',
             self::RequestRejected => 'A query request was rejected, with channel and reason.',
-            self::RequestCancelled => 'A pending query request was cancelled.',
+            self::RequestCancelled => 'A pending query request was cancelled (by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
             self::RequestExecutionStarted => 'Execution of an approved request started.',
             self::RequestExecutionCompleted => 'Execution of a request completed.',
             self::RequestExecutionFailed => 'Execution of a request failed (masked error message).',

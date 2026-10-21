@@ -54,12 +54,13 @@ class QueryRequest extends Model
 
     public function requester(): BelongsTo
     {
-        return $this->belongsTo(User::class, 'user_id');
+        // Soft-deleted users stay visible: the request history must keep its names.
+        return $this->belongsTo(User::class, 'user_id')->withTrashed();
     }
 
     public function reviewer(): BelongsTo
     {
-        return $this->belongsTo(User::class, 'reviewed_by');
+        return $this->belongsTo(User::class, 'reviewed_by')->withTrashed();
     }
 
     public function chatApprovalTokens(): HasMany

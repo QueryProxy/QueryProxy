@@ -48,6 +48,14 @@ class LoginController extends Controller
 
         $user = User::where('email', $credentials['email'])->firstOrFail();
 
+        // Right credentials, but the account is suspended: refuse before a
+        // session (or the 2FA step) exists.
+        if ($user->isSuspended()) {
+            throw ValidationException::withMessages([
+                'email' => __('This account is suspended.'),
+            ]);
+        }
+
         if ($user->hasTwoFactorEnabled()) {
             // Credentials are correct but the session is not authenticated yet:
             // park the login and demand the TOTP code first.

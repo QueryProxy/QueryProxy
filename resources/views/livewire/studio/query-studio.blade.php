@@ -49,6 +49,12 @@
                 </div>
             </x-ui.panel>
 
+            <x-ui.panel padded>
+                <x-ui.field label="Reason" hint="optional — shown to the DBA who reviews this request" :error="$errors->first('note')">
+                    <x-ui.textarea wire:model="note" rows="2" placeholder="Why is this change needed? Link a ticket if there is one." />
+                </x-ui.field>
+            </x-ui.panel>
+
             <x-ui.panel title="SQL">
                 <div wire:ignore
                      x-data

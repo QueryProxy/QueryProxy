@@ -106,12 +106,13 @@ test('admins can override the self-approval block', function () {
         'user_id' => $admin->id,
     ]);
 
-    app(ApprovalService::class)->approve($adminRequest, $admin);
+    app(ApprovalService::class)->approve($adminRequest, $admin, reason: 'Incident 4711, DBA unreachable');
 
     expect($adminRequest->fresh()->status)->toBe(QueryRequestStatus::Queued);
 
     $log = AuditLog::where('action', 'request.approved')->latest('id')->first();
-    expect($log->metadata['override'])->toBeTrue();
+    expect($log->metadata['override'])->toBeTrue()
+        ->and($log->metadata['reason'])->toBe('Incident 4711, DBA unreachable');
 });
 
 test('developers cannot review requests', function () {

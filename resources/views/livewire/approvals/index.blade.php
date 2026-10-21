@@ -38,9 +38,25 @@
                     <x-ui.code>{{ $request->sql_prepared }}</x-ui.code>
                 </div>
 
+                @if ($request->note)
+                    <div class="border-t border-line px-3.5 py-3">
+                        <div class="eyebrow mb-1.5">Requester's reason</div>
+                        <p class="whitespace-pre-line text-[12.5px] text-ink-3">{{ $request->note }}</p>
+                    </div>
+                @endif
+
                 <x-slot:footer>
                     @if ($isOwnRequest)
                         <span class="font-mono text-[11px] text-mute-3">Your own request — a second DBA has to decide.</span>
+                    @elseif ($overridingId === $request->id)
+                        <form wire:submit="approve({{ $request->id }})" class="flex w-full items-end gap-2.5">
+                            <x-ui.field label="Override reason" hint="required — written to the audit log" class="flex-1" :error="$errors->first('reason')">
+                                <x-ui.input type="text" wire:model="reason" autofocus
+                                            placeholder="Why does this need approving outside the normal DBA review?" />
+                            </x-ui.field>
+                            <x-ui.btn type="submit" variant="ok" icon="check">Approve by override</x-ui.btn>
+                            <x-ui.btn type="button" wire:click="$set('overridingId', null)">Cancel</x-ui.btn>
+                        </form>
                     @elseif ($rejectingId === $request->id)
                         <form wire:submit="reject" class="flex w-full items-end gap-2.5">
                             <x-ui.field label="Rejection reason" class="flex-1" :error="$errors->first('rejectionReason')">
@@ -53,8 +69,12 @@
                     @else
                         <span class="font-mono text-[11px] text-mute-3">Decisions are written to the audit log with your identity.</span>
                         <x-ui.btn wire:click="startReject({{ $request->id }})" variant="danger" icon="x" class="ml-auto">Reject</x-ui.btn>
-                        <x-ui.btn wire:click="approve({{ $request->id }})" wire:confirm="Approve and execute request #{{ $request->id }}?"
-                                  variant="ok" icon="check">Approve &amp; execute</x-ui.btn>
+                        @if (in_array($request->id, $overrideIds, true))
+                            <x-ui.btn wire:click="startOverride({{ $request->id }})" variant="ok" icon="check">Approve (override)…</x-ui.btn>
+                        @else
+                            <x-ui.btn wire:click="approve({{ $request->id }})" wire:confirm="Approve and execute request #{{ $request->id }}?"
+                                      variant="ok" icon="check">Approve &amp; execute</x-ui.btn>
+                        @endif
                     @endif
                 </x-slot:footer>
             </x-ui.panel>

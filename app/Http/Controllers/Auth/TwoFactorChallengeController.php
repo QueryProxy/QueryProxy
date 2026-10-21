@@ -68,6 +68,15 @@ class TwoFactorChallengeController extends Controller
 
         RateLimiter::clear($throttleKey);
 
+        // Suspended between the password step and the code: do not log in.
+        if ($user->isSuspended()) {
+            $request->session()->forget(['two_factor.id', 'two_factor.remember']);
+
+            throw ValidationException::withMessages([
+                'code' => __('This account is suspended.'),
+            ]);
+        }
+
         $remember = (bool) $request->session()->pull('two_factor.remember', false);
         $request->session()->forget('two_factor.id');
 

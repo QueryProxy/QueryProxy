@@ -8,6 +8,7 @@ use App\Models\QueryRequest;
 use App\Models\User;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Validation\ValidationException;
 
 /**
  * The single entry point for approval decisions, used by the web UI and the
@@ -15,14 +16,43 @@ use Illuminate\Support\Facades\Gate;
  */
 class ApprovalService
 {
+    public const MAX_REASON_LENGTH = 1000;
+
     /**
-     * @throws AuthorizationException
+     * An approval is an override when the reviewer is not a DBA of the request's
+     * team (an admin stepping in) or is approving their own request.
      */
-    public function approve(QueryRequest $request, User $reviewer, string $channel = 'web'): void
+    public function isOverride(QueryRequest $request, User $reviewer): bool
+    {
+        return ! $reviewer->isDbaIn($request->team) || $request->user_id === $reviewer->id;
+    }
+
+    /**
+     * @param  string|null  $reason  Mandatory (non-empty) for an override, on every channel.
+     *
+     * @throws AuthorizationException
+     * @throws ValidationException when an override comes without a reason, before anything changes
+     */
+    public function approve(QueryRequest $request, User $reviewer, string $channel = 'web', ?string $reason = null): void
     {
         Gate::forUser($reviewer)->authorize('review', $request);
 
-        $isOverride = ! $reviewer->isDbaIn($request->team) || $request->user_id === $reviewer->id;
+        $isOverride = $this->isOverride($request, $reviewer);
+        $reason = trim((string) $reason);
+
+        if ($isOverride) {
+            if ($reason === '') {
+                throw ValidationException::withMessages([
+                    'reason' => 'An override needs a reason.',
+                ]);
+            }
+
+            if (mb_strlen($reason) > self::MAX_REASON_LENGTH) {
+                throw ValidationException::withMessages([
+                    'reason' => 'The reason may not be longer than '.self::MAX_REASON_LENGTH.' characters.',
+                ]);
+            }
+        }
 
         // Conditional update so two concurrent approvals (e.g. web + a stale
         // Slack button) can never both claim the request and dispatch it twice.
@@ -44,6 +74,7 @@ class ApprovalService
         audit()->record('request.approved', actor: $reviewer, request: $request, metadata: [
             'channel' => $channel,
             'override' => $isOverride,
+            ...($isOverride ? ['reason' => $reason] : []),
         ]);
 
         ApprovalNotifier::requestDecided($request);
@@ -99,5 +130,31 @@ class ApprovalService
         $request->refresh();
 
         audit()->record('request.cancelled', actor: $user, request: $request);
+    }
+
+    /**
+     * Cancel a pending request on behalf of the system (e.g. its owner was
+     * deleted). No policy check: there is no acting user. The pending to
+     * cancelled move is the same atomic claim as a user cancel, and the audit
+     * entry carries no user — not even the signed-in one — plus metadata.actor
+     * = system and the reason.
+     *
+     * @return bool false when the request was no longer pending (already decided)
+     */
+    public function cancelBySystem(QueryRequest $request, string $reason): bool
+    {
+        $claimed = QueryRequest::whereKey($request->id)
+            ->where('status', QueryRequestStatus::Pending)
+            ->update(['status' => QueryRequestStatus::Cancelled]);
+
+        if ($claimed === 0) {
+            return false;
+        }
+
+        $request->refresh();
+
+        audit()->record('request.cancelled', request: $request, metadata: ['reason' => $reason], system: true);
+
+        return true;
     }
 }

@@ -12,6 +12,7 @@ use App\Livewire\Admin\TeamMembers;
 use App\Livewire\Admin\Teams;
 use App\Livewire\Admin\Users;
 use App\Livewire\Approvals\Index as ApprovalsIndex;
+use App\Livewire\Approvals\Override as ApprovalOverride;
 use App\Livewire\Audit\Index as AuditIndex;
 use App\Livewire\Connections\Index as ConnectionsIndex;
 use App\Livewire\Dashboard;
@@ -65,6 +66,11 @@ Route::middleware(['auth', '2fa.required'])->group(function () {
         Route::get('/masking', MaskingIndex::class)->name('masking.index');
         Route::get('/settings/chatops', ChatOpsSettings::class)->name('settings.chatops');
     });
+
+    // Outside the role groups on purpose: a Slack Approve press that would be an
+    // override links here, and the request policy (not the current-team role)
+    // decides who may review.
+    Route::get('/requests/{queryRequest}/override', ApprovalOverride::class)->name('requests.override');
 
     Route::middleware('role:auditor')->group(function () {
         Route::get('/audit', AuditIndex::class)->name('audit.index');
