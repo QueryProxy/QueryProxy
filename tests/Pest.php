@@ -9,7 +9,11 @@ pest()->extend(TestCase::class)
 
 pest()->extend(TestCase::class)->in('Unit');
 
-// Live database checks: skipped unless QUERYPROXY_LIVE_PGSQL_HOST is set.
-pest()->extend(TestCase::class)
-    ->group('live-pgsql')
-    ->in('Live');
+// Live database checks. The PostgreSQL guard tests ("live-pgsql") are skipped
+// unless QUERYPROXY_LIVE_PGSQL_HOST is set; the audit chain tests
+// ("live-appdb") unless QUERYPROXY_LIVE_APPDB_HOST is set.
+pest()->extend(TestCase::class)->in('Live');
+
+pest()->group('live-pgsql')->in('Live/Pgsql*');
+
+pest()->group('live-appdb')->in('Live/AuditChainLiveTest.php');

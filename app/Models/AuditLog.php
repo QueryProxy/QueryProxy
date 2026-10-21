@@ -2,8 +2,11 @@
 
 namespace App\Models;
 
+use App\Services\Audit\AuditChain;
 use App\Services\Sql\SqlRedactor;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -57,6 +60,43 @@ class AuditLog extends Model
         // Audit logs are immutable: they can only ever be inserted.
         static::updating(fn () => throw new RuntimeException('Audit logs are immutable.'));
         static::deleting(fn () => throw new RuntimeException('Audit logs are immutable.'));
+    }
+
+    /**
+     * Insert and chain in one transaction: the chain lock taken by
+     * AuditChain::seal() is held until the record is committed, so records
+     * are appended in a single order (ADR-020). The chain head moves inside
+     * seal(), in this same transaction.
+     */
+    protected function performInsert(Builder $query)
+    {
+        return $this->getConnection()->transaction(fn () => parent::performInsert($query));
+    }
+
+    /**
+     * saveOrIgnore() would skip the insert silently after the chain lock and
+     * head were already moved. Audit records are never written that way.
+     */
+    protected function performInsertOrIgnore(Builder $query, array|string|null $uniqueBy)
+    {
+        throw new RuntimeException('Audit logs cannot be inserted with saveOrIgnore().');
+    }
+
+    /**
+     * Seal the record at the last possible moment: parent::performInsert()
+     * has fired `creating` (listeners may still change fields) and set the
+     * timestamps by now, and this is the attribute set that is inserted, so
+     * the hash always covers exactly what is stored. Still inside the
+     * transaction opened by performInsert().
+     */
+    protected function getAttributesForInsert()
+    {
+        // Whole seconds only: the hashed value must survive any column type.
+        $this->setAttribute('created_at', Carbon::parse($this->getAttribute('created_at'))->startOfSecond());
+
+        app(AuditChain::class)->seal($this);
+
+        return parent::getAttributesForInsert();
     }
 
     public function user(): BelongsTo

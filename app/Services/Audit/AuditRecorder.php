@@ -2,6 +2,7 @@
 
 namespace App\Services\Audit;
 
+use App\Enums\AuditEvent;
 use App\Models\AuditLog;
 use App\Models\Connection;
 use App\Models\QueryRequest;
@@ -11,7 +12,7 @@ use App\Models\User;
 class AuditRecorder
 {
     public function record(
-        string $action,
+        AuditEvent|string $action,
         ?Team $team = null,
         ?User $actor = null,
         ?QueryRequest $request = null,
@@ -24,7 +25,7 @@ class AuditRecorder
         return AuditLog::create([
             'team_id' => $team?->id ?? $request?->team_id ?? $connection?->team_id,
             'user_id' => $actor?->id,
-            'action' => $action,
+            'action' => $action instanceof AuditEvent ? $action->value : $action,
             'query_request_id' => $request?->id,
             'connection_id' => $connection?->id ?? $request?->connection_id,
             'sql' => $sql,
