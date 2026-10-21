@@ -34,6 +34,7 @@ class Index extends Component
 
         $query = QueryRequest::forTeam($team)
             ->with(['connection', 'requester', 'team'])
+            ->withSlotWait()
             ->latest();
 
         // Developers only see their own requests; DBAs / auditors / admins see the team's.

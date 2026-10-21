@@ -8,6 +8,7 @@ use Illuminate\Database\Connection as DatabaseConnection;
 use PDO;
 use RuntimeException;
 use Throwable;
+use WeakMap;
 
 /**
  * Database-side session hardening for a query run against a target database.
@@ -30,15 +31,21 @@ use Throwable;
  */
 class TargetSession
 {
+    /** @var WeakMap<PDO, true>|null connections currently switched to unbuffered fetch */
+    private ?WeakMap $unbuffered = null;
+
     /** Seconds the database stops before the job's own execution timeout. */
     public const STATEMENT_TIMEOUT_MARGIN = 5;
 
     /** PDO_SQLSRV's query timeout attribute (PDO::SQLSRV_ATTR_QUERY_TIMEOUT). */
     private const SQLSRV_ATTR_QUERY_TIMEOUT = 1001;
 
-    /** Error text fragments (lower case) that mean "write attempted in a read-only session". */
+    /** PDO MySQL's buffered-query attribute (Pdo\Mysql::ATTR_USE_BUFFERED_QUERY, formerly PDO::MYSQL_ATTR_USE_BUFFERED_QUERY). */
+    private const MYSQL_ATTR_USE_BUFFERED_QUERY = 1000;
+
     private const LIMIT_ATTEMPTS = 3;
 
+    /** Error text fragments (lower case) that mean "write attempted in a read-only session". */
     private const READ_ONLY_VIOLATIONS = [
         'sqlstate[25006]',
         'read-only transaction',
@@ -182,6 +189,11 @@ class TargetSession
                     throw new RuntimeException('The database connection was re-established while opening the read-only transaction; refusing to run the read on a writable session.');
                 }
 
+                // Rows are streamed from the server, never copied into PHP
+                // memory first. Done only now, inside the transaction, so the
+                // statements above (and any reconnect) ran buffered.
+                $this->disableBufferedFetch($db);
+
                 break;
 
             case DbDriver::Sqlite:
@@ -200,6 +212,8 @@ class TargetSession
 
     public function endReadOnly(DatabaseConnection $db, bool $commit): void
     {
+        $this->restoreBufferedFetch($db);
+
         if ($db->transactionLevel() < 1) {
             return;
         }
@@ -234,6 +248,52 @@ class TargetSession
         }
 
         return false;
+    }
+
+    /**
+     * Stop PDO MySQL from buffering whole result sets client-side.
+     *
+     * An unbuffered connection cannot run another statement until the open
+     * result is consumed or freed, so the caller must release the result
+     * before endReadOnly() and must not query the same connection meanwhile.
+     * Fails closed: if the attribute cannot be set, the read does not run,
+     * because it could silently pull a huge result into memory.
+     */
+    private function disableBufferedFetch(DatabaseConnection $db): void
+    {
+        $pdo = $db->getPdo();
+
+        if (! $pdo->setAttribute(self::mysqlBufferedQueryAttribute(), false)) {
+            throw new RuntimeException('Could not switch the database connection to unbuffered fetch; refusing to run the read.');
+        }
+
+        $this->unbuffered ??= new WeakMap;
+        $this->unbuffered[$pdo] = true;
+    }
+
+    /** Back to buffered mode, so the COMMIT and anything after it run normally. */
+    private function restoreBufferedFetch(DatabaseConnection $db): void
+    {
+        $pdo = $db->getRawPdo();
+
+        if (! $pdo instanceof PDO || ! isset($this->unbuffered[$pdo])) {
+            return;
+        }
+
+        unset($this->unbuffered[$pdo]);
+
+        try {
+            $pdo->setAttribute(self::mysqlBufferedQueryAttribute(), true);
+        } catch (Throwable) {
+            // A dead connection is discarded by the caller anyway.
+        }
+    }
+
+    private static function mysqlBufferedQueryAttribute(): int
+    {
+        return defined('Pdo\\Mysql::ATTR_USE_BUFFERED_QUERY')
+            ? (int) constant('Pdo\\Mysql::ATTR_USE_BUFFERED_QUERY')
+            : self::MYSQL_ATTR_USE_BUFFERED_QUERY;
     }
 
     private static function sqlsrvQueryTimeoutAttribute(): int

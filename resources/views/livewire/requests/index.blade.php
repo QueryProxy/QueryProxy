@@ -43,7 +43,12 @@
                     <x-ui.td mono muted nowrap>{{ $request->connection->name }}</x-ui.td>
                     <x-ui.td muted nowrap>{{ $request->requester->name }}</x-ui.td>
                     <x-ui.td><x-ui.badge :tone="$request->type->tone()">{{ $request->type->label() }}</x-ui.badge></x-ui.td>
-                    <x-ui.td><x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge></x-ui.td>
+                    <x-ui.td>
+                        <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
+                        @if ($request->isWaitingForSlot())
+                            <x-ui.badge tone="pending" class="mt-1" title="Every connection slot is busy; this request runs as soon as one frees up.">Waiting for slot</x-ui.badge>
+                        @endif
+                    </x-ui.td>
                     <x-ui.td mono muted nowrap align="right" title="{{ $request->created_at }}">{{ $request->created_at->diffForHumans() }}</x-ui.td>
                 </x-ui.tr>
             @empty

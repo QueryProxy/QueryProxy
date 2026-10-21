@@ -7,6 +7,7 @@ use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Execution\QueryExecutor;
+use App\Services\Execution\ResultStreamer;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Database\Events\TransactionCommitted;
@@ -15,6 +16,26 @@ use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Storage;
+
+/** A SQLite PDO that records (and can refuse) the MySQL buffered-query switch. */
+class SessionRecordingPdo extends PDO
+{
+    /** @var list<array{buffered: bool, inTransaction: bool}> */
+    public static array $bufferedQueryCalls = [];
+
+    public static bool $refuseBufferedQuery = false;
+
+    public function setAttribute(int $attribute, mixed $value): bool
+    {
+        if ($attribute === 1000) {
+            self::$bufferedQueryCalls[] = ['buffered' => (bool) $value, 'inTransaction' => $this->inTransaction()];
+
+            return ! self::$refuseBufferedQuery;
+        }
+
+        return parent::setAttribute($attribute, $value);
+    }
+}
 
 /**
  * Database-side session hardening: READ ONLY transaction for reads and the
@@ -57,18 +78,62 @@ function sessionSetup(string $sql, string $type = 'read', ?DbDriver $driver = nu
 /** Route the target (and its read identity) to a SQLite-backed session that ignores SET statements. */
 function sessionFakeDriver(string $dbFile): void
 {
+    SessionRecordingPdo::$bufferedQueryCalls = [];
+    SessionRecordingPdo::$refuseBufferedQuery = false;
+
     DB::extend('fake_session', function (array $config, string $name) {
-        return new class(new PDO('sqlite:'.$config['database']), $config['database'], '', $config + ['name' => $name]) extends SQLiteConnection
+        return new class(new SessionRecordingPdo('sqlite:'.$config['database']), $config['database'], '', $config + ['name' => $name]) extends SQLiteConnection
         {
+            private ?string $cursorSql = null;
+
+            private int $cursorOffset = 0;
+
             public function unprepared($query)
             {
-                if (str_starts_with($query, 'SET ')) {
+                if (str_starts_with($query, 'SET ')
+                    || preg_match('/^(SAVEPOINT|RELEASE SAVEPOINT|ROLLBACK TO SAVEPOINT|CLOSE) /', $query) === 1) {
                     $this->event(new QueryExecuted($query, [], 0, $this));
 
                     return true;
                 }
 
                 return parent::unprepared($query);
+            }
+
+            // PostgreSQL's server-side cursor, emulated: DECLARE remembers the
+            // query, FETCH FORWARD n replays the next n rows of it.
+            public function statement($query, $bindings = [])
+            {
+                $prefix = 'DECLARE qp_cursor NO SCROLL CURSOR FOR ';
+
+                if (! str_starts_with($query, $prefix)) {
+                    return parent::statement($query, $bindings);
+                }
+
+                $this->event(new QueryExecuted($query, [], 0, $this));
+
+                if (str_contains($query, '/*no-cursor*/')) {
+                    throw new RuntimeException('cannot declare a cursor for this statement');
+                }
+
+                $this->cursorSql = substr($query, strlen($prefix));
+                $this->cursorOffset = 0;
+
+                return true;
+            }
+
+            public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
+            {
+                if (preg_match('/^FETCH FORWARD (\d+) FROM qp_cursor$/', $query, $match) !== 1) {
+                    return parent::select($query, $bindings, $useReadPdo, $fetchUsing);
+                }
+
+                $statement = $this->getPdo()->query(sprintf('SELECT * FROM (%s) LIMIT %d OFFSET %d', $this->cursorSql, $match[1], $this->cursorOffset));
+                $rows = $statement->fetchAll(PDO::FETCH_OBJ);
+                $this->cursorOffset += count($rows);
+                $this->event(new QueryExecuted($query, [], 0, $this));
+
+                return $rows;
             }
 
             public function scalar($query, $bindings = [], $useReadPdo = true)
@@ -185,7 +250,11 @@ test('a read opens a READ ONLY transaction and sets the timeouts for the driver'
         'SET LOCAL statement_timeout = 60000',
         'SET LOCAL lock_timeout = 7000',
         'SET LOCAL idle_in_transaction_session_timeout = 65000',
-        'SELECT id FROM customers',
+        'SAVEPOINT qp_declare',
+        'DECLARE qp_cursor NO SCROLL CURSOR FOR SELECT id FROM customers',
+        'RELEASE SAVEPOINT qp_declare',
+        'FETCH FORWARD 500 FROM qp_cursor',
+        'CLOSE qp_cursor',
         'COMMIT',
     ]],
     'mysql' => [DbDriver::Mysql, [
@@ -293,3 +362,152 @@ test('a read without a read identity stays on the main connection', function () 
 
     expect(collect($log)->pluck('connection')->unique()->all())->toBe(['queryproxy_target_'.$request->connection_id]);
 });
+
+// ---------------------------------------------------------------------------
+// Unbuffered fetch (ADR-003 amendment)
+// ---------------------------------------------------------------------------
+
+test('a mysql or mariadb read switches to unbuffered fetch inside the transaction and back before the commit', function (DbDriver $driver) {
+    [$request] = sessionSetup('SELECT id, name FROM customers ORDER BY id', 'read', $driver);
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->fresh()->result_row_count)->toBe(3)
+        ->and(SessionRecordingPdo::$bufferedQueryCalls)->toBe([
+            ['buffered' => false, 'inTransaction' => true],
+            ['buffered' => true, 'inTransaction' => true],
+        ]);
+})->with([DbDriver::Mysql, DbDriver::Mariadb]);
+
+test('a mysql read fails closed when the connection cannot be made unbuffered', function () {
+    [$request] = sessionSetup('SELECT id FROM customers', 'read', DbDriver::Mysql);
+    SessionRecordingPdo::$refuseBufferedQuery = true;
+    $log = sessionCollectQueries();
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Failed)
+        ->and(sessionSent($log))->not->toContain('SELECT id FROM customers')
+        ->and(sessionSent($log))->toContain('ROLLBACK');
+});
+
+test('reads on the other drivers never touch the buffered-query attribute', function (?DbDriver $driver) {
+    [$request] = sessionSetup('SELECT id FROM customers', 'read', $driver);
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed)
+        ->and(SessionRecordingPdo::$bufferedQueryCalls)->toBe([]);
+})->with([DbDriver::Pgsql, DbDriver::Sqlsrv]);
+
+test('a pgsql read pulls the rows through a server-side cursor in batches and stops one row past the ceiling', function () {
+    config(['queryproxy.select_hard_limit' => 1200]);
+    $sql = 'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500) SELECT i FROM n';
+    [$request] = sessionSetup($sql, 'read', DbDriver::Pgsql);
+    $log = sessionCollectQueries();
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+    $sent = sessionSent($log);
+
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->result_row_count)->toBe(1200)
+        ->and($request->result_truncated)->toBeTrue()
+        ->and(array_values(array_filter($sent, fn ($q) => str_starts_with($q, 'FETCH'))))->toBe([
+            'FETCH FORWARD 500 FROM qp_cursor',
+            'FETCH FORWARD 500 FROM qp_cursor',
+            'FETCH FORWARD 201 FROM qp_cursor',
+        ])
+        ->and(array_slice($sent, -2))->toBe(['CLOSE qp_cursor', 'COMMIT']);
+});
+
+test('a pgsql read that ends before the ceiling is not marked truncated', function () {
+    [$request] = sessionSetup('SELECT id FROM customers', 'read', DbDriver::Pgsql);
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->result_row_count)->toBe(3)
+        ->and($request->fresh()->result_truncated)->toBeFalse();
+});
+
+test('a pgsql statement the server will not declare as a cursor still runs as a plain query, and says so', function () {
+    Log::spy();
+
+    [$request] = sessionSetup('SELECT id FROM customers /*no-cursor*/', 'read', DbDriver::Pgsql);
+    $log = sessionCollectQueries();
+
+    app(QueryExecutor::class)->execute($request);
+
+    $sent = sessionSent($log);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->fresh()->result_row_count)->toBe(3)
+        ->and($sent)->toContain('ROLLBACK TO SAVEPOINT qp_declare')
+        ->and($sent)->toContain('SELECT id FROM customers /*no-cursor*/')
+        ->and($sent)->not->toContain('FETCH FORWARD 500 FROM qp_cursor');
+
+    // The fallback holds the whole result in client memory, so it must not be silent,
+    // and the log line must not carry the SQL or the server's message.
+    Log::shouldHaveReceived('warning')->once()->withArgs(fn (string $message, array $context) => str_contains($message, 'Server-side cursor refused')
+        && $context['query_request_id'] === $request->id
+        && $context['exception'] === RuntimeException::class
+        && ! str_contains(json_encode($context), 'customers')
+        && ! str_contains(json_encode($context), 'cannot declare'));
+});
+
+test('a pgsql statement that is declared as a cursor logs no warning', function () {
+    Log::spy();
+
+    [$request] = sessionSetup('SELECT id FROM customers', 'read', DbDriver::Pgsql);
+
+    app(QueryExecutor::class)->execute($request);
+
+    Log::shouldNotHaveReceived('warning');
+});
+
+test('a pgsql statement behind leading comments is still read through a cursor', function (string $sql) {
+    [$request] = sessionSetup($sql, 'read', DbDriver::Pgsql);
+    $log = sessionCollectQueries();
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed)
+        ->and(sessionSent($log))->toContain('FETCH FORWARD 500 FROM qp_cursor');
+})->with([
+    'block comment' => ['/* daily report */ SELECT id FROM customers'],
+    'line comment' => ["-- daily report\nSELECT id FROM customers"],
+    'comment after parenthesis' => ['( /* x */ SELECT id FROM customers)'],
+    // Nested comments are covered by the isDeclarable() dataset: the fake server here is SQLite, which has none.
+]);
+
+test('only statements PostgreSQL can declare as a cursor are wrapped', function (string $sql, bool $declarable) {
+    expect(ResultStreamer::isDeclarable($sql))->toBe($declarable);
+})->with([
+    'select' => ['SELECT 1', true],
+    'lower case with leading whitespace' => ["  \n select 1", true],
+    'parenthesised select' => ['(SELECT 1) UNION (SELECT 2)', true],
+    'with' => ['WITH a AS (SELECT 1) SELECT * FROM a', true],
+    'values' => ['VALUES (1), (2)', true],
+    'table' => ['TABLE customers', true],
+    'show' => ['SHOW server_version', false],
+    'explain' => ['EXPLAIN SELECT 1', false],
+    'block comment before select' => ['/* hi */ SELECT 1', true],
+    'line comment before select' => ["-- daily report\nSELECT 1", true],
+    'several comments and blank lines' => ["-- a\n\n/* b */\n  -- c\nSELECT 1", true],
+    'nested block comment' => ['/* a /* b */ c */ SELECT 1', true],
+    'comment before parenthesised select' => ['/* x */ (SELECT 1) UNION (SELECT 2)', true],
+    'comment after opening parenthesis' => ['( /* x */ SELECT 1) UNION (SELECT 2)', true],
+    'line comment after opening parenthesis' => ["(-- x\nSELECT 1)", true],
+    'nested parentheses with comments' => ["/* a */ ( /* b */ ( -- c\n WITH t AS (SELECT 1) SELECT * FROM t))", true],
+    'comment after parenthesis before show' => ['( /* x */ SHOW server_version)', false],
+    'parenthesis then unterminated comment' => ['( /* never closed SELECT 1', false],
+    'bare parenthesis' => ['(', false],
+    'comment before show' => ['/* x */ SHOW server_version', false],
+    'comment only' => ['-- nothing here', false],
+    'unterminated block comment' => ['/* never closed SELECT 1', false],
+    'unterminated nested block comment' => ['/* a /* b */ SELECT 1', false],
+    'keyword hidden in a comment' => ['/* SELECT 1 */ SHOW server_version', false],
+    'identifier that starts like a keyword' => ['selected_rows()', false],
+]);

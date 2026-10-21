@@ -92,6 +92,7 @@
                 "request.execution_started",
                 "request.execution_completed",
                 "request.execution_failed",
+                "request.execution_deferred",
                 "execution.late_completion",
                 "result.downloaded"
             ]

@@ -8,6 +8,9 @@
             <h1 class="mt-1.5 flex flex-wrap items-center gap-2.5 font-display text-[19px] font-semibold tracking-[-0.012em] text-ink">
                 Request #{{ $request->id }}
                 <x-ui.badge :tone="$request->status->tone()">{{ $request->status->label() }}</x-ui.badge>
+                @if ($request->isWaitingForSlot())
+                    <x-ui.badge tone="pending" title="Every connection slot is busy; this request runs as soon as one frees up.">Waiting for slot</x-ui.badge>
+                @endif
                 <x-ui.badge :tone="$request->type->tone()">{{ $request->type->label() }}</x-ui.badge>
                 @if ($request->is_ddl)
                     <x-ui.badge tone="danger">DDL</x-ui.badge>

@@ -222,7 +222,16 @@ function fakeMysqlSession(QueryRequest $request, string $dbFile, DbDriver $drive
     $request->connection->forceFill(['driver' => $driver])->save();
 
     DB::extend('fake_mysql_session', function (array $config) use ($sqlMode, $defaultDatabase) {
-        return new class(new PDO('sqlite:'.$config['database']), $config['database'], '', $config, $sqlMode, $defaultDatabase) extends SQLiteConnection
+        // MySQL's unbuffered-fetch attribute does not exist on SQLite; accept it.
+        $pdo = new class('sqlite:'.$config['database']) extends PDO
+        {
+            public function setAttribute(int $attribute, mixed $value): bool
+            {
+                return $attribute === 1000 ? true : parent::setAttribute($attribute, $value);
+            }
+        };
+
+        return new class($pdo, $config['database'], '', $config, $sqlMode, $defaultDatabase) extends SQLiteConnection
         {
             public function __construct($pdo, $database, $tablePrefix, $config, private string|Throwable $sqlMode, private array|Throwable $defaultDatabase)
             {

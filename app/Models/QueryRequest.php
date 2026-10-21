@@ -25,6 +25,9 @@ class QueryRequest extends Model
 {
     use HasFactory;
 
+    /** Audit action written when a request is held back because the connection's slots are busy. */
+    public const SLOT_DEFERRED_ACTION = 'request.execution_deferred';
+
     protected function casts(): array
     {
         return [
@@ -68,6 +71,11 @@ class QueryRequest extends Model
         return $this->hasMany(ChatApprovalToken::class);
     }
 
+    public function auditLogs(): HasMany
+    {
+        return $this->hasMany(AuditLog::class);
+    }
+
     public function scopeForTeam(Builder $query, Team $team): Builder
     {
         return $query->where('team_id', $team->id);
@@ -93,6 +101,31 @@ class QueryRequest extends Model
     public function isPending(): bool
     {
         return $this->status === QueryRequestStatus::Pending;
+    }
+
+    /** Adds `is_waiting_for_slot` (a deferral entry exists) to each row, so a list can show the badge without a query per row; isWaitingForSlot() still requires the Queued status. */
+    public function scopeWithSlotWait(Builder $query): Builder
+    {
+        return $query->withExists(['auditLogs as is_waiting_for_slot' => fn (Builder $logs) => $logs
+            ->where('action', self::SLOT_DEFERRED_ACTION)]);
+    }
+
+    /**
+     * True while the request sits in the queue because every connection slot
+     * was busy. Derived from the deferral audit entry (no status of its own):
+     * it clears when the request starts running or reaches a final state.
+     */
+    public function isWaitingForSlot(): bool
+    {
+        if ($this->status !== QueryRequestStatus::Queued) {
+            return false;
+        }
+
+        if (array_key_exists('is_waiting_for_slot', $this->attributes)) {
+            return (bool) $this->attributes['is_waiting_for_slot'];
+        }
+
+        return $this->auditLogs()->where('action', self::SLOT_DEFERRED_ACTION)->exists();
     }
 
     public function hasResult(): bool

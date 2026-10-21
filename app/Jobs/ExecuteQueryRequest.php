@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Enums\QueryRequestStatus;
+use App\Jobs\Middleware\LimitConnectionConcurrency;
 use App\Models\QueryRequest;
 use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Execution\QueryExecutor;
@@ -29,6 +30,34 @@ class ExecuteQueryRequest implements ShouldQueue
     public function handle(QueryExecutor $executor): void
     {
         $executor->execute($this->request->fresh());
+    }
+
+    /**
+     * @return list<object>
+     */
+    public function middleware(): array
+    {
+        return [new LimitConnectionConcurrency];
+    }
+
+    /**
+     * Put this request back on the queue to start again after $delay seconds
+     * and drop the current copy.
+     *
+     * release() is not used: it counts as an attempt, and with tries = 1 the
+     * next pick-up would be failed as having exceeded them. A fresh copy
+     * starts at zero attempts. Dispatching before deleting means a crash in
+     * between leaves two copies, which the executor's conditional claim
+     * already handles (only one can start the request).
+     */
+    public function requeue(int $delay): void
+    {
+        $copy = new self($this->request);
+        $copy->onConnection($this->connection)->onQueue($this->queue)->delay($delay);
+
+        dispatch($copy);
+
+        $this->job?->delete();
     }
 
     /**

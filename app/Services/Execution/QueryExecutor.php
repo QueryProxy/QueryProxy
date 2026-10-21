@@ -45,6 +45,7 @@ class QueryExecutor
         private Masker $masker,
         private ErrorMessageSanitizer $errors,
         private TargetSession $session,
+        private ResultStreamer $streamer,
     ) {}
 
     public function execute(QueryRequest $request): void
@@ -381,7 +382,11 @@ class QueryExecutor
             $sessionOpened = true;
             $this->session->beginReadOnly($db, $driver);
 
-            foreach ($db->cursor($sql) as $row) {
+            // Rows are pulled from the server one at a time (see
+            // ResultStreamer), so peak memory does not grow with the result.
+            $rows = $this->streamer->rows($db, $driver, $sql, $hardLimit, ['query_request_id' => $request->id]);
+
+            foreach ($rows as $row) {
                 if ($rowCount >= $hardLimit) {
                     $truncated = true;
 
@@ -400,6 +405,11 @@ class QueryExecutor
                 $rowCount++;
             }
 
+            // Stop reading at the ceiling and free the statement / cursor
+            // before the transaction ends: an unbuffered result left open
+            // would make the COMMIT fail.
+            unset($rows);
+
             $this->session->endReadOnly($db, commit: true);
             $sessionOpened = false;
 
@@ -414,6 +424,9 @@ class QueryExecutor
                 'result_columns' => json_encode($columns),
             ];
         } catch (Throwable $e) {
+            // Free the open result / cursor before the rollback.
+            unset($rows);
+
             if ($sessionOpened) {
                 $this->session->endReadOnly($db, commit: false);
             }

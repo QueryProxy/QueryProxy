@@ -72,6 +72,7 @@ enum AuditEvent: string
     case RequestExecutionStarted = 'request.execution_started';
     case RequestExecutionCompleted = 'request.execution_completed';
     case RequestExecutionFailed = 'request.execution_failed';
+    case RequestExecutionDeferred = 'request.execution_deferred';
     case ExecutionLateCompletion = 'execution.late_completion';
     case ResultDownloaded = 'result.downloaded';
 
@@ -131,6 +132,7 @@ enum AuditEvent: string
             self::RequestExecutionStarted => 'Execution of an approved request started.',
             self::RequestExecutionCompleted => 'Execution of a request completed.',
             self::RequestExecutionFailed => 'Execution of a request failed (masked error message).',
+            self::RequestExecutionDeferred => 'An approved request was put back on the queue because every slot of its connection was busy.',
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
             self::ResultDownloaded => 'The stored result of a request was downloaded.',
         };

@@ -55,6 +55,22 @@ return [
 
     'lock_timeout' => ExecutionTimeout::resolveLock(env('QUERYPROXY_LOCK_TIMEOUT', '5')),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Connection slots
+    |--------------------------------------------------------------------------
+    |
+    | How many requests may run against one target connection at the same time
+    | (a cache lock per slot). A request that finds every slot taken goes back
+    | on the queue and starts again after `connection_slot_retry_delay`
+    | seconds; it stays "queued" meanwhile. 0 disables the limit. With more
+    | workers than slots, the extra workers simply re-queue jobs.
+    */
+
+    'connection_slots' => max(0, (int) env('QUERYPROXY_CONNECTION_SLOTS', 2)),
+
+    'connection_slot_retry_delay' => max(1, (int) env('QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY', 5)),
+
     'result_disk' => env('QUERYPROXY_RESULT_DISK', 'local'),
 
     'result_ttl_days' => (int) env('QUERYPROXY_RESULT_TTL_DAYS', 30),
