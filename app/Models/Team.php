@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Services\Connections\TlsPemStore;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -33,6 +34,16 @@ class Team extends Model
 
         static::created(function (Team $team) {
             $team->installDefaultMaskingRules();
+        });
+
+        // connections.team_id cascades in the database, which fires no model
+        // events, so Connection's own `deleted` hook never runs for these
+        // rows. Remove their TLS PEM files (client keys are stored in clear on
+        // disk while in use) before the cascade, whichever path deletes the team.
+        static::deleting(function (Team $team) {
+            $store = app(TlsPemStore::class);
+
+            $team->connections()->pluck('id')->each(fn ($id) => $store->purgeById((int) $id));
         });
     }
 
