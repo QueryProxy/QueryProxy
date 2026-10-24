@@ -5,6 +5,7 @@ namespace App\Jobs\Middleware;
 use App\Enums\QueryRequestStatus;
 use App\Jobs\ExecuteQueryRequest;
 use App\Models\QueryRequest;
+use App\Services\Metrics\MetricsRecorder;
 use Closure;
 use Illuminate\Queue\Jobs\SyncJob;
 use Illuminate\Support\Facades\Cache;
@@ -115,6 +116,8 @@ class LimitConnectionConcurrency
         }
 
         Log::info('Query request waiting for a free connection slot.', $context);
+
+        app(MetricsRecorder::class)->slotDeferred();
 
         try {
             audit()->record(QueryRequest::SLOT_DEFERRED_ACTION, actor: $request->reviewer, request: $request, metadata: [

@@ -249,6 +249,28 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Prometheus metrics (ADR-022)
+    |--------------------------------------------------------------------------
+    | GET /metrics is off until one of these is set. A scrape passes with the
+    | Bearer `token` (QUERYPROXY_METRICS_TOKEN, or the file named by
+    | QUERYPROXY_METRICS_TOKEN_FILE) or from an address in `allowed_ips`
+    | (QUERYPROXY_METRICS_ALLOWED_IPS, comma-separated addresses or CIDR
+    | ranges; the client address follows the TRUSTED_PROXIES rules above).
+    | Anything else gets 401. Use a random token of 24+ characters
+    | (`openssl rand -hex 24`); queryproxy:doctor warns about a shorter one.
+    */
+
+    'metrics' => [
+        'token' => SecretFile::get('QUERYPROXY_METRICS_TOKEN'),
+
+        'allowed_ips' => array_values(array_filter(array_map(
+            'trim',
+            explode(',', (string) env('QUERYPROXY_METRICS_ALLOWED_IPS', '')),
+        ))),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | SIEM sinks (ADR-021)
     |--------------------------------------------------------------------------
     | Every audit event can also be exported to external systems. All sinks are

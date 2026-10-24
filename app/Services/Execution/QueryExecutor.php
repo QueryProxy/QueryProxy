@@ -11,6 +11,7 @@ use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Masking\ErrorMessageSanitizer;
 use App\Services\Masking\Masker;
+use App\Services\Metrics\MetricsRecorder;
 use App\Services\Sql\SqlInspector;
 use Illuminate\Database\Connection as DatabaseConnection;
 use Illuminate\Database\LostConnectionException;
@@ -49,6 +50,7 @@ class QueryExecutor
         private TargetSession $session,
         private ResultStreamer $streamer,
         private BackendCanceller $canceller,
+        private MetricsRecorder $metrics,
     ) {}
 
     public function execute(QueryRequest $request): void
@@ -67,6 +69,12 @@ class QueryExecutor
         }
 
         $request->refresh();
+
+        $this->metrics->requestEntered(QueryRequestStatus::Running, $request->type);
+
+        // The masker may be shared by the runs of one worker: start this run's
+        // masked-value count from zero.
+        $this->masker->takeMaskedTally();
 
         $connection = $request->connection;
 
@@ -136,6 +144,10 @@ class QueryExecutor
             $owned = true;
             $request->refresh();
 
+            $this->metrics->requestEntered(QueryRequestStatus::Completed, $request->type);
+            $this->metrics->executionFinished($request, $durationMs);
+            $this->metrics->maskedValues($this->masker->takeMaskedTally());
+
             audit()->record('request.execution_completed', actor: $request->reviewer, request: $request, metadata: [
                 'duration_ms' => $request->duration_ms,
                 'affected_rows' => $request->affected_rows,
@@ -188,6 +200,9 @@ class QueryExecutor
 
             $owned = true;
             $request->refresh();
+
+            $this->metrics->requestEntered(QueryRequestStatus::Failed, $request->type);
+            $this->metrics->executionFinished($request, $durationMs);
 
             audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
                 'error' => $safeMessage,

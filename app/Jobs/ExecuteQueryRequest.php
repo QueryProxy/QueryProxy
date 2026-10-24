@@ -9,6 +9,7 @@ use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Execution\BackendCanceller;
 use App\Services\Execution\QueryExecutor;
 use App\Services\Masking\ErrorMessageSanitizer;
+use App\Services\Metrics\MetricsRecorder;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Support\Facades\Log;
@@ -112,6 +113,8 @@ class ExecuteQueryRequest implements ShouldQueue
 
         try {
             $request = QueryRequest::findOrFail($this->request->id);
+
+            app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Failed, $request->type);
 
             audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
                 'error' => $message,

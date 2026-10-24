@@ -51,6 +51,16 @@ class Masker
     private array $teamKeys = [];
 
     /**
+     * Values maskValue() replaced since the last takeMaskedTally(), by the
+     * match type of the rule that fired. Feeds queryproxy_masked_values_total
+     * (ADR-022); kept in memory and flushed once per run, so counting costs
+     * no query per value.
+     *
+     * @var array<string, int>
+     */
+    private array $maskedTally = [];
+
+    /**
      * @return Collection<int, MaskingRule>
      */
     public function rulesFor(Connection $connection): Collection
@@ -91,6 +101,8 @@ class Masker
 
         foreach ($rules as $rule) {
             if ($rule->match_type === MaskMatchType::Column && $this->columnMatches($rule->pattern, $column)) {
+                $this->tally($rule);
+
                 return $this->apply($rule->strategy, (string) $value, $rule->team_id);
             }
         }
@@ -106,12 +118,32 @@ class Masker
 
             foreach ($rules as $rule) {
                 if ($this->contentRuleMatches($rule, $subject)) {
+                    $this->tally($rule);
+
                     return $this->apply($rule->strategy, $subject, $rule->team_id);
                 }
             }
         }
 
         return $value;
+    }
+
+    /**
+     * The masked-value counts gathered so far, by rule match type; resets them.
+     *
+     * @return array<string, int>
+     */
+    public function takeMaskedTally(): array
+    {
+        $tally = $this->maskedTally;
+        $this->maskedTally = [];
+
+        return $tally;
+    }
+
+    private function tally(MaskingRule $rule): void
+    {
+        $this->maskedTally[$rule->match_type->value] = ($this->maskedTally[$rule->match_type->value] ?? 0) + 1;
     }
 
     /**

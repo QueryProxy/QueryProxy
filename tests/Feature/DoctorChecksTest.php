@@ -726,6 +726,35 @@ test('Doctor metrics looks at the token', function () {
     expect(doctorRun(new MetricsCheck)->status)->toBe(CheckStatus::Ok);
 });
 
+test('Doctor metrics accepts an IP allowlist without a token', function () {
+    config(['queryproxy.metrics.allowed_ips' => ['10.0.0.0/8']]);
+
+    expect(doctorRun(new MetricsCheck)->status)->toBe(CheckStatus::Ok);
+});
+
+test('Doctor metrics warns about allowlist entries that can never match', function (string $entry) {
+    config(['queryproxy.metrics.allowed_ips' => ['10.0.0.0/8', $entry]]);
+
+    expect(doctorRun(new MetricsCheck)->status)->toBe(CheckStatus::Warn);
+})->with(['prometheus.local', '10.0.0.0/33', '2001:db8::/129', '10.0.0.1/', '10.0.0.0/x']);
+
+test('Doctor metrics reports a bad allowlist entry and a short token together', function () {
+    putenv('QUERYPROXY_METRICS_TOKEN=short');
+    config(['queryproxy.metrics.allowed_ips' => ['prometheus.local']]);
+
+    $result = doctorRun(new MetricsCheck);
+
+    expect($result->status)->toBe(CheckStatus::Warn)
+        ->and($result->message)->toContain('prometheus.local')
+        ->and($result->message)->toContain('shorter than');
+});
+
+test('Doctor metrics accepts addresses and ranges of both families', function () {
+    config(['queryproxy.metrics.allowed_ips' => ['192.0.2.7', '10.1.0.0/16', '2001:db8::5', '2001:db8::/32']]);
+
+    expect(doctorRun(new MetricsCheck)->status)->toBe(CheckStatus::Ok);
+});
+
 test('Doctor metrics reports an unusable QUERYPROXY_METRICS_TOKEN_FILE', function () {
     putenv('QUERYPROXY_METRICS_TOKEN_FILE=/nonexistent/token');
 

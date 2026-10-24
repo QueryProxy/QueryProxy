@@ -9,6 +9,7 @@ use App\Models\Team;
 use App\Models\User;
 use App\Services\Approvals\ApprovalNotifier;
 use App\Services\Masking\SensitiveFilterDetector;
+use App\Services\Metrics\MetricsRecorder;
 use App\Services\Sql\SqlInspector;
 use Illuminate\Support\Facades\DB;
 use Livewire\Attributes\Title;
@@ -91,6 +92,11 @@ class QueryStudio extends Component
         $this->authorize('use', $connection);
 
         if (! $this->validateSql($inspector)) {
+            // Counted here and not in validateSql(): that also backs the
+            // Validate button, which is a preview that can be pressed any
+            // number of times, not a refused submission.
+            app(MetricsRecorder::class)->guardRejected($this->violations);
+
             return;
         }
 
@@ -133,6 +139,8 @@ class QueryStudio extends Component
 
             return $request;
         });
+
+        app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Pending, $request->type);
 
         ApprovalNotifier::requestSubmitted($request);
 

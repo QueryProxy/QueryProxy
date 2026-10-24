@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\MetricsController;
 use App\Http\Middleware\EnsureAdmin;
 use App\Http\Middleware\EnsureTeamRole;
 use App\Http\Middleware\EnsureUserIsActive;
@@ -12,12 +13,22 @@ use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Request;
 use Illuminate\Session\Middleware\AuthenticateSession;
+use Illuminate\Support\Facades\Route;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: __DIR__.'/../routes/web.php',
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
+        then: function (): void {
+            // /metrics (ADR-022) is registered outside the web group on purpose:
+            // a scrape carries no session or CSRF token and must not create a
+            // session row. It authenticates itself (token or IP allowlist), and
+            // the throttle keeps a wrong-token guess from being a free oracle.
+            Route::get('/metrics', MetricsController::class)
+                ->middleware('throttle:120,1')
+                ->name('metrics');
+        },
     )
     ->withMiddleware(function (Middleware $middleware): void {
         // The app may sit behind a TLS-terminating reverse proxy (docker-compose

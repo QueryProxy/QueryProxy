@@ -7,6 +7,7 @@ use App\Jobs\ExecuteQueryRequest;
 use App\Models\QueryRequest;
 use App\Models\User;
 use App\Services\Execution\BackendCanceller;
+use App\Services\Metrics\MetricsRecorder;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Validation\ValidationException;
@@ -78,6 +79,8 @@ class ApprovalService
             ...($isOverride ? ['reason' => $reason] : []),
         ]);
 
+        $this->countDecision($request, QueryRequestStatus::Approved);
+
         ApprovalNotifier::requestDecided($request);
 
         $request->update(['status' => QueryRequestStatus::Queued]);
@@ -113,6 +116,8 @@ class ApprovalService
             'reason' => $reason,
         ]);
 
+        $this->countDecision($request, QueryRequestStatus::Rejected);
+
         ApprovalNotifier::requestDecided($request);
     }
 
@@ -131,6 +136,8 @@ class ApprovalService
         $request->refresh();
 
         audit()->record('request.cancelled', actor: $user, request: $request);
+
+        app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
     }
 
     /**
@@ -186,6 +193,8 @@ class ApprovalService
             'duration_ms' => $request->executed_at ? (int) $request->executed_at->diffInMilliseconds(now(), true) : null,
         ], fn ($value) => $value !== null));
 
+        app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
+
         ApprovalNotifier::requestStopped($request, $user);
 
         return $signalled;
@@ -214,6 +223,17 @@ class ApprovalService
 
         audit()->record('request.cancelled', request: $request, metadata: ['reason' => $reason], system: true);
 
+        app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
+
         return true;
+    }
+
+    /** Counts a decision (status entered) and how long the request waited for it. */
+    private function countDecision(QueryRequest $request, QueryRequestStatus $status): void
+    {
+        $metrics = app(MetricsRecorder::class);
+
+        $metrics->requestEntered($status, $request->type);
+        $metrics->approvalDecided($request);
     }
 }
