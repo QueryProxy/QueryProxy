@@ -387,16 +387,28 @@ final class IntegrationTarget
         return self::driver() === DbDriver::Sqlsrv ? 'COUNT_BIG(*)' : 'COUNT(*)';
     }
 
+    /**
+     * The long part of the heavy statements: a three-way cross join counted
+     * under a condition that mixes all three tables. Without the condition SQL
+     * Server answered a plain COUNT of the cross join in under a second (it
+     * multiplies the row counts instead of joining); with it every combination
+     * has to be evaluated, 2.7e10 of them, on every server.
+     */
+    private function heavyCount(string $alias = ''): string
+    {
+        return "SELECT {$this->bigCount()}{$alias} FROM {nums} a, {nums} b, {nums} c WHERE (a.n + b.n * c.n) % 7 = 3";
+    }
+
     /** A read that runs for minutes on every server and can be interrupted. */
     public function heavyRead(): string
     {
-        return $this->sql("SELECT {$this->bigCount()} AS total FROM {nums} a, {nums} b, {nums} c");
+        return $this->sql($this->heavyCount(' AS total'));
     }
 
     /** A write whose long part (the SELECT) comes before the first row is stored. */
     public function heavyWrite(): string
     {
-        return $this->sql("INSERT INTO {sink} (n) SELECT {$this->bigCount()} FROM {nums} a, {nums} b, {nums} c");
+        return $this->sql('INSERT INTO {sink} (n) '.$this->heavyCount());
     }
 
     /**

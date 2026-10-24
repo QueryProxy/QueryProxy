@@ -147,7 +147,8 @@ test('the migration chains records that existed before it', function () {
     audit()->record('test.after');
 
     expect($this->artisan('audit:verify')->run())->toBe(0)
-        ->and(DB::table('audit_chain_lock')->value('sequence'))->toBe(8);
+        // pdo_sqlsrv returns a bigint as a string.
+        ->and((int) DB::table('audit_chain_lock')->value('sequence'))->toBe(8);
 });
 
 test('the migration can be re-run after a partial failure', function () {
@@ -203,6 +204,6 @@ test('concurrent writers cannot fork the chain', function () {
     }
 
     expect(DB::table('audit_logs')->count())->toBe(100)
-        ->and(DB::table('audit_chain_lock')->value('sequence'))->toBe(100)
+        ->and((int) DB::table('audit_chain_lock')->value('sequence'))->toBe(100)
         ->and($this->artisan('audit:verify')->expectsOutputToContain('100 records verified')->run())->toBe(0);
 });
