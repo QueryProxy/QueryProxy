@@ -35,3 +35,6 @@ Thumbs.db
 /CLAUDE.md
 /.mcp.json
 /boost.json
+
+# Integration test certificates (tests/Integration/docker/generate-certs.sh)
+/tests/Integration/docker/certs/

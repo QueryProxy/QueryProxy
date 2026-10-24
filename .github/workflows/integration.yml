@@ -1,0 +1,174 @@
+name: Integration
+
+# Runs the integration tests (tests/Integration, Pest group "integration") and
+# the audit chain and connection slot tests (tests/Live, group "live-appdb")
+# against real PostgreSQL, MySQL, MariaDB and SQL Server servers, one job per
+# driver. The servers come from docker-compose.integration.yml, the same file
+# the tests use locally, so the credentials, ports and TLS setups are written
+# once. Besides the main server each job starts a second one where the TLS
+# tests need it (a server that offers TLS and one that does not).
+#
+# The tests/Live PostgreSQL guard tests keep their own workflow
+# (live-pgsql.yml): they need a superuser and a server that trusts loopback
+# differently, and nothing in them is driver-specific beyond PostgreSQL.
+#
+# Actions are pinned to commit SHAs rather than mutable tags, as in ci.yml.
+# Dependabot (github-actions ecosystem) keeps the SHAs current; when bumping
+# one, re-resolve the SHA — never edit the version comment alone.
+
+# Besides main and pull requests it runs on feat/** pushes and by hand, so a
+# feature branch can be checked on the real runner before its pull request.
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  databases:
+    name: integration (${{ matrix.driver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - driver: pgsql
+            php-extensions: pdo_pgsql
+            services: pgsql pgsql-tls
+            port: 15432
+            database: queryproxy_test
+            username: queryproxy_test
+            password: queryproxy_test
+            tls-on-port: 15433
+            tls-off-port: 15432
+          - driver: mysql
+            php-extensions: pdo_mysql
+            services: mysql mysql-notls
+            port: 13306
+            database: queryproxy_test
+            username: root
+            password: queryproxy_test
+            tls-on-port: 13306
+            tls-off-port: 13307
+          - driver: mariadb
+            php-extensions: pdo_mysql
+            services: mariadb mariadb-tls
+            port: 13316
+            database: queryproxy_test
+            username: root
+            password: queryproxy_test
+            tls-on-port: 13317
+            tls-off-port: 13316
+          - driver: sqlsrv
+            php-extensions: pdo_sqlsrv
+            services: mssql
+            port: 11433
+            database: queryproxy_test
+            username: sa
+            # Must match MSSQL_SA_PASSWORD in docker-compose.integration.yml.
+            password: QueryProxy_test9!
+            # SQL Server has no TLS-less mode: the TLS tests use its self-signed certificate.
+            tls-on-port: 11433
+            tls-off-port: ''
+
+    env:
+      # A missing server or variable fails the tests instead of skipping them,
+      # so a typo cannot turn a job green with every test skipped.
+      QUERYPROXY_IT_REQUIRED: '1'
+      QUERYPROXY_LIVE_APPDB_REQUIRED: '1'
+      QUERYPROXY_IT_DRIVER: ${{ matrix.driver }}
+      QUERYPROXY_IT_HOST: 127.0.0.1
+      QUERYPROXY_IT_PORT: ${{ matrix.port }}
+      QUERYPROXY_IT_DATABASE: ${{ matrix.database }}
+      QUERYPROXY_IT_USERNAME: ${{ matrix.username }}
+      QUERYPROXY_IT_PASSWORD: ${{ matrix.password }}
+      QUERYPROXY_IT_TLS_ON_PORT: ${{ matrix.tls-on-port }}
+      QUERYPROXY_IT_TLS_OFF_PORT: ${{ matrix.tls-off-port }}
+      QUERYPROXY_IT_TLS_CA: tests/Integration/docker/certs/ca.crt
+      QUERYPROXY_LIVE_APPDB_DRIVER: ${{ matrix.driver }}
+      QUERYPROXY_LIVE_APPDB_HOST: 127.0.0.1
+      QUERYPROXY_LIVE_APPDB_PORT: ${{ matrix.port }}
+      QUERYPROXY_LIVE_APPDB_DATABASE: ${{ matrix.database }}
+      QUERYPROXY_LIVE_APPDB_USERNAME: ${{ matrix.username }}
+      QUERYPROXY_LIVE_APPDB_PASSWORD: ${{ matrix.password }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # pdo_sqlsrv needs the Microsoft ODBC driver at run time and unixODBC
+      # headers if the extension has to be built. Both versions are installed
+      # so the TLS test can exercise Encrypt/TrustServerCertificate on 18 and
+      # 17; 17 is optional (the test skips when it is not there).
+      - name: Install the Microsoft ODBC drivers
+        if: matrix.driver == 'sqlsrv'
+        run: |
+          sudo apt-get update
+          # The runner image may already carry Microsoft's repository; adding
+          # it a second time can clash on the signing key, so only add it when
+          # the driver is not offered yet.
+          if ! apt-cache show msodbcsql18 >/dev/null 2>&1; then
+            curl -sSL -o packages-microsoft-prod.deb "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release && echo "$VERSION_ID")/packages-microsoft-prod.deb"
+            sudo dpkg -i packages-microsoft-prod.deb
+            rm packages-microsoft-prod.deb
+            sudo apt-get update
+          fi
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17 || echo "::warning::ODBC Driver 17 could not be installed; its TLS test will be skipped."
+          odbcinst -q -d
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite, ${{ matrix.php-extensions }}, intl, zip, bcmath
+          coverage: none
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare application
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Generate the test certificates
+        run: sh tests/Integration/docker/generate-certs.sh
+
+      - name: Start the database servers
+        run: docker compose -f docker-compose.integration.yml up -d --wait ${{ matrix.services }}
+
+      - name: Integration tests
+        run: ./vendor/bin/pest --group=integration
+
+      - name: Audit chain and connection slot tests
+        if: ${{ !cancelled() }}
+        run: ./vendor/bin/pest --group=live-appdb
+
+      - name: Server logs
+        if: ${{ failure() }}
+        run: docker compose -f docker-compose.integration.yml logs --no-color --tail=200 ${{ matrix.services }}
+
+      - name: Stop the database servers
+        if: ${{ always() }}
+        run: docker compose -f docker-compose.integration.yml down --volumes
+
+  # Matrix jobs report as "integration (pgsql)", "integration (mysql)", ... so
+  # branch protection requires the single `integration` job below, which
+  # aggregates their result (the same shape as `test` in ci.yml).
+  integration:
+    needs: databases
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check matrix result
+        run: test "${{ needs.databases.result }}" = "success"

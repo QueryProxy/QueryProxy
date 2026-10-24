@@ -36,6 +36,7 @@ use Tests\Live\LiveAppDb;
 
 beforeEach(function () {
     if (! LiveAppDb::configured()) {
+        LiveAppDb::failIfRequired();
         $this->markTestSkipped('Set '.LiveAppDb::ENV_PREFIX.'HOST (and _DRIVER, _PORT, _DATABASE, _USERNAME, _PASSWORD) to run the live audit chain tests.');
     }
 

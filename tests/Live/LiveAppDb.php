@@ -3,8 +3,10 @@
 namespace Tests\Live;
 
 use App\Services\Audit\AuditTriggers;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use PHPUnit\Framework\AssertionFailedError;
 
 /**
  * A real application database (pgsql, mysql, mariadb or sqlsrv) for the live
@@ -32,9 +34,22 @@ final class LiveAppDb
 
     private const CHAIN_MIGRATION = 'database/migrations/2026_10_20_000001_add_hash_chain_to_audit_logs_table.php';
 
+    private const CACHE_MIGRATION = 'database/migrations/0001_01_01_000001_create_cache_table.php';
+
     public static function configured(): bool
     {
         return self::env('HOST') !== '';
+    }
+
+    /**
+     * CI sets QUERYPROXY_LIVE_APPDB_REQUIRED: a missing server is then a
+     * broken job, not a reason to skip every live test and stay green.
+     */
+    public static function failIfRequired(): void
+    {
+        if (self::env('REQUIRED') !== '') {
+            throw new AssertionFailedError('QUERYPROXY_LIVE_APPDB_REQUIRED is set, but QUERYPROXY_LIVE_APPDB_HOST is not.');
+        }
     }
 
     public static function driver(): string
@@ -66,8 +81,10 @@ final class LiveAppDb
         }
 
         if ($driver === 'sqlsrv') {
-            $config['trust_server_certificate'] = true;
-            $config['encrypt'] = 'no';
+            // pdo_sqlsrv documents true/false for these options; the throwaway
+            // server's certificate is self-signed.
+            $config['trust_server_certificate'] = 'true';
+            $config['encrypt'] = 'true';
         }
 
         return $config;
@@ -80,6 +97,7 @@ final class LiveAppDb
     public static function start(): void
     {
         self::assertSafeDatabase();
+        self::ensureDatabase();
 
         config([
             'database.connections.'.self::CONNECTION => self::connectionConfig(),
@@ -92,6 +110,60 @@ final class LiveAppDb
 
         self::migration(self::CREATE_MIGRATION)->up();
         self::migration(self::CHAIN_MIGRATION)->up();
+    }
+
+    /**
+     * Point the database cache store (and its locks) at the live database, so
+     * Cache::lock() works across processes on the real thing. The cache
+     * tables must exist (createCacheTables()).
+     */
+    public static function useForCache(): void
+    {
+        config([
+            'database.connections.'.self::CONNECTION => self::connectionConfig(),
+            'cache.default' => 'database',
+            'cache.stores.database.connection' => self::CONNECTION,
+            'cache.stores.database.lock_connection' => self::CONNECTION,
+        ]);
+
+        Cache::purge('database');
+    }
+
+    public static function createCacheTables(): void
+    {
+        self::migration(self::CACHE_MIGRATION)->up();
+    }
+
+    public static function dropCacheTables(): void
+    {
+        Schema::dropIfExists('cache');
+        Schema::dropIfExists('cache_locks');
+    }
+
+    /**
+     * SQL Server starts with no database of ours (the other servers create
+     * theirs from their environment). Creating it here, in the one place every
+     * live test starts from, keeps the tests independent of the order they run in.
+     */
+    private static function ensureDatabase(): void
+    {
+        if (self::driver() !== 'sqlsrv') {
+            return;
+        }
+
+        $database = self::env('DATABASE');
+
+        if (preg_match('/^[A-Za-z0-9_]+$/', $database) !== 1) {
+            throw new \RuntimeException('QUERYPROXY_LIVE_APPDB_DATABASE may only contain letters, digits and underscores.');
+        }
+
+        config(['database.connections.live_appdb_master' => ['database' => 'master'] + self::connectionConfig()]);
+
+        try {
+            DB::connection('live_appdb_master')->unprepared("IF DB_ID(N'{$database}') IS NULL CREATE DATABASE [{$database}]");
+        } finally {
+            DB::purge('live_appdb_master');
+        }
     }
 
     /**
