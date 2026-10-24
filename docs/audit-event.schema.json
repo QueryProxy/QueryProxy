@@ -94,6 +94,7 @@
                 "request.execution_failed",
                 "request.execution_deferred",
                 "execution.late_completion",
+                "execution.cancelled",
                 "result.downloaded"
             ]
         },

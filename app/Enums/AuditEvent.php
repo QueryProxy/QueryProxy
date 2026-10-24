@@ -74,6 +74,7 @@ enum AuditEvent: string
     case RequestExecutionFailed = 'request.execution_failed';
     case RequestExecutionDeferred = 'request.execution_deferred';
     case ExecutionLateCompletion = 'execution.late_completion';
+    case ExecutionCancelled = 'execution.cancelled';
     case ResultDownloaded = 'result.downloaded';
 
     public function description(): string
@@ -134,6 +135,7 @@ enum AuditEvent: string
             self::RequestExecutionFailed => 'Execution of a request failed (masked error message).',
             self::RequestExecutionDeferred => 'An approved request was put back on the queue because every slot of its connection was busy.',
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
+            self::ExecutionCancelled => 'A user stopped a running request: the database was asked to cancel the statement (metadata.signalled tells whether it was reached; metadata.duration_ms is the run time so far).',
             self::ResultDownloaded => 'The stored result of a request was downloaded.',
         };
     }

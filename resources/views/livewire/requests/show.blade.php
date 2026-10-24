@@ -29,6 +29,9 @@
             @if ($canCancel)
                 <x-ui.btn wire:click="cancel" wire:confirm="Cancel this request?">Cancel request</x-ui.btn>
             @endif
+            @if ($canStop)
+                <x-ui.btn wire:click="stop" wire:confirm="Stop this running query? The database cancels the statement and rolls back what it can; changes it already committed stay." variant="danger">Stop query</x-ui.btn>
+            @endif
             @if ($canReview)
                 @if ($isOverride)
                     <x-ui.btn href="{{ route('requests.override', $request) }}" variant="ok" icon="check">Approve (override)…</x-ui.btn>
@@ -39,6 +42,12 @@
             @endif
         </div>
     </div>
+
+    @if ($notice)
+        <x-ui.panel padded class="mb-4 border-danger-line">
+            <p class="text-[13px] text-danger">{{ $notice }}</p>
+        </x-ui.panel>
+    @endif
 
     @if ($showRejectForm)
         <x-ui.panel padded class="mb-4 border-danger-line">

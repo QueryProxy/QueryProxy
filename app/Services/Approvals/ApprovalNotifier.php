@@ -4,9 +4,11 @@ namespace App\Services\Approvals;
 
 use App\Enums\TeamRole;
 use App\Models\QueryRequest;
+use App\Models\User;
 use App\Notifications\QueryRequestDecided;
 use App\Notifications\QueryRequestFinished;
 use App\Notifications\QueryRequestReminder;
+use App\Notifications\QueryRequestStopped;
 use App\Notifications\QueryRequestSubmitted;
 use App\Services\Chat\ChatNotifier;
 use Illuminate\Support\Facades\Notification;
@@ -76,5 +78,19 @@ class ApprovalNotifier
         if (! $request->requester->trashed()) {
             $request->requester->notify(new QueryRequestFinished($request));
         }
+    }
+
+    /**
+     * Somebody other than the requester stopped the running query: the
+     * requester hears about it in-app. Stopping your own query tells you
+     * nothing you do not know.
+     */
+    public static function requestStopped(QueryRequest $request, User $stoppedBy): void
+    {
+        if ($request->user_id === $stoppedBy->id || $request->requester->trashed()) {
+            return;
+        }
+
+        $request->requester->notify(new QueryRequestStopped($request, $stoppedBy));
     }
 }

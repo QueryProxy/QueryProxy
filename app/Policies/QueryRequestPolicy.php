@@ -55,6 +55,23 @@ class QueryRequestPolicy
     }
 
     /**
+     * Stop a statement that is running right now: the requester, the DBA of
+     * the request's team and a system admin. Auditors and every other member
+     * cannot. As with cancel, the admin overrides the permission, not the state:
+     * only a running request with a known database session can be stopped.
+     */
+    public function stop(User $user, QueryRequest $request): bool
+    {
+        if (! $request->isStoppable()) {
+            return false;
+        }
+
+        return $user->isAdmin()
+            || $request->user_id === $user->id
+            || $user->isDbaIn($request->team);
+    }
+
+    /**
      * Result *data* is scoped tighter than request metadata: auditors review
      * histories and approval traces (PRD role definition) but do not get the
      * row payloads.

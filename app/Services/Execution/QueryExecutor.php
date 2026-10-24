@@ -12,6 +12,8 @@ use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Masking\ErrorMessageSanitizer;
 use App\Services\Masking\Masker;
 use App\Services\Sql\SqlInspector;
+use Illuminate\Database\Connection as DatabaseConnection;
+use Illuminate\Database\LostConnectionException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -46,6 +48,7 @@ class QueryExecutor
         private ErrorMessageSanitizer $errors,
         private TargetSession $session,
         private ResultStreamer $streamer,
+        private BackendCanceller $canceller,
     ) {}
 
     public function execute(QueryRequest $request): void
@@ -115,6 +118,8 @@ class QueryExecutor
                 ->update([
                     ...$outcome,
                     'status' => QueryRequestStatus::Completed,
+                    'backend_pid' => null,
+                    'backend_session' => null,
                     'duration_ms' => $durationMs,
                 ]);
 
@@ -169,6 +174,8 @@ class QueryExecutor
                 ->where('status', QueryRequestStatus::Running)
                 ->update([
                     'status' => QueryRequestStatus::Failed,
+                    'backend_pid' => null,
+                    'backend_session' => null,
                     'duration_ms' => $durationMs,
                     'error_message' => $safeMessage,
                 ]);
@@ -257,6 +264,18 @@ class QueryExecutor
      */
     private function recordLateFailure(QueryRequest $request, int $durationMs, string $safeMessage): void
     {
+        // The error a user's stop causes (the database reports the cancelled
+        // statement as a failure) is the stop itself, already audited as
+        // execution.cancelled; it is not a late completion.
+        if ($this->currentStatus($request) === QueryRequestStatus::Cancelled->value) {
+            Log::info('Query execution ended with an error after the request was stopped.', [
+                'query_request_id' => $request->id,
+                'duration_ms' => $durationMs,
+            ]);
+
+            return;
+        }
+
         audit()->record('execution.late_completion', actor: $request->reviewer, request: $request, metadata: [
             'duration_ms' => $durationMs,
             'status' => $this->currentStatus($request),
@@ -371,6 +390,7 @@ class QueryExecutor
         $db = DB::connection($connectionName);
         $driver = $request->connection->driver;
         $sessionOpened = false;
+        $backendSession = null;
 
         try {
             $columns = [];
@@ -381,6 +401,8 @@ class QueryExecutor
             // length of the read, whatever the SQL says.
             $sessionOpened = true;
             $this->session->beginReadOnly($db, $driver);
+            $backendSession = $this->recordBackendPid($request, $db, $driver);
+            $this->refuseReconnect($db);
 
             // Rows are pulled from the server one at a time (see
             // ResultStreamer), so peak memory does not grow with the result.
@@ -405,12 +427,23 @@ class QueryExecutor
                 $rowCount++;
             }
 
+            // MySQL / MariaDB keep producing a cut-off result, and freeing an
+            // unbuffered statement reads whatever is left: time (and the
+            // connection slot) would depend on the size of the table. Ask the
+            // server to abort the statement first, so there is next to nothing
+            // left to read. The transaction is read-only, so ending it with a
+            // rollback instead of a commit changes nothing.
+            $abortedAtCeiling = $truncated
+                && $backendSession !== null
+                && in_array($driver, [DbDriver::Mysql, DbDriver::Mariadb], true)
+                && $this->canceller->cancel($request->connection, $backendSession['pid'], $backendSession['token'], $request->runsAsReader());
+
             // Stop reading at the ceiling and free the statement / cursor
             // before the transaction ends: an unbuffered result left open
             // would make the COMMIT fail.
             unset($rows);
 
-            $this->session->endReadOnly($db, commit: true);
+            $this->session->endReadOnly($db, commit: ! $abortedAtCeiling);
             $sessionOpened = false;
 
             rewind($temp);
@@ -444,6 +477,69 @@ class QueryExecutor
             if (is_resource($temp)) {
                 fclose($temp);
             }
+        }
+    }
+
+    /**
+     * Remember the target's id (and start stamp) for the session this run
+     * executes on, so a user can stop the statement from another connection
+     * (BackendCanceller).
+     *
+     * Best effort: a run whose id cannot be read or stored simply cannot be
+     * stopped by the user; it still runs and still ends at the statement
+     * timeout. Stored only while the request is still running here.
+     *
+     * @return array{pid: int, token: string|null}|null null when the driver has none or it was not read
+     */
+    private function recordBackendPid(QueryRequest $request, DatabaseConnection $db, DbDriver $driver): ?array
+    {
+        $session = $this->canceller->identify($db, $driver);
+
+        if ($session === null) {
+            return null;
+        }
+
+        try {
+            QueryRequest::whereKey($request->id)
+                ->where('status', QueryRequestStatus::Running)
+                ->update(['backend_pid' => $session['pid'], 'backend_session' => $session['token']]);
+        } catch (Throwable $e) {
+            Log::warning('Could not record the database session id of a running request.', [
+                'query_request_id' => $request->id,
+                'exception' => $e::class,
+            ]);
+
+            return null;
+        }
+
+        return $session;
+    }
+
+    /**
+     * From here on the run must never move to a new session by itself.
+     *
+     * When the server drops the session (a user's stop on SQL Server ends it,
+     * a network cut does too), Laravel reconnects and, outside a transaction,
+     * runs the failed statement again on the fresh session: a write the user
+     * just stopped would be applied after all, without the limits set on the
+     * old session and under a session id nobody recorded. With the reconnector
+     * replaced the lost connection surfaces as the run's error instead. The
+     * connection is per request and purged afterwards, so nothing needs it back.
+     */
+    private function refuseReconnect(DatabaseConnection $db): void
+    {
+        $db->setReconnector(function (): never {
+            throw new LostConnectionException('The connection to the target was lost; the statement is not re-run on a new session.');
+        });
+    }
+
+    /**
+     * @throws RuntimeException when a user stopped the request (it is cancelled)
+     */
+    private function assertNotStopped(QueryRequest $request): void
+    {
+        if ($this->currentStatus($request) === QueryRequestStatus::Cancelled->value) {
+            throw new RuntimeException('The request was stopped before the statement finished; the transaction is rolled back.');
         }
     }
 
@@ -489,14 +585,25 @@ class QueryExecutor
         // Multi-statement requests always run atomically; single writes run as-is.
         $transactional = count($statements) > 1 || $request->is_transaction;
 
-        $run = function () use ($connection, $statements, $driver, $transactional): int {
+        $run = function () use ($request, $connection, $statements, $driver, $transactional): int {
             // Inside the transaction so pgsql can scope the limits with SET LOCAL.
             $this->session->applyLimits($connection, $driver, $transactional);
+            $this->recordBackendPid($request, $connection, $driver);
+            $this->refuseReconnect($connection);
 
             $affected = 0;
 
             foreach ($statements as $statement) {
                 $affected += $connection->affectingStatement($statement);
+
+                // A user's stop moves the request out of Running first and only
+                // then signals the database. A signal that lands between two
+                // statements (or after the last one) finds nothing to cancel,
+                // so the run has to notice by itself: throwing here makes the
+                // surrounding transaction roll back instead of commit.
+                if ($transactional) {
+                    $this->assertNotStopped($request);
+                }
             }
 
             return $affected;

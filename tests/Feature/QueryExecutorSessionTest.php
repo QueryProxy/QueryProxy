@@ -6,6 +6,7 @@ use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Services\Connections\DynamicConnectionFactory;
+use App\Services\Execution\BackendCanceller;
 use App\Services\Execution\QueryExecutor;
 use App\Services\Execution\ResultStreamer;
 use Illuminate\Database\Events\QueryExecuted;
@@ -391,6 +392,55 @@ test('a mysql read fails closed when the connection cannot be made unbuffered', 
         ->and(sessionSent($log))->not->toContain('SELECT id FROM customers')
         ->and(sessionSent($log))->toContain('ROLLBACK');
 });
+
+test('a mysql or mariadb read cut off at the ceiling asks the server to abort the statement before freeing it', function (DbDriver $driver) {
+    config(['queryproxy.select_hard_limit' => 2]);
+    [$request, , $connection] = sessionSetup('SELECT id FROM customers ORDER BY id', 'read', $driver);
+    $log = sessionCollectQueries();
+
+    $this->mock(BackendCanceller::class, function ($mock) use ($connection) {
+        $mock->shouldReceive('identify')->once()->andReturn(['pid' => 77, 'token' => null]);
+        $mock->shouldReceive('cancel')
+            ->once()
+            ->withArgs(fn ($target, int $pid, ?string $token, bool $asReader) => $target->is($connection) && $pid === 77 && $token === null && $asReader === false)
+            ->andReturn(true);
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    // The transaction is read-only, so it is ended with a rollback.
+    expect($request->status)->toBe(QueryRequestStatus::Completed)
+        ->and($request->result_row_count)->toBe(2)
+        ->and($request->result_truncated)->toBeTrue()
+        ->and(array_slice(sessionSent($log), -1))->toBe(['ROLLBACK'])
+        ->and(sessionSent($log))->not->toContain('COMMIT')
+        ->and(SessionRecordingPdo::$bufferedQueryCalls)->toBe([
+            ['buffered' => false, 'inTransaction' => true],
+            ['buffered' => true, 'inTransaction' => true],
+        ]);
+})->with([DbDriver::Mysql, DbDriver::Mariadb]);
+
+test('a read that is not cut off, or runs on another driver, never aborts its own statement', function (DbDriver $driver, int $ceiling) {
+    config(['queryproxy.select_hard_limit' => $ceiling]);
+    [$request] = sessionSetup('SELECT id FROM customers ORDER BY id', 'read', $driver);
+    $log = sessionCollectQueries();
+
+    $this->mock(BackendCanceller::class, function ($mock) {
+        $mock->shouldReceive('identify')->once()->andReturn(['pid' => 77, 'token' => null]);
+        $mock->shouldNotReceive('cancel');
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Completed)
+        ->and(sessionSent($log))->not->toContain('ROLLBACK');
+})->with([
+    'mysql under the ceiling' => [DbDriver::Mysql, 100],
+    'pgsql over the ceiling' => [DbDriver::Pgsql, 2],
+    'sqlsrv over the ceiling' => [DbDriver::Sqlsrv, 2],
+]);
 
 test('reads on the other drivers never touch the buffered-query attribute', function (?DbDriver $driver) {
     [$request] = sessionSetup('SELECT id FROM customers', 'read', $driver);

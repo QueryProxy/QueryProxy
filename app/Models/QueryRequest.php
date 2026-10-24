@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\DbDriver;
 use App\Enums\QueryRequestStatus;
 use App\Enums\StatementType;
 use App\Services\Sql\SqlRedactor;
@@ -17,7 +18,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'statement_count', 'is_transaction', 'is_ddl', 'type', 'status', 'note',
     'reviewed_by', 'reviewed_at', 'rejection_reason', 'review_channel',
     'reminded_at', 'chat_renewed_at',
-    'executed_at', 'duration_ms', 'affected_rows',
+    'executed_at', 'backend_pid', 'backend_session', 'duration_ms', 'affected_rows',
     'result_disk', 'result_path', 'result_row_count', 'result_truncated', 'result_columns',
     'error_message', 'sensitive_filter_columns',
 ])]
@@ -40,6 +41,7 @@ class QueryRequest extends Model
             'reminded_at' => 'datetime',
             'chat_renewed_at' => 'datetime',
             'executed_at' => 'datetime',
+            'backend_pid' => 'integer',
             'result_columns' => 'array',
             'sensitive_filter_columns' => 'array',
         ];
@@ -101,6 +103,34 @@ class QueryRequest extends Model
     public function isPending(): bool
     {
         return $this->status === QueryRequestStatus::Pending;
+    }
+
+    /**
+     * Whether the run logs in as the connection's read-only identity (a
+     * single-statement read on a connection that has one, as in QueryExecutor) rather than the main one.
+     * Decides which identity a stop signal tries first.
+     */
+    public function runsAsReader(): bool
+    {
+        // getRelationValue(): inside the model, $this->connection is the name of
+        // the database connection the model itself uses, not the relation.
+        $connection = $this->getRelationValue('connection');
+
+        return $this->type === StatementType::Read
+            && (int) $this->statement_count <= 1
+            && $connection->driver !== DbDriver::Sqlite
+            && $connection->hasReadCredentials();
+    }
+
+    /**
+     * True while the statement runs on the target and its session id is
+     * known, which is what a stop needs: without the id there is nothing to
+     * signal (the id is recorded a moment after the run starts, and never on
+     * SQLite).
+     */
+    public function isStoppable(): bool
+    {
+        return $this->status === QueryRequestStatus::Running && $this->backend_pid !== null;
     }
 
     /** Adds `is_waiting_for_slot` (a deferral entry exists) to each row, so a list can show the badge without a query per row; isWaitingForSlot() still requires the Queued status. */

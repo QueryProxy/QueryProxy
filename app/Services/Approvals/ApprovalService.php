@@ -6,6 +6,7 @@ use App\Enums\QueryRequestStatus;
 use App\Jobs\ExecuteQueryRequest;
 use App\Models\QueryRequest;
 use App\Models\User;
+use App\Services\Execution\BackendCanceller;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Validation\ValidationException;
@@ -130,6 +131,64 @@ class ApprovalService
         $request->refresh();
 
         audit()->record('request.cancelled', actor: $user, request: $request);
+    }
+
+    /**
+     * Stop a request that is running: move it to cancelled, then ask the
+     * target database to cancel the statement from a second connection.
+     *
+     * The state moves first, in one conditional update that also requires the
+     * recorded session id to be unchanged: whichever of this claim and the
+     * run's own completion lands first wins, so the run can never record a
+     * failure for the error the cancellation causes, and a session id that
+     * outlived its run is never signalled. The executor then sees a request
+     * that is no longer running and records nothing more (a run that still
+     * finished is logged as execution.late_completion).
+     *
+     * The signal names the session by id and start stamp (BackendCanceller), so
+     * an id the server has since given to another session is left alone.
+     * The requester is notified when somebody else stopped the run.
+     *
+     * Not delivering the signal does not undo the stop: the statement then ends
+     * on its own, at the latest at the database-side statement timeout.
+     *
+     * @return bool whether the database accepted the cancel signal
+     *
+     * @throws AuthorizationException when the user may not stop it, or it stopped running meanwhile
+     */
+    public function stop(QueryRequest $request, User $user): bool
+    {
+        Gate::forUser($user)->authorize('stop', $request);
+
+        $pid = (int) $request->backend_pid;
+        $token = $request->backend_session;
+
+        $claimed = QueryRequest::whereKey($request->id)
+            ->where('status', QueryRequestStatus::Running)
+            ->where('backend_pid', $pid)
+            ->when($token === null, fn ($query) => $query->whereNull('backend_session'), fn ($query) => $query->where('backend_session', $token))
+            ->update([
+                'status' => QueryRequestStatus::Cancelled,
+                'backend_pid' => null,
+                'backend_session' => null,
+            ]);
+
+        if ($claimed === 0) {
+            throw new AuthorizationException('This request is no longer running.');
+        }
+
+        $request->refresh();
+
+        $signalled = app(BackendCanceller::class)->cancel($request->connection, $pid, $token, $request->runsAsReader());
+
+        audit()->record('execution.cancelled', actor: $user, request: $request, metadata: array_filter([
+            'signalled' => $signalled,
+            'duration_ms' => $request->executed_at ? (int) $request->executed_at->diffInMilliseconds(now(), true) : null,
+        ], fn ($value) => $value !== null));
+
+        ApprovalNotifier::requestStopped($request, $user);
+
+        return $signalled;
     }
 
     /**

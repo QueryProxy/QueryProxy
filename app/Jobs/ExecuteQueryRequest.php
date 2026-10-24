@@ -6,6 +6,7 @@ use App\Enums\QueryRequestStatus;
 use App\Jobs\Middleware\LimitConnectionConcurrency;
 use App\Models\QueryRequest;
 use App\Services\Approvals\ApprovalNotifier;
+use App\Services\Execution\BackendCanceller;
 use App\Services\Execution\QueryExecutor;
 use App\Services\Masking\ErrorMessageSanitizer;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -67,8 +68,9 @@ class ExecuteQueryRequest implements ShouldQueue
      *
      * The stored message goes through the same redact-and-mask path as
      * execute()'s own failures; the raw exception text only reaches the log.
-     * When the update wins, the failure is audited and the requester notified,
-     * exactly as execute() would have done.
+     * When the update wins, the statement still running on the target (if its
+     * session was recorded) is cancelled, and the failure is audited and the
+     * requester notified, exactly as execute() would have done.
      */
     public function failed(?Throwable $exception): void
     {
@@ -80,6 +82,12 @@ class ExecuteQueryRequest implements ShouldQueue
 
         $message = $this->safeMessage($exception);
 
+        // The session the run was using on the target, read before the update
+        // below clears it.
+        $session = QueryRequest::whereKey($this->request->id)
+            ->where('status', QueryRequestStatus::Running)
+            ->first(['id', 'connection_id', 'type', 'backend_pid', 'backend_session']);
+
         $updated = QueryRequest::whereKey($this->request->id)
             ->whereIn('status', [
                 QueryRequestStatus::Queued,
@@ -88,12 +96,19 @@ class ExecuteQueryRequest implements ShouldQueue
             ])
             ->update([
                 'status' => QueryRequestStatus::Failed,
+                'backend_pid' => null,
+                'backend_session' => null,
                 'error_message' => $message,
             ]);
 
         if ($updated === 0) {
             return;
         }
+
+        // The worker is gone (or about to be) but the statement may still be
+        // running on the target, holding locks and a connection slot until the
+        // database's own timeout. Cancel it the way a user's stop does.
+        $this->cancelOnTarget($session);
 
         try {
             $request = QueryRequest::findOrFail($this->request->id);
@@ -106,6 +121,31 @@ class ExecuteQueryRequest implements ShouldQueue
             ApprovalNotifier::requestFinished($request);
         } catch (Throwable $e) {
             Log::error('Recording a failed job request failed.', [
+                'query_request_id' => $this->request->id,
+                'exception' => $e::class,
+            ]);
+        }
+    }
+
+    /**
+     * Best effort: ask the target to stop the statement of a run this job
+     * has just failed. Never throws; failed() must go on to audit and notify.
+     */
+    private function cancelOnTarget(?QueryRequest $session): void
+    {
+        if ($session === null || $session->backend_pid === null) {
+            return;
+        }
+
+        try {
+            app(BackendCanceller::class)->cancel(
+                $session->connection,
+                $session->backend_pid,
+                $session->backend_session,
+                $session->runsAsReader(),
+            );
+        } catch (Throwable $e) {
+            Log::warning('Could not cancel the statement of a failed job on the target.', [
                 'query_request_id' => $this->request->id,
                 'exception' => $e::class,
             ]);

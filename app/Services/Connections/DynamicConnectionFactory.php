@@ -13,6 +13,9 @@ use Throwable;
 
 class DynamicConnectionFactory
 {
+    /** Seconds a control connection may take to connect. */
+    private const CONTROL_CONNECT_TIMEOUT = 5;
+
     public function __construct(private TargetSession $session, private TlsPemStore $pemStore = new TlsPemStore) {}
 
     /**
@@ -43,6 +46,35 @@ class DynamicConnectionFactory
         $name = $this->readConnectionName($connection);
 
         config(["database.connections.{$name}" => $this->configFor($connection, readIdentity: true)]);
+
+        return $name;
+    }
+
+    /**
+     * Register a separate, short-lived runtime connection used only to signal
+     * another session on the same target (stopping a running statement), and
+     * return its name. It never shares the session of the run it controls.
+     * Logs in as the read-only identity when $readIdentity is set. purge()
+     * removes it together with the other runtime connections.
+     */
+    public function configureControl(Connection $connection, bool $readIdentity = false): string
+    {
+        $this->assertAllowedTarget($connection);
+
+        $name = $this->controlConnectionName($connection, $readIdentity);
+
+        $config = $this->configFor($connection, $readIdentity);
+
+        // Bounded connect time: a stop must not hang on an unreachable host.
+        if (in_array($connection->driver, [DbDriver::Pgsql, DbDriver::Mysql, DbDriver::Mariadb], true)) {
+            $config['options'] = ($config['options'] ?? []) + [PDO::ATTR_TIMEOUT => self::CONTROL_CONNECT_TIMEOUT];
+        }
+
+        if ($connection->driver === DbDriver::Sqlsrv) {
+            $config['login_timeout'] = self::CONTROL_CONNECT_TIMEOUT;
+        }
+
+        config(["database.connections.{$name}" => $config]);
 
         return $name;
     }
@@ -168,7 +200,14 @@ class DynamicConnectionFactory
 
     public function purge(Connection $connection): void
     {
-        foreach ([$this->connectionName($connection), $this->readConnectionName($connection)] as $name) {
+        $names = [
+            $this->connectionName($connection),
+            $this->readConnectionName($connection),
+            $this->controlConnectionName($connection, false),
+            $this->controlConnectionName($connection, true),
+        ];
+
+        foreach ($names as $name) {
             DB::purge($name);
             config(["database.connections.{$name}" => null]);
         }
@@ -254,6 +293,11 @@ class DynamicConnectionFactory
     public function readConnectionName(Connection $connection): string
     {
         return $this->connectionName($connection).'_read';
+    }
+
+    public function controlConnectionName(Connection $connection, bool $readIdentity = false): string
+    {
+        return ($readIdentity ? $this->readConnectionName($connection) : $this->connectionName($connection)).'_control';
     }
 
     /**
