@@ -1,0 +1,186 @@
+# Throwaway database servers for the integration tests (tests/Integration,
+# Pest group "integration", and the "live-appdb" audit tests). Test-only:
+# fixed credentials, every port bound to 127.0.0.1 and chosen so as not to
+# collide with a local database. CI (.github/workflows/integration.yml) uses
+# this same file, one driver per job.
+#
+# Besides the main server of each driver there is a second one, so that the
+# TLS tests have a server that offers TLS and one that does not:
+#
+#   driver    main server (functional tests)        second server
+#   pgsql     pgsql         15432  no TLS           pgsql-tls     15433  TLS
+#   mysql     mysql         13306  TLS (self-made)  mysql-notls   13307  no TLS
+#   mariadb   mariadb       13316  no TLS           mariadb-tls   13317  TLS
+#   sqlsrv    mssql         11433  TLS (self-signed), no way to switch it off
+#
+# The TLS servers need the certificates of tests/Integration/docker/ first:
+#
+#   tests/Integration/docker/generate-certs.sh
+#   docker compose -f docker-compose.integration.yml up -d --wait pgsql pgsql-tls
+#   QUERYPROXY_IT_DRIVER=pgsql QUERYPROXY_IT_HOST=127.0.0.1 QUERYPROXY_IT_PORT=15432 \
+#   QUERYPROXY_IT_DATABASE=queryproxy_test QUERYPROXY_IT_USERNAME=queryproxy_test \
+#   QUERYPROXY_IT_PASSWORD=queryproxy_test \
+#   QUERYPROXY_IT_TLS_OFF_PORT=15432 QUERYPROXY_IT_TLS_ON_PORT=15433 \
+#   QUERYPROXY_IT_TLS_CA=tests/Integration/docker/certs/ca.crt \
+#   ./vendor/bin/pest --group=integration
+#   docker compose -f docker-compose.integration.yml down
+#
+# Images are pinned to a version and a digest so a new release cannot turn the
+# jobs red without a change here; Dependabot (docker-compose ecosystem) bumps
+# them. Whether a server really offers TLS is asserted by the TLS tests
+# themselves (they read the server's greeting), not taken from this file.
+#
+# The per-driver variables are listed in tests/Integration/IntegrationTarget.php.
+# The tests need a login that may create tables and logins/users and signal
+# other sessions, so the servers' administrator account is used (root, sa, a
+# PostgreSQL superuser).
+
+services:
+  pgsql:
+    image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+    environment:
+      POSTGRES_DB: queryproxy_test
+      POSTGRES_USER: queryproxy_test
+      POSTGRES_PASSWORD: queryproxy_test
+      PGPORT: "5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      # TCP on purpose: during initdb the temporary server answers on the
+      # socket only, and the container would be reported healthy too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U queryproxy_test -d queryproxy_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  pgsql-tls:
+    image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+    # PostgreSQL refuses a key file it does not own or that others can read,
+    # and a bind-mounted file keeps the owner of the host. So the key is copied
+    # to a place the server owns before the stock entrypoint starts it.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        mkdir -p /tls &&
+        cp /certs/server.crt /certs/server.key /tls/ &&
+        chown postgres:postgres /tls/server.crt /tls/server.key &&
+        chmod 600 /tls/server.key &&
+        exec docker-entrypoint.sh postgres
+        -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key
+    environment:
+      POSTGRES_DB: queryproxy_test
+      POSTGRES_USER: queryproxy_test
+      POSTGRES_PASSWORD: queryproxy_test
+      PGPORT: "5432"
+    volumes:
+      - ./tests/Integration/docker/certs:/certs:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U queryproxy_test -d queryproxy_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  mysql:
+    image: mysql:8.4.13@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+    # MySQL generates a self-signed certificate on first start and offers TLS
+    # by default. Its default login plugin (caching_sha2_password) needs TLS
+    # for the first login of an account, so the functional tests use it too.
+    environment:
+      MYSQL_ROOT_PASSWORD: queryproxy_test
+      MYSQL_DATABASE: queryproxy_test
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pqueryproxy_test --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mysql-notls:
+    image: mysql:8.4.13@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+    # An empty tls_version leaves the server without any TLS protocol, so it
+    # starts with encrypted connections disabled (MySQL 8.4 manual, "Server-Side
+    # Configuration for Encrypted Connections").
+    command: ["--tls-version="]
+    environment:
+      MYSQL_ROOT_PASSWORD: queryproxy_test
+      MYSQL_DATABASE: queryproxy_test
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pqueryproxy_test --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mariadb:
+    # MariaDB 11.4 turns TLS on by itself (it makes a self-signed certificate
+    # when none is given), so the server meant to have none has to say so.
+    image: mariadb:11.4.13@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
+    command: ["--skip-ssl"]
+    environment:
+      MARIADB_ROOT_PASSWORD: queryproxy_test
+      MARIADB_DATABASE: queryproxy_test
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13316:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mariadb-tls:
+    image: mariadb:11.4.13@sha256:250e1609e93c0e6aecf64bfbab2d84d5e89d2481540fe77447ff6c855c3b1873
+    command:
+      - --ssl-ca=/certs/ca.crt
+      - --ssl-cert=/certs/server.crt
+      - --ssl-key=/certs/server.key
+    environment:
+      MARIADB_ROOT_PASSWORD: queryproxy_test
+      MARIADB_DATABASE: queryproxy_test
+    volumes:
+      - ./tests/Integration/docker/certs:/certs:ro
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13317:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-CU27-ubuntu-22.04@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090
+    # SQL Server always generates a self-signed certificate at start-up and
+    # encrypts when the client asks for it; there is no setting that makes it
+    # refuse TLS, so there is no second "no TLS" server for this driver.
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: "QueryProxy_test9!"
+    ports:
+      - "127.0.0.1:11433:1433"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          (/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b ||
+          /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -b) >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s

@@ -16,4 +16,10 @@ pest()->extend(TestCase::class)->in('Live');
 
 pest()->group('live-pgsql')->in('Live/Pgsql*');
 
-pest()->group('live-appdb')->in('Live/AuditChainLiveTest.php');
+pest()->group('live-appdb')->in('Live/AuditChainLiveTest.php', 'Live/ConnectionSlotLiveTest.php');
+
+// Integration tests against real PostgreSQL, MySQL, MariaDB and SQL Server
+// servers (docker-compose.integration.yml). They skip unless
+// QUERYPROXY_IT_DRIVER and QUERYPROXY_IT_HOST are set; the audit chain tests
+// ("live-appdb") run in the same CI jobs.
+pest()->extend(TestCase::class)->group('integration')->in('Integration');

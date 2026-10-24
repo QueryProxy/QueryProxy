@@ -35,6 +35,19 @@ updates:
       docker-minor-patch:
         update-types: ["minor", "patch"]
 
+  # docker-compose.integration.yml: the throwaway database servers of the CI
+  # integration jobs, pinned by version and digest.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies"]
+    groups:
+      docker-compose-minor-patch:
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

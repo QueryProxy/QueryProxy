@@ -80,6 +80,8 @@ function liveCancelConnection(Team $team): Connection
         'database' => $env('DATABASE', 'postgres'),
         'username' => $env('USERNAME', 'postgres'),
         'password' => $env('PASSWORD'),
+        // A new connection requires TLS (ADR-019); the throwaway server has none.
+        'options' => ['tls' => ['mode' => 'disable']],
     ]);
 }
 
