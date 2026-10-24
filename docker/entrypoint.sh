@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ENTRYPOINT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 cd /var/www/html
 
 # Everything that must survive a container replacement lives in one directory,
@@ -12,6 +14,16 @@ DATA_DIR=/var/www/html/storage/app
 # Volumes created by QueryProxy <= 0.1.1 kept the database and key under
 # /var/www/html/database; keep using them so upgrades don't lose data.
 LEGACY_DIR=/var/www/html/database
+
+# Secrets from files (Docker / Kubernetes secrets): NAME_FILE=/run/secrets/x
+# supplies NAME for APP_KEY, DB_PASSWORD, MAIL_PASSWORD and the other variables
+# listed in docker/secret-files.sh. NAME and NAME_FILE together is an error.
+# This runs first, so APP_KEY_FILE counts as an explicit APP_KEY below.
+# shellcheck source=docker/secret-files.sh
+. "$ENTRYPOINT_DIR/secret-files.sh"
+if ! load_secret_files; then
+    exit 1
+fi
 
 # Zero-config bootstrap: env file, app key, SQLite database, migrations.
 if [ ! -f .env ]; then
@@ -38,7 +50,7 @@ if [ -z "${APP_KEY:-}" ]; then
         # stderr, so `docker run --rm <image> php artisan key:generate --show`
         # stays capturable in a command substitution.
         echo "[entrypoint] Generated APP_KEY and stored it at ${KEY_FILE} (data volume)." >&2
-        echo "[entrypoint] For production, prefer an explicit APP_KEY environment variable." >&2
+        echo "[entrypoint] For production, prefer an explicit APP_KEY environment variable (or APP_KEY_FILE for a mounted secret)." >&2
         echo "[entrypoint] Generate one with: docker run --rm queryproxy/queryproxy php artisan key:generate --show" >&2
     fi
     APP_KEY="$(cat "$KEY_FILE")"

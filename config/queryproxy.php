@@ -3,6 +3,7 @@
 use App\Enums\ChatSqlMode;
 use App\Services\Sql\SqlInspector;
 use App\Support\ExecutionTimeout;
+use App\Support\SecretFile;
 
 /*
 | QUERYPROXY_EXECUTION_TIMEOUT is validated by ExecutionTimeout::resolve(), the
@@ -293,7 +294,7 @@ return [
         // The secret must be at least 16 characters.
         'webhook' => [
             'url' => (string) env('QUERYPROXY_SIEM_WEBHOOK_URL', ''),
-            'secret' => (string) env('QUERYPROXY_SIEM_WEBHOOK_SECRET', ''),
+            'secret' => (string) SecretFile::get('QUERYPROXY_SIEM_WEBHOOK_SECRET', ''),
             'timeout' => (int) env('QUERYPROXY_SIEM_WEBHOOK_TIMEOUT', 5),
             'tries' => (int) env('QUERYPROXY_SIEM_WEBHOOK_TRIES', 6),
         ],

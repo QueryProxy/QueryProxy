@@ -1,5 +1,7 @@
 <?php
 
+use App\Support\SecretFile;
+
 return [
 
     /*
@@ -97,11 +99,11 @@ return [
 
     'cipher' => 'AES-256-CBC',
 
-    'key' => env('APP_KEY'),
+    'key' => SecretFile::get('APP_KEY'),
 
     'previous_keys' => [
         ...array_filter(
-            explode(',', (string) env('APP_PREVIOUS_KEYS', ''))
+            explode(',', (string) SecretFile::get('APP_PREVIOUS_KEYS', ''))
         ),
     ],
 
