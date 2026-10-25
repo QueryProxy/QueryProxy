@@ -43,6 +43,20 @@ jobs:
       id-token: write
 
     steps:
+      # The tag glob above is looser than the certificate identity that
+      # SECURITY.md (and the verify step below) accept. Refuse any other tag
+      # before building, so an image users could not verify is never pushed.
+      # The regexp has three copies: SECURITY.md, this step and the verify
+      # step below. Change them together.
+      - name: Validate the release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not vX.Y.Z or vX.Y.Z-<pre-release>; nothing is published."
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -125,8 +139,9 @@ jobs:
 
       # Verify the signature just made with the same command SECURITY.md gives
       # users, so that command is proven on every release. Keep the identity
-      # regexp identical to the one in SECURITY.md. A failure here fails the
-      # job, and the release job (needs: image) then publishes nothing.
+      # regexp identical to SECURITY.md and the tag guard at the top of this
+      # job. A failure here fails the job, and the release job (needs: image)
+      # then publishes nothing.
       - name: Verify the published image signature
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
