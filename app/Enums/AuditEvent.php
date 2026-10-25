@@ -132,7 +132,7 @@ enum AuditEvent: string
             self::RequestCancelled => 'A pending query request was cancelled (by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
             self::RequestExecutionStarted => 'Execution of an approved request started.',
             self::RequestExecutionCompleted => 'Execution of a request completed.',
-            self::RequestExecutionFailed => 'Execution of a request failed (masked error message).',
+            self::RequestExecutionFailed => 'Execution of a request failed (masked error message; metadata.refused_by = guard when a read request carried a write statement).',
             self::RequestExecutionDeferred => 'An approved request was put back on the queue because every slot of its connection was busy.',
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
             self::ExecutionCancelled => 'A user stopped a running request: the database was asked to cancel the statement (metadata.signalled tells whether it was reached; metadata.duration_ms is the run time so far).',
