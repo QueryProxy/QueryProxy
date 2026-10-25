@@ -87,7 +87,8 @@ This setup suits evaluation. Before exposing it to a network, follow the
 
 Images are published on release to Docker Hub (`queryproxy/queryproxy`) and
 GitHub Container Registry (`ghcr.io/queryproxy/queryproxy`), as `latest` and
-per-version tags, for `linux/amd64` and `linux/arm64`.
+per-version tags, for `linux/amd64` and `linux/arm64`. `latest` is the most
+recently published stable release; pre-releases get their version tag only.
 
 **Docker Compose.** [`docker-compose.yml`](docker-compose.yml) in this repository
 is the same single service (`docker compose up -d`), with commented blocks for

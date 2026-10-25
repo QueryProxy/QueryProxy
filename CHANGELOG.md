@@ -6,6 +6,20 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A pre-release no longer moves `latest`.** A pre-release tag such as
+  `v0.4.0-rc.1` now publishes only its version tag; `latest` stays on the
+  most recently published stable release.
+
+### Security
+
+- **The release workflow refuses tags users could not verify.** A tag that
+  matches the `v*.*.*` trigger but not the certificate identity in
+  `SECURITY.md` (for example `v1.2.3.4` or `v1.2.3+build`) now stops the
+  workflow before anything is built or pushed. Use `vX.Y.Z` or
+  `vX.Y.Z-<pre-release>`.
+
 ## [0.3.3] - 2026-10-25
 
 ### Fixed (0.3.3)
