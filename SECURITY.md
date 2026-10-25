@@ -41,7 +41,7 @@ Please include:
 Every release image published to Docker Hub (`queryproxy/queryproxy`) and GitHub
 Container Registry (`ghcr.io/queryproxy/queryproxy`) is signed keyless with
 [cosign](https://github.com/sigstore/cosign) from the release workflow, and
-carries an SBOM and a SLSA provenance attestation. Replace `0.3.1` with the
+carries an SBOM and a SLSA provenance attestation. Replace `0.3.3` with the
 version you are checking.
 
 Verify the signature with cosign v3 or later: signatures are stored in the
@@ -54,7 +54,7 @@ issued by GitHub Actions:
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/QueryProxy/QueryProxy/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/queryproxy/queryproxy:0.3.1
+  ghcr.io/queryproxy/queryproxy:0.3.3
 ```
 
 The release workflow runs this same verification against the pushed digest on
@@ -63,9 +63,9 @@ both registries before the GitHub Release is published.
 Inspect the SBOM and the provenance attached to the image:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.1 \
+docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.3 \
   --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.1 \
+docker buildx imagetools inspect ghcr.io/queryproxy/queryproxy:0.3.3 \
   --format '{{ json .Provenance }}'
 ```
 
