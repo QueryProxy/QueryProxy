@@ -36,7 +36,9 @@ updates:
         update-types: ["minor", "patch"]
 
   # docker-compose.integration.yml: the throwaway database servers of the CI
-  # integration jobs, pinned by version and digest.
+  # integration jobs, pinned by version and digest. They track the LTS lines
+  # (PostgreSQL 17, MySQL 8.4, MariaDB 11.4); moving to a new major is a
+  # deliberate change, so major updates are not proposed.
   - package-ecosystem: docker-compose
     directory: /
     schedule:
@@ -44,6 +46,9 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     labels: ["dependencies"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       docker-compose-minor-patch:
         update-types: ["minor", "patch"]
