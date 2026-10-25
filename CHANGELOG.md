@@ -49,6 +49,9 @@ does not start.
 - **Release images are signed** with cosign (keyless) and carry an SBOM and a
   SLSA provenance attestation; an OpenSSF Scorecard workflow runs weekly.
   How to verify is in [SECURITY.md](SECURITY.md#verifying-release-images).
+- **livewire/livewire 4.4.8** fixes an authorization bypass in `#[Authorize]`
+  ([GHSA-mhf7-xp6r-6qrc](https://github.com/advisories/GHSA-mhf7-xp6r-6qrc)).
+  QueryProxy does not use `#[Authorize]`, so it was not affected directly.
 
 ### Added (0.3.0)
 
