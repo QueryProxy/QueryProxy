@@ -17,6 +17,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 
 const SLACK_SECRET = 'test-slack-signing-secret';
 const TEAMS_SECRET = 'test-teams-hmac-secret';
@@ -554,4 +555,32 @@ test('chat notifications carry no ddl mark for other requests', function () {
         && ! str_contains($sent->body(), 'DDL'));
     Http::assertSent(fn ($sent) => str_contains($sent->url(), 'outlook.office.com')
         && ! str_contains($sent->body(), 'DDL'));
+});
+
+test('the teams webhook field suggests a workflows url instead of the retired connector url when unconfigured', function () {
+    $team = Team::factory()->create();
+    $dba = User::factory()->create();
+    $team->users()->attach($dba, ['role' => 'dba']);
+    session(['current_team_id' => $team->id]);
+
+    Livewire\Livewire::actingAs($dba)
+        ->test(ChatOps::class)
+        ->assertSeeHtml('placeholder="https://….environment.api.powerplatform.com/…/workflows/…"')
+        ->assertDontSeeHtml('placeholder="https://xxx.webhook.office.com')
+        ->assertSee('legacy webhook.office.com URLs still work');
+});
+
+test('the teams webhook field keeps the replace hint once an integration is configured', function () {
+    [$team, $dba] = chatSetup();
+    session(['current_team_id' => $team->id]);
+
+    $component = Livewire\Livewire::actingAs($dba)
+        ->test(ChatOps::class)
+        ->assertSeeHtml('placeholder="configured — enter a new URL to replace"')
+        ->assertDontSee('legacy webhook.office.com URLs still work');
+
+    // Scope to the Teams panel: the Slack panel has its own "blank = keep current" hints.
+    $teamsPanel = Str::after($component->html(), 'Microsoft Teams');
+
+    expect($teamsPanel)->toMatch('/Incoming webhook URL\s*(?:<!--.*?-->\s*)*<span[^>]*>blank = keep current<\/span>/s');
 });

@@ -75,9 +75,9 @@
 
             <div class="p-3.5">
                 <form wire:submit="saveTeams" class="flex flex-col gap-3">
-                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('teamsWebhookUrl')" :hint="$hasTeams ? 'blank = keep current' : null">
+                    <x-ui.field label="Incoming webhook URL" :error="$errors->first('teamsWebhookUrl')" :hint="$hasTeams ? 'blank = keep current' : 'Power Automate Workflows URL; legacy webhook.office.com URLs still work'">
                         <x-ui.input type="url" wire:model="teamsWebhookUrl" class="font-mono text-[11.5px]"
-                                    placeholder="{{ $hasTeams ? 'configured — enter a new URL to replace' : 'https://xxx.webhook.office.com/…' }}" />
+                                    placeholder="{{ $hasTeams ? 'configured — enter a new URL to replace' : 'https://….environment.api.powerplatform.com/…/workflows/…' }}" />
                     </x-ui.field>
 
                     @if ($canRotateSecret)
