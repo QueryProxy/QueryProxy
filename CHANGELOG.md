@@ -6,6 +6,257 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-25
+
+Step-by-step upgrade and rollback instructions, with the migration list, are
+on the [upgrading page](https://queryproxy.com/docs/upgrading/). Six changes
+below are marked **Breaking** under Changed: the redacted chat SQL preview,
+soft-deleted users with required override reasons, required TLS on new
+connections, the Teams Workflows card format, and two that need action
+before you upgrade: the database privileges the audit migration needs, and
+the pinned time zone of MySQL and MariaDB application connections. If the
+migration user lacks those privileges the upgrade stops and the container
+does not start.
+
+### Security (0.3.0)
+
+- **Reads run in a read-only session on the target database.** PostgreSQL,
+  MySQL, MariaDB and SQLite enforce it in the engine. SQL Server has no such
+  session: use the optional read-only identity (below) with `SELECT`
+  privileges only. The connection form warns about this.
+- **MySQL and MariaDB reads could leave their read-only transaction.** MySQL
+  commits implicitly before DDL, which ended the transaction opened with
+  `SET TRANSACTION READ ONLY` and let the statement run outside it with write
+  access. The SQL guard classes DDL as a write, so reaching this needed a
+  statement the guard had misclassified as a read and a DBA who approved it
+  as one. It was found by the integration tests against real databases
+  before this release and was never in a released version: read-only
+  sessions are new in 0.3.0. Reads on MySQL and MariaDB now set the session
+  itself read only, so a statement that ends the transaction is still
+  refused, and if the transaction is gone when a read commits the run fails
+  instead of reporting success. The read path also classifies the statement
+  again and refuses a write sent as a read, recording `refused_by: guard` in
+  the audit log. The SQL guard and the DBA approval are unchanged; this
+  closes a gap in the database-side layer.
+- **SQL literals are redacted in chat, audit and listings.** String and
+  numeric literals become placeholders in Slack and Teams previews, audit
+  metadata and its export, the dashboard and the request lists. The raw SQL
+  stays on the request page for the requester, the team's `dba` users and
+  the admin. An Auditor sees redacted SQL only. When a statement cannot be
+  redacted safely the preview is hidden.
+- **New connections require TLS** (see Changed). Existing connections keep
+  their behaviour and are flagged until you enforce TLS on them.
+- **Release images are signed** with cosign (keyless) and carry an SBOM and a
+  SLSA provenance attestation; an OpenSSF Scorecard workflow runs weekly.
+  How to verify is in [SECURITY.md](SECURITY.md#verifying-release-images).
+
+### Added (0.3.0)
+
+- **Audit hash chain.** Each audit entry stores the hash of the previous one
+  and its own hash, so edits, deletions and reordering are detectable.
+  `php artisan audit:verify` walks the chain from the first record and
+  reports the first break; `audit:checkpoint` (scheduled daily) records the
+  latest chain hash as an audit event. Database triggers reject `UPDATE` and
+  `DELETE` on `audit_logs` on every supported driver (and `TRUNCATE` on
+  PostgreSQL; MySQL and MariaDB triggers cannot block it).
+- **Audit export to external systems.** Opt-in sinks, set with
+  `QUERYPROXY_SIEM_SINKS`: JSON lines on stdout, RFC 5424 syslog over
+  udp, tcp or tls, and an HMAC-signed HTTPS webhook. Delivery is queued after
+  the audit record commits, retried, and dead-lettered to `failed_jobs`, so a
+  down sink never blocks the audit write. Events follow
+  `docs/audit-event.schema.json` and carry no per-event chain hashes.
+- **Prometheus metrics on `/metrics`**: counters for requests, approvals,
+  executions (completed, failed, cancelled, deferred for a busy connection),
+  guard rejections by rule and masked columns. Off by default (`404`); it
+  turns on when `QUERYPROXY_METRICS_TOKEN` or
+  `QUERYPROXY_METRICS_ALLOWED_IPS` is set. A scrape passes with the Bearer
+  token or from an allowed address, so an address on the allowlist needs no
+  token; anything else gets `401`. Labels never carry SQL, user names or
+  hosts. A Grafana dashboard ships as `docs/grafana-queryproxy.json`.
+- **`php artisan queryproxy:doctor`** checks an installation without changing
+  it: configuration and `APP_KEY`, the database, queue worker and scheduler
+  heartbeat, storage, TLS enforcement on connections and their PEM files,
+  masking coverage, the audit chain (`--full-audit` verifies all of it), SIEM
+  sinks and metrics. `--json` prints a machine-readable report and `--strict`
+  also fails on warnings.
+- **Secrets from files.** `APP_KEY`, `APP_PREVIOUS_KEYS`, `DB_PASSWORD`,
+  `MAIL_PASSWORD`, `REDIS_PASSWORD`, `SLACK_BOT_USER_OAUTH_TOKEN`,
+  `QUERYPROXY_ADMIN_PASSWORD`, `QUERYPROXY_METRICS_TOKEN` and
+  `QUERYPROXY_SIEM_WEBHOOK_SECRET` can be given as the same name with a
+  `_FILE` suffix, by the application config and by the Docker entrypoint.
+  Setting both `NAME` and `NAME_FILE` is an error and the container does not
+  start; a plain value of `null`, `(null)` or `(empty)` counts as unset.
+- **Stop a running query** from the request page. The requester, an approver
+  or an admin can stop it: `pg_cancel_backend` on PostgreSQL, `KILL QUERY` on
+  MySQL and MariaDB, `KILL` on SQL Server, sent from a separate connection. On
+  PostgreSQL and SQL Server the signal first checks the session's start time;
+  MySQL and MariaDB connection ids are not reused. Not available on SQLite. A
+  stopped run is rolled back, ends as `cancelled`, is audited as
+  `execution.cancelled`, and notifies the requester when someone else stopped
+  it. On SQL Server the target connection's user needs `VIEW SERVER STATE` and
+  `ALTER ANY CONNECTION`; without them the request is still marked `cancelled`
+  and a warning is shown, but the query runs on until its statement timeout.
+  `KILL` ends the whole session there, where the other drivers cancel only the
+  statement.
+- **`hmac` masking strategy and checksum validators.** `hmac` pseudonymises
+  values with a 256-bit key per team (stored encrypted), so analysts can join
+  and count on masked columns. `queryproxy:masking:rotate-key` replaces the
+  key; old and new pseudonyms then stop matching. A `validator` match type
+  adds TCKN, VKN, TR IBAN and Luhn checks, and a Turkey PII rule pack
+  (national id, tax id, IBAN, mobile and E.164 phone numbers, vehicle plates)
+  can be installed per team. The VKN content validator ships disabled
+  because its check digit matches too many unrelated numbers; the column rule
+  still covers `vkn` and `tax_no` columns.
+- **Sensitive-filter badge.** A request that filters, joins or sorts on a
+  column covered by a masking rule is flagged in the approval list and on the
+  request page, because the result can leak masked values through the
+  predicate.
+- **Connection TLS settings and a read-only identity.** Each connection has a
+  TLS mode and an optional CA, client certificate and key (PEM material is
+  stored encrypted and written to `storage/app/tls/` with owner-only
+  permissions). A connection can also hold an optional, encrypted read-only
+  identity that read requests use.
+- **Suspending users.** Administrators suspend and resume users on the Users
+  screen.
+- **Pending-request reminders.** `requests:remind` reminds the team's DBAs
+  and admins once, `QUERYPROXY_PENDING_REMIND_AFTER` hours (default `4`, `0`
+  turns it off) after a request is filed, and re-posts chat cards with a
+  fresh approval token once the old tokens have expired. Requests never
+  expire.
+- **Connection slots.** `QUERYPROXY_CONNECTION_SLOTS` (default `2`) limits
+  how many requests run against one connection at a time. A request that
+  finds every slot busy is re-queued after
+  `QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY` seconds (default `5`), audited as
+  `request.execution_deferred` and shown with a "Waiting for slot" badge.
+- **Integration tests on real databases.** A workflow runs the integration
+  and live suites against PostgreSQL, MySQL, MariaDB and SQL Server, with and
+  without TLS.
+
+### Changed (0.3.0)
+
+- **Breaking — `QUERYPROXY_CHAT_INCLUDE_SQL` now defaults to
+  `literals_redacted`.** The Slack and Teams preview replaces string and
+  number literals with `?`. Values: `literals_redacted` (default), `full` (the
+  earlier behaviour) and `none`; `true` still means `full` and `false` means
+  `none`. The audit screen and the audit CSV no longer carry raw SQL for any
+  role, and the CSV column `sql` is now `sql_redacted`. Update scripts that
+  read it by name.
+- **Breaking — users are soft-deleted and overrides need a reason.**
+  `query_requests.user_id` and `reviewed_by` become `RESTRICT`, so request
+  history cannot disappear with a user, and code that hard-deletes users now
+  fails on the foreign key. Deleting a user blocks their sign-in, sessions and
+  chat identities and cancels their `pending` requests (audited as
+  `request.cancelled`, actor `system`); approved and queued requests are not
+  touched, and the e-mail address stays reserved. A suspended user is blocked
+  the same way but keeps their pending requests. Every admin override
+  approval now needs a written reason on every channel, stored in the audit
+  log: a Slack **Approve** press that would be an override is not applied and
+  answers with a link to a web form, and the Teams action endpoint answers
+  `422` to an override without `reason`. Rolling the user migration back is
+  refused while any deleted or suspended account exists.
+- **Breaking — new connections require TLS.** PostgreSQL uses
+  `sslmode=require`, which encrypts but does not verify the server (use
+  `verify-full` against a man-in-the-middle); MySQL and MariaDB require TLS
+  without verifying the server certificate unless you tick "Verify the server
+  certificate" and add a CA; SQL Server uses `Encrypt=true` and
+  `TrustServerCertificate=false` (`pdo_sqlsrv` must be installed), so a
+  self-signed or privately issued certificate fails until its CA is trusted or
+  `TrustServerCertificate` is turned on for that connection. SQLite has no
+  TLS. Existing connections keep their old behaviour and are flagged in the
+  connection list: PostgreSQL shows "TLS not enforced" (`sslmode=prefer`), the
+  others "TLS: driver default". Edit each connection to enforce TLS;
+  `queryproxy:doctor` lists those that do not. On SQL Server the enforcement
+  is the ODBC driver's documented behaviour, not something QueryProxy
+  implements, and the tests cannot simulate a server that offers no TLS; treat
+  the network path as untrusted until you have checked it.
+- **Breaking for custom flows — Teams Workflows URLs receive an Adaptive
+  Card.** Webhook URLs on `*.powerplatform.com` and `*.logic.azure.com` now
+  receive an Adaptive Card 1.5 instead of a MessageCard, and
+  `*.powerplatform.com` joins the default webhook host allowlist. The
+  `queryproxy` envelope with the action token stays at the top level, so the
+  approval flow keeps working. A Power Automate flow that reads the
+  MessageCard fields (`title`, `summary`, `sections[0].facts`) now reads them
+  empty: read the card from `attachments[0].content`, or forward the body
+  unchanged. Legacy connector URLs (`*.webhook.office.com`) still receive a
+  MessageCard (see Deprecated).
+- **Reads run in a read-only session with timeouts derived from
+  `QUERYPROXY_EXECUTION_TIMEOUT`.** The statement timeout is the execution
+  timeout minus 5 seconds (at least 1) and the lock timeout is
+  `QUERYPROXY_LOCK_TIMEOUT` (default `5`); writes get the same limits. On
+  MySQL the statement timeout applies to `SELECT` only. On PostgreSQL,
+  `SELECT … FOR UPDATE` and `FOR SHARE` are rejected inside a read request.
+  Once a statement has started, QueryProxy no longer reconnects to the target
+  after a network drop: a brief drop fails the run instead of re-running it on
+  a new session.
+- **Results are streamed.** Rows are read through a server-side cursor on
+  PostgreSQL and an unbuffered result on MySQL and MariaDB, so memory no
+  longer grows with the result size.
+- **Slots can make requests wait.** If you ran more workers against one
+  connection than `QUERYPROXY_CONNECTION_SLOTS` allows, requests now stay
+  `queued` where they used to run at once. `0` switches the limit off.
+- **Breaking, check before upgrading — MySQL and MariaDB: the application
+  connection time zone is pinned to UTC.** `config/database.php` sets
+  `'timezone' => '+00:00'` on the `mysql` and `mariadb` connections.
+  `TIMESTAMP` columns are stored as UTC and shown in the session time zone,
+  which until now was the database server's. On a server that is not on UTC,
+  every existing `TIMESTAMP` value (`created_at`, `updated_at` and the other
+  `*_at` columns) is shown shifted by the server's UTC offset after the
+  upgrade: a server at UTC+3 shows values 3 hours earlier, one at UTC-5 shows
+  them 5 hours later (with a named zone such as `Europe/Berlin` the shift
+  follows daylight saving). `DATETIME` columns and servers already on UTC are
+  not affected. Open chat approval tokens (`chat_approval_tokens.expires_at`,
+  24-hour lifetime) expire early by that offset on UTC+ servers, and a token
+  with less time left becomes invalid at once; on UTC- servers they live that
+  much longer. Delete the open tokens before upgrading to avoid either effect;
+  the affected requests then get a fresh chat card from the reminder: `DELETE
+  FROM chat_approval_tokens WHERE used_at IS NULL;`. Check the server with
+  `SELECT @@global.time_zone, @@session.time_zone, @@system_time_zone,
+  TIMEDIFF(NOW(), UTC_TIMESTAMP());` first. The audit hash chain depends on
+  the pin: `audit_logs.created_at` is hashed as UTC wall time and must read
+  back unchanged.
+- **Breaking, before upgrading — the audit migration needs trigger
+  privileges.** The audit chain migration creates triggers. If it fails, the
+  container does not start, because the entrypoint runs `migrate` on every
+  start. The migration user needs the `TRIGGER` privilege on MySQL and MariaDB
+  (with binary logging on, also `SUPER` or
+  `log_bin_trust_function_creators=1`, otherwise it fails with error 1419) and
+  ownership of the table on PostgreSQL. Existing audit records are chained
+  from the first one during the migration, which can be run again after a
+  partial failure. After the migration, `audit_logs` rows can no longer be
+  updated or deleted.
+- **The first reminder run can post many cards at once.** Pending requests
+  older than 24 hours with no live approval token, in teams with an enabled
+  chat integration, get a renewed chat card on the first `requests:remind`
+  run after the upgrade, so a channel with a backlog sees a one-time burst.
+- **The scheduler gains three jobs**: a daily `audit:checkpoint`,
+  `requests:remind` every 15 minutes and a one-minute heartbeat written to
+  the cache (read by `queryproxy:doctor`). Keep the scheduler running.
+- **Masking.** The `hash` strategy is deprecated (see Deprecated). The
+  built-in card-number regex is replaced by a Luhn validator rule in new
+  default sets; existing teams keep the old rule and "Add default rules"
+  adds the Luhn rule next to it. The TCKN validator no longer treats a digit
+  run glued to a letter or an underscore as a candidate; a column named
+  `tckn` is still caught by its column rule.
+- As before, the Docker entrypoint sets the worker timeout to
+  `QUERYPROXY_EXECUTION_TIMEOUT` plus 10 seconds and ignores
+  `QUERYPROXY_WORKER_TIMEOUT`; `queryproxy:doctor` reports that value.
+
+### Deprecated (0.3.0)
+
+- **The `hash` masking strategy** stays selectable and is labelled
+  deprecated in the UI; use `hmac`.
+- **MessageCard payloads to Teams legacy connector URLs.** Microsoft's
+  [retirement notice](https://devblogs.microsoft.com/microsoft365dev/retirement-of-office-365-connectors-within-microsoft-teams/)
+  (April 14, 2026 update) says the rollout ran May 18 to May 22, 2026, after
+  which Office 365 Connectors no longer function, so a legacy URL may already
+  have stopped working. Move to a Workflows URL.
+
+### Fixed (0.3.0)
+
+- A job that fails now cancels its query on the target database instead of
+  leaving it running, and reads cut off at the row cap on MySQL and MariaDB
+  send `KILL QUERY`.
+
 ## [0.2.7] - 2026-10-18
 
 ### Security (0.2.7)
@@ -687,7 +938,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.4...v0.2.5
