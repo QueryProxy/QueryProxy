@@ -1,0 +1,10 @@
+// markdownlint-cli2 rules for the repository's Markdown (README, CHANGELOG, docs).
+{
+  "default": true,
+  // Prose wraps near 80 columns, but tables, code and long link targets may not.
+  "MD013": {
+    "line_length": 120,
+    "tables": false,
+    "code_blocks": false
+  }
+}
