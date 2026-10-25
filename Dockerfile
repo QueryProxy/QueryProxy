@@ -13,7 +13,9 @@ RUN npm run build
 # ---- PHP application ----
 FROM php:8.5-fpm-alpine AS app
 
-RUN apk add --no-cache \
+# Pick up Alpine security fixes the base image has not been rebuilt with yet.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache \
         icu-dev \
         libzip-dev \
         libpq-dev \
