@@ -265,6 +265,17 @@ test('Doctor queue_timing compares retry_after with the worker timeout', functio
     expect(doctorRun(new QueueTimingCheck)->status)->toBe(CheckStatus::Ok);
 });
 
+test('Doctor queue_timing ignores QUERYPROXY_WORKER_TIMEOUT, as the entrypoint does', function () {
+    config(['queue.default' => 'database', 'queue.connections.database.retry_after' => 330, 'queryproxy.execution_timeout' => 300]);
+    putenv('QUERYPROXY_WORKER_TIMEOUT=600');
+
+    try {
+        expect(doctorRun(new QueueTimingCheck)->status)->toBe(CheckStatus::Ok);
+    } finally {
+        putenv('QUERYPROXY_WORKER_TIMEOUT');
+    }
+});
+
 test('Doctor queue_timing fails when retry_after does not exceed the execution timeout', function () {
     config(['queue.default' => 'database', 'queue.connections.database.retry_after' => 60, 'queryproxy.execution_timeout' => 300]);
 

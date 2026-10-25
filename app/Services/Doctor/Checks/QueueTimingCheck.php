@@ -29,7 +29,9 @@ class QueueTimingCheck extends BaseCheck
         }
 
         $executionTimeout = (int) config('queryproxy.execution_timeout');
-        $workerTimeout = (int) ($this->env('QUERYPROXY_WORKER_TIMEOUT') ?? ($executionTimeout + self::WORKER_MARGIN));
+        // Derived the same way as docker/entrypoint.sh, which ignores any
+        // QUERYPROXY_WORKER_TIMEOUT set by the operator.
+        $workerTimeout = $executionTimeout + self::WORKER_MARGIN;
 
         if ((int) $retryAfter <= $workerTimeout) {
             return $this->fail("retry_after ({$retryAfter}s) is not greater than the worker timeout ({$workerTimeout}s, execution timeout {$executionTimeout}s); a long query would be started a second time. Raise {$queue} retry_after or lower QUERYPROXY_EXECUTION_TIMEOUT.");
