@@ -6,6 +6,25 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-25
+
+No image was published for 0.3.0: the release scan stopped it on a
+vulnerable package in the base image. 0.3.1 is the same release with that
+package updated; upgrade from 0.2.7 straight to 0.3.1 and follow the 0.3.0
+upgrade notes below.
+
+### Security (0.3.1)
+
+- **The image installs Alpine security updates on build.** The PHP base image
+  still shipped `brotli-libs` 1.2.0-r1 (CVE-2026-111497, an out-of-bounds
+  write in the Brotli decoder); the build now runs `apk upgrade`, so packages
+  fixed in Alpine are picked up before the base image is rebuilt.
+
+### Changed (0.3.1)
+
+- Dependency updates: `laravel/framework` 13.38.0, `vite` 8.3.5,
+  `@codemirror/view` 6.43.15 and `github/codeql-action/upload-sarif` 4.39.1.
+
 ## [0.3.0] - 2026-10-25
 
 Step-by-step upgrade and rollback instructions, with the migration list, are
@@ -941,7 +960,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.5...v0.2.6
