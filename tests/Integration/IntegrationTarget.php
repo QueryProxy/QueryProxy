@@ -376,6 +376,12 @@ final class IntegrationTarget
         return $this->admin()->selectOne('SELECT label FROM '.$this->table('items').' WHERE id = ?', [$id])?->label;
     }
 
+    /** Whether the table of this test exists on the server (information_schema, names are lower case). */
+    public function tableExists(string $key): bool
+    {
+        return (int) $this->admin()->selectOne('SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_name = ?', [$this->table($key)])->n > 0;
+    }
+
     public function sinkCount(): int
     {
         return (int) $this->admin()->selectOne('SELECT COUNT(*) AS n FROM '.$this->table('sink'))->n;
