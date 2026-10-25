@@ -182,7 +182,7 @@ class Masker
      * in the text (a bare word, a quoted or backticked name, a `Key (col)=(v)`
      * column list, `table.column` and its last part) matches a column rule,
      * every literal value in the message is masked with the strongest strategy
-     * among the matching rules (`full` > `hash` > `partial`). The identifier
+     * among the matching rules (`full` > `hmac` > `hash` > `partial`). The identifier
      * itself is left readable. A single stray apostrophe (MySQL's `doesn't
      * exist`) would shift the quote pairing and leave a value outside the
      * quotes, so when a column rule matches and the quotes do not balance the
