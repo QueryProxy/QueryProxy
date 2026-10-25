@@ -567,7 +567,7 @@ test('the teams webhook field suggests a workflows url instead of the retired co
         ->test(ChatOps::class)
         ->assertSeeHtml('placeholder="https://….environment.api.powerplatform.com/…/workflows/…"')
         ->assertDontSeeHtml('placeholder="https://xxx.webhook.office.com')
-        ->assertSee('legacy webhook.office.com URLs still work');
+        ->assertSee('Office 365 connectors are retired');
 });
 
 test('the teams webhook field keeps the replace hint once an integration is configured', function () {
@@ -577,7 +577,7 @@ test('the teams webhook field keeps the replace hint once an integration is conf
     $component = Livewire\Livewire::actingAs($dba)
         ->test(ChatOps::class)
         ->assertSeeHtml('placeholder="configured — enter a new URL to replace"')
-        ->assertDontSee('legacy webhook.office.com URLs still work');
+        ->assertDontSee('Office 365 connectors are retired');
 
     // Scope to the Teams panel: the Slack panel has its own "blank = keep current" hints.
     $teamsPanel = Str::after($component->html(), 'Microsoft Teams');
