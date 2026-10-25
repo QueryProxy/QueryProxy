@@ -67,6 +67,15 @@ class AuditLog extends Model
      * AuditChain::seal() is held until the record is committed, so records
      * are appended in a single order (ADR-020). The chain head moves inside
      * seal(), in this same transaction.
+     *
+     * Rule: a transaction that writes an audit record is opened with
+     * `attempts` (DB::transaction($callback, attempts: 3)). On MariaDB 11.8
+     * (`innodb_snapshot_isolation`) a concurrent audit write fails the chain
+     * lock row with error 1020 ("Record has changed since last read"), and
+     * Laravel can only retry the outermost transaction. The transaction below
+     * is nested whenever the caller opened one, and a nested transaction is
+     * never retried: it throws DeadlockException and the outer one has to be
+     * retried. Without an outer transaction this one is the outermost.
      */
     protected function performInsert(Builder $query)
     {

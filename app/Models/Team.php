@@ -19,6 +19,14 @@ class Team extends Model
     use HasFactory;
 
     /**
+     * Ids of the connections whose PEM files are removed once the team delete
+     * commits. Set by the `deleting` hook; not an attribute, never persisted.
+     *
+     * @var list<int>
+     */
+    protected array $pemPurgeConnectionIds = [];
+
+    /**
      * Every team starts protected: the default masking rules are installed
      * the moment a team row is created, whichever path creates it (admin UI,
      * seeder, factory). Teams that existed before this hook are deliberately
@@ -39,11 +47,25 @@ class Team extends Model
         // connections.team_id cascades in the database, which fires no model
         // events, so Connection's own `deleted` hook never runs for these
         // rows. Remove their TLS PEM files (client keys are stored in clear on
-        // disk while in use) before the cascade, whichever path deletes the team.
+        // disk while in use), whichever path deletes the team. The ids are read
+        // before the cascade removes the rows; the files go only once the delete
+        // has committed, so a rolled-back or retried delete (see
+        // Teams::deleteTeam) never loses them. purgeById() is idempotent.
         static::deleting(function (Team $team) {
-            $store = app(TlsPemStore::class);
+            $team->pemPurgeConnectionIds = $team->connections()->pluck('id')->map(fn ($id) => (int) $id)->all();
+        });
 
-            $team->connections()->pluck('id')->each(fn ($id) => $store->purgeById((int) $id));
+        static::deleted(function (Team $team) {
+            $ids = $team->pemPurgeConnectionIds;
+            $team->pemPurgeConnectionIds = [];
+
+            $team->getConnection()->afterCommit(function () use ($ids) {
+                $store = app(TlsPemStore::class);
+
+                foreach ($ids as $id) {
+                    $store->purgeById($id);
+                }
+            });
         });
     }
 

@@ -33,12 +33,17 @@ class UserLifecycle
         }
 
         DB::transaction(function () use ($user) {
+            // A retried attempt starts from the database state: after a rolled
+            // back attempt the model would otherwise still carry (and consider
+            // saved) the suspension, and save() would write nothing.
+            $user->refresh();
+
             $user->forceFill(['suspended_at' => now()])->save();
 
             $this->endSessions($user);
 
             audit()->record('user.suspended', metadata: ['user' => $user->email]);
-        });
+        }, attempts: 3);
     }
 
     public function unsuspend(User $user): void
@@ -57,6 +62,11 @@ class UserLifecycle
      * approved and queued requests keep running) in one transaction: if any
      * cancellation fails the delete rolls back, so a deleted user never keeps a
      * pending request.
+     *
+     * The transaction writes an audit record, so it is opened with `attempts`:
+     * on MariaDB 11.8 (`innodb_snapshot_isolation`) a concurrent audit write
+     * makes the chain lock row fail with error 1020, and only the outermost
+     * transaction can be retried (see AuditLog::performInsert()).
      */
     public function delete(User $user): void
     {
@@ -87,7 +97,7 @@ class UserLifecycle
             ]);
 
             $user->delete();
-        });
+        }, attempts: 3);
     }
 
     /** Drop live sessions and invalidate remember-me cookies. */

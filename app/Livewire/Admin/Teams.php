@@ -49,7 +49,7 @@ class Teams extends Component
             audit()->record('team.created', team: $team, metadata: ['name' => $team->name]);
 
             return $team;
-        });
+        }, attempts: 3);
 
         $this->reset('name');
         session()->flash('status', "Team \"{$team->name}\" created.");
@@ -60,22 +60,32 @@ class Teams extends Component
     {
         $this->assertAdmin();
 
-        $team = Team::findOrFail($teamId);
+        // Audit record and delete land together, and the transaction is opened
+        // with `attempts` because it writes an audit record: a concurrent audit
+        // write can fail the chain lock with error 1020 on MariaDB 11.8, and
+        // only the outermost transaction is retried. The closure is safe to
+        // run again: deleting result files is idempotent, and the team's TLS
+        // PEM files go only after commit (Team's `deleted` hook).
+        DB::transaction(function () use ($teamId) {
+            // Loaded afresh on every attempt: a model whose delete was rolled
+            // back would otherwise still believe it no longer exists.
+            $team = Team::findOrFail($teamId);
 
-        audit()->record('team.deleted', team: $team, metadata: ['name' => $team->name]);
+            audit()->record('team.deleted', team: $team, metadata: ['name' => $team->name]);
 
-        // The DB cascade removes the query_requests rows without firing model
-        // events, so the stored result files must be deleted explicitly or
-        // they would linger on disk beyond the pruner's reach.
-        QueryRequest::where('team_id', $team->id)
-            ->whereNotNull('result_path')
-            ->lazyById()
-            ->each(function (QueryRequest $request) {
-                Storage::disk($request->result_disk ?? config('queryproxy.result_disk', 'local'))
-                    ->delete($request->result_path);
-            });
+            // The DB cascade removes the query_requests rows without firing model
+            // events, so the stored result files must be deleted explicitly or
+            // they would linger on disk beyond the pruner's reach.
+            QueryRequest::where('team_id', $team->id)
+                ->whereNotNull('result_path')
+                ->lazyById()
+                ->each(function (QueryRequest $request) {
+                    Storage::disk($request->result_disk ?? config('queryproxy.result_disk', 'local'))
+                        ->delete($request->result_path);
+                });
 
-        $team->delete();
+            $team->delete();
+        }, attempts: 3);
     }
 
     public function render()

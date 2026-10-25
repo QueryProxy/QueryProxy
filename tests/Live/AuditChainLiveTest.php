@@ -34,6 +34,23 @@ use Illuminate\Support\Facades\DB;
 use Symfony\Component\Process\Process;
 use Tests\Live\LiveAppDb;
 
+/**
+ * True when the server refuses a write to a row that changed after the read
+ * view was fixed (MariaDB 11.8+ with innodb_snapshot_isolation=ON): the outer
+ * transaction is then expected to need its second attempt. Servers without
+ * the variable (MySQL, PostgreSQL, SQL Server, older MariaDB) are not.
+ */
+function liveSnapshotIsolationOn(): bool
+{
+    try {
+        $value = DB::selectOne('SELECT @@innodb_snapshot_isolation AS value')->value ?? null;
+    } catch (Throwable) {
+        return false;
+    }
+
+    return in_array(strtoupper((string) $value), ['1', 'ON'], true);
+}
+
 beforeEach(function () {
     if (! LiveAppDb::configured()) {
         LiveAppDb::failIfRequired();
@@ -169,21 +186,71 @@ test('an audit write inside an outer transaction sees the latest chain head', fu
     // Under MySQL/MariaDB REPEATABLE READ the outer transaction fixes its
     // read view at its first read; a second connection then commits a record.
     // The audit write of the outer transaction must still chain after it.
+    //
+    // MariaDB 11.8 (innodb_snapshot_isolation=ON) refuses that write with
+    // error 1020 instead, because the chain lock row changed after the read
+    // view was fixed. The outer transaction is therefore opened with attempts
+    // (the rule for every transaction that writes an audit record): the second
+    // attempt reads afresh and chains after the other record. Elsewhere the
+    // first attempt already succeeds.
     audit()->record('test.before');
 
-    DB::transaction(function () {
+    $attempts = 0;
+    $other = null;
+    $inside = null;
+
+    DB::transaction(function () use (&$attempts, &$other, &$inside) {
+        $attempts++;
+
         AuditLog::count();
 
-        $other = (new AuditLog(['action' => 'test.other']))->setConnection(LiveAppDb::SECOND_CONNECTION);
-        $other->save();
+        // Another process commits only during the first attempt.
+        if ($other === null) {
+            $other = (new AuditLog(['action' => 'test.other']))->setConnection(LiveAppDb::SECOND_CONNECTION);
+            $other->save();
+        }
 
         $inside = audit()->record('test.inside');
+    }, attempts: 3);
 
-        expect($inside->prev_hash)->toBe($other->hash);
-    });
-
-    expect(DB::table('audit_logs')->count())->toBe(3)
+    expect($attempts)->toBe(liveSnapshotIsolationOn() ? 2 : 1)
+        ->and($inside->prev_hash)->toBe($other->hash)
+        ->and(DB::table('audit_logs')->count())->toBe(3)
         ->and($this->artisan('audit:verify')->run())->toBe(0);
+});
+
+test('an outer transaction that reads, loses the chain to another process and then writes audit succeeds on retry', function () {
+    // The scenario of the MariaDB 11.8 regression: the outer transaction reads
+    // (fixing its snapshot), a separate process advances the chain and commits,
+    // then the outer transaction writes its audit record. Only the retry of the
+    // outermost transaction, which starts a fresh snapshot, can succeed.
+    audit()->record('test.before');
+
+    $attempts = 0;
+    $inside = null;
+
+    DB::transaction(function () use (&$attempts, &$inside) {
+        $attempts++;
+
+        AuditLog::count();
+
+        if ($attempts === 1) {
+            $writer = new Process([PHP_BINARY, base_path('tests/Live/audit_writer.php'), '1', 'between'], base_path());
+            $writer->setTimeout(60)->run();
+
+            expect($writer->getExitCode())->toBe(0, $writer->getErrorOutput().$writer->getOutput());
+        }
+
+        $inside = audit()->record('test.inside');
+    }, attempts: 3);
+
+    $between = AuditLog::where('action', 'test.concurrent')->firstOrFail();
+
+    expect($attempts)->toBe(liveSnapshotIsolationOn() ? 2 : 1)
+        ->and($inside->prev_hash)->toBe($between->hash)
+        ->and(DB::table('audit_logs')->count())->toBe(3)
+        ->and((int) DB::table('audit_chain_lock')->value('sequence'))->toBe(3)
+        ->and($this->artisan('audit:verify')->expectsOutputToContain('3 records verified')->run())->toBe(0);
 });
 
 test('concurrent writers cannot fork the chain', function () {

@@ -138,7 +138,7 @@ class QueryStudio extends Component
             ]);
 
             return $request;
-        });
+        }, attempts: 3);
 
         app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Pending, $request->type);
 
