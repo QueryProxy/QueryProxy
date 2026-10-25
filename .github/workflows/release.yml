@@ -123,6 +123,20 @@ jobs:
             "queryproxy/queryproxy@${DIGEST}" \
             "ghcr.io/queryproxy/queryproxy@${DIGEST}"
 
+      # Verify the signature just made with the same command SECURITY.md gives
+      # users, so that command is proven on every release. Keep the identity
+      # regexp identical to the one in SECURITY.md. A failure here fails the
+      # job, and the release job (needs: image) then publishes nothing.
+      - name: Verify the published image signature
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/QueryProxy/QueryProxy/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "queryproxy/queryproxy@${DIGEST}" \
+            "ghcr.io/queryproxy/queryproxy@${DIGEST}"
+
   # Publishes the GitHub Release once the image is out, using the tag's
   # section of CHANGELOG.md as the release notes.
   release:

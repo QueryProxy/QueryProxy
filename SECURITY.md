@@ -57,6 +57,9 @@ cosign verify \
   ghcr.io/queryproxy/queryproxy:0.3.1
 ```
 
+The release workflow runs this same verification against the pushed digest on
+both registries before the GitHub Release is published.
+
 Inspect the SBOM and the provenance attached to the image:
 
 ```sh
