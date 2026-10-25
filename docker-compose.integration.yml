@@ -13,6 +13,13 @@
 #   mariadb   mariadb       13316  no TLS           mariadb-tls   13317  TLS
 #   sqlsrv    mssql         11433  TLS (self-signed), no way to switch it off
 #
+# MariaDB runs on two LTS lines. This file holds 11.4; 11.8 has the same pair of
+# servers in its own file, tests/Integration/docker/mariadb-11-8/docker-compose.yml
+# (ports 13318 no TLS, 13319 TLS), which is used on its own, never merged with
+# this one. They are two files so Dependabot sees two image dependencies and
+# keeps each line on its own patch releases (it merges equal image names of one
+# directory into a single dependency based on the lower version).
+#
 # The TLS servers need the certificates of tests/Integration/docker/ first:
 #
 #   tests/Integration/docker/generate-certs.sh

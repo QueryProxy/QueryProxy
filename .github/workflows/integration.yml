@@ -2,11 +2,13 @@ name: Integration
 
 # Runs the integration tests (tests/Integration, Pest group "integration") and
 # the audit chain and connection slot tests (tests/Live, group "live-appdb")
-# against real PostgreSQL, MySQL, MariaDB and SQL Server servers, one job per
-# driver. The servers come from docker-compose.integration.yml, the same file
-# the tests use locally, so the credentials, ports and TLS setups are written
-# once. Besides the main server each job starts a second one where the TLS
-# tests need it (a server that offers TLS and one that does not).
+# against real PostgreSQL, MySQL, MariaDB (11.4 and 11.8) and SQL Server
+# servers, one job per driver and version. The servers come from
+# docker-compose.integration.yml (MariaDB 11.8: tests/Integration/docker/
+# mariadb-11-8/docker-compose.yml), the same files the tests use locally, so
+# the credentials, ports and TLS setups are written once. Besides the main
+# server each job starts a second one where the TLS tests need it (a server that
+# offers TLS and one that does not).
 #
 # The tests/Live PostgreSQL guard tests keep their own workflow
 # (live-pgsql.yml): they need a superuser and a server that trusts loopback
@@ -33,7 +35,7 @@ concurrency:
 
 jobs:
   databases:
-    name: integration (${{ matrix.driver }})
+    name: integration (${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -41,6 +43,8 @@ jobs:
       matrix:
         include:
           - driver: pgsql
+            label: pgsql
+            compose-file: docker-compose.integration.yml
             php-extensions: pdo_pgsql
             services: pgsql pgsql-tls
             port: 15432
@@ -50,6 +54,8 @@ jobs:
             tls-on-port: 15433
             tls-off-port: 15432
           - driver: mysql
+            label: mysql
+            compose-file: docker-compose.integration.yml
             php-extensions: pdo_mysql
             services: mysql mysql-notls
             port: 13306
@@ -59,6 +65,8 @@ jobs:
             tls-on-port: 13306
             tls-off-port: 13307
           - driver: mariadb
+            label: mariadb 11.4
+            compose-file: docker-compose.integration.yml
             php-extensions: pdo_mysql
             services: mariadb mariadb-tls
             port: 13316
@@ -67,7 +75,23 @@ jobs:
             password: queryproxy_test
             tls-on-port: 13317
             tls-off-port: 13316
+          # 11.8 enables innodb_snapshot_isolation by default (error 1020 on a
+          # row another transaction changed since the snapshot); the same
+          # server is the live application database of the audit tests.
+          - driver: mariadb
+            label: mariadb 11.8
+            compose-file: tests/Integration/docker/mariadb-11-8/docker-compose.yml
+            php-extensions: pdo_mysql
+            services: mariadb-11-8 mariadb-11-8-tls
+            port: 13318
+            database: queryproxy_test
+            username: root
+            password: queryproxy_test
+            tls-on-port: 13319
+            tls-off-port: 13318
           - driver: sqlsrv
+            label: sqlsrv
+            compose-file: docker-compose.integration.yml
             php-extensions: pdo_sqlsrv
             services: mssql
             port: 11433
@@ -144,7 +168,7 @@ jobs:
         run: sh tests/Integration/docker/generate-certs.sh
 
       - name: Start the database servers
-        run: docker compose -f docker-compose.integration.yml up -d --wait ${{ matrix.services }}
+        run: docker compose -f ${{ matrix.compose-file }} up -d --wait ${{ matrix.services }}
 
       - name: Integration tests
         run: ./vendor/bin/pest --group=integration
@@ -155,13 +179,13 @@ jobs:
 
       - name: Server logs
         if: ${{ failure() }}
-        run: docker compose -f docker-compose.integration.yml logs --no-color --tail=200 ${{ matrix.services }}
+        run: docker compose -f ${{ matrix.compose-file }} logs --no-color --tail=200 ${{ matrix.services }}
 
       - name: Stop the database servers
         if: ${{ always() }}
-        run: docker compose -f docker-compose.integration.yml down --volumes
+        run: docker compose -f ${{ matrix.compose-file }} down --volumes
 
-  # Matrix jobs report as "integration (pgsql)", "integration (mysql)", ... so
+  # Matrix jobs report as "integration (pgsql)", "integration (mariadb 11.8)", ... so
   # branch protection requires the single `integration` job below, which
   # aggregates their result (the same shape as `test` in ci.yml).
   integration:

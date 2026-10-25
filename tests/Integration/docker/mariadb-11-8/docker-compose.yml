@@ -1,0 +1,52 @@
+# MariaDB 11.8 for the integration tests: the same pair of servers as the
+# 11.4 ones in docker-compose.integration.yml (see the header there), on other
+# ports. 11.8 turns innodb_snapshot_isolation on by default, so this server also
+# checks the retry of the audit-writing transactions (error 1020) against a
+# real server.
+#
+# It is a file of its own, used on its own, so that Dependabot treats it as a
+# separate image dependency (see .github/dependabot.yml). Start it the way the
+# header of docker-compose.integration.yml describes, with this file after -f,
+# QUERYPROXY_IT_DRIVER=mariadb, QUERYPROXY_IT_PORT=13318,
+# QUERYPROXY_IT_TLS_OFF_PORT=13318 and QUERYPROXY_IT_TLS_ON_PORT=13319. The
+# certificates are the ones tests/Integration/docker/generate-certs.sh makes.
+
+services:
+  mariadb-11-8:
+    # TLS is on by default in 11.8 as in 11.4 (self-made certificate), so the
+    # server meant to have none says so.
+    image: mariadb:11.8.9@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+    command: ["--skip-ssl"]
+    environment:
+      MARIADB_ROOT_PASSWORD: queryproxy_test
+      MARIADB_DATABASE: queryproxy_test
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13318:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  mariadb-11-8-tls:
+    image: mariadb:11.8.9@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+    command:
+      - --ssl-ca=/certs/ca.crt
+      - --ssl-cert=/certs/server.crt
+      - --ssl-key=/certs/server.key
+    environment:
+      MARIADB_ROOT_PASSWORD: queryproxy_test
+      MARIADB_DATABASE: queryproxy_test
+    volumes:
+      - ../certs:/certs:ro
+    tmpfs:
+      - /var/lib/mysql
+    ports:
+      - "127.0.0.1:13319:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 40

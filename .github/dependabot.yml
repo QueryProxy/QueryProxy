@@ -35,12 +35,22 @@ updates:
       docker-minor-patch:
         update-types: ["minor", "patch"]
 
-  # docker-compose.integration.yml: the throwaway database servers of the CI
-  # integration jobs, pinned by version and digest. They track the LTS lines
-  # (PostgreSQL 17, MySQL 8.4, MariaDB 11.4); moving to a new major is a
-  # deliberate change, so major updates are not proposed.
+  # docker-compose.integration.yml and tests/Integration/docker/mariadb-11-8/
+  # docker-compose.yml: the throwaway database servers of the CI integration
+  # jobs, pinned by version and digest. They track the LTS lines (PostgreSQL 17,
+  # MySQL 8.4, MariaDB 11.4 and 11.8); moving to a new major is a deliberate
+  # change, so major updates are not proposed. MariaDB's "major" is the minor
+  # number (11.4 -> 11.8), so its minor updates are ignored too.
+  #
+  # Dependabot merges the services of one directory that use the same image
+  # name into a single dependency and bases ignore ranges on the lowest
+  # version of them. MariaDB 11.4 and 11.8 therefore live in two directories,
+  # each its own update job: 11.4.x and 11.8.x each get patch updates only.
+  # Another MariaDB line gets its own directory and an entry here.
   - package-ecosystem: docker-compose
-    directory: /
+    directories:
+      - /
+      - /tests/Integration/docker/mariadb-11-8
     schedule:
       interval: weekly
     commit-message:
@@ -49,6 +59,8 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      - dependency-name: "mariadb"
+        update-types: ["version-update:semver-minor"]
     groups:
       docker-compose-minor-patch:
         update-types: ["minor", "patch"]
