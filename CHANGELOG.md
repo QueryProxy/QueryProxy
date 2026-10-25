@@ -6,6 +6,31 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-25
+
+### Fixed (0.3.2)
+
+- **Changes that write an audit entry no longer fail on MariaDB 11.8 or
+  later.** MariaDB 11.8 turns on `innodb_snapshot_isolation` by default: a
+  transaction that reads a row, and then touches a row another transaction
+  changed since its snapshot, fails with error 1020 instead of waiting. When
+  the application database was MariaDB 11.8 or later, deleting or suspending
+  a user, creating or deleting a team and submitting a query could fail this
+  way, because they read first and then append to the audit chain. These
+  transactions are now tried up to three times, and each attempt starts from
+  fresh data. On other databases the first attempt normally succeeds; a
+  deadlock or lock timeout in these transactions is now retried as well.
+- **Deleting a team keeps its TLS certificate files until the delete
+  commits.** The files used to be removed before the delete finished, so a
+  delete that was rolled back would have lost them. They are now removed after
+  the commit; a team delete that is retried or rolled back keeps them.
+
+### Changed (0.3.2)
+
+- **Integration tests run on MariaDB 11.4 and 11.8.** The CI matrix has a
+  separate job for each line, and the audit chain tests run against both as
+  the application database.
+
 ## [0.3.1] - 2026-10-25
 
 No image was published for 0.3.0: the release scan stopped it on a
@@ -960,7 +985,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.6...v0.2.7

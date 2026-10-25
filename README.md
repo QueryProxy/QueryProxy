@@ -94,6 +94,11 @@ is the same single service (`docker compose up -d`), with commented blocks for
 running the worker as its own container or using MySQL / PostgreSQL for the
 application database.
 
+**Tested versions.** Target databases: PostgreSQL 17, MySQL 8.4, MariaDB 11.4
+and 11.8, SQL Server 2022 and SQLite. Application database: SQLite, MySQL 8.4,
+MariaDB 11.4 and 11.8, and PostgreSQL 17. Other versions may work but are not
+tested.
+
 **Without Docker.** You need PHP 8.3 or newer (with the pdo drivers for your target
 databases), Composer, and Node 20.19+ or 22.12+.
 
@@ -318,7 +323,7 @@ All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
 ## Project Status
 
-**Beta.** QueryProxy is at version 0.3.1; breaking changes can land in any 0.y
+**Beta.** QueryProxy is at version 0.3.2; breaking changes can land in any 0.y
 release and are listed in the [changelog](CHANGELOG.md).
 
 ## Contributing
