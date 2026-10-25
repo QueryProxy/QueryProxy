@@ -5,6 +5,7 @@ Self-hosted portal for database access control, query approval and audited SQL e
 [![CI](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/QueryProxy/QueryProxy/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/QueryProxy/QueryProxy)](https://github.com/QueryProxy/QueryProxy/releases/latest)
 [![License](https://img.shields.io/github/license/QueryProxy/QueryProxy)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/QueryProxy/QueryProxy/badge)](https://scorecard.dev/viewer/?uri=github.com/QueryProxy/QueryProxy)
 [![Designed & Maintained with Tan](https://muhammetsafak.com/badges/designed-maintained-with-tan.svg)](https://muhammetsafak.com/tan/)
 
 QueryProxy sits between your developers and your databases. Instead of handing out
@@ -47,11 +48,18 @@ It is a single Laravel monolith with no external dependencies by default.
   Microsoft Teams cards with an HMAC-verified action endpoint.
 - **Async execution:** approved queries run on a queue worker; reads stream
   through database cursors into NDJSON files with constant memory usage.
-- **Dynamic data masking:** column-pattern and content-regex rules (full, partial
-  or hash) applied while results are written, so unmasked PII never reaches the
-  result store.
-- **Immutable audit log:** every login, grant, submission, decision, execution and
-  download, with a filterable auditor UI and CSV export.
+- **Dynamic data masking:** column-pattern, content-regex and checksum
+  validator rules (full, partial, hash or keyed `hmac`) applied while results
+  are written, so unmasked PII never reaches the result store.
+- **Tamper-evident audit log:** every login, grant, submission, decision, execution
+  and download, hash-chained and protected by database triggers
+  (`php artisan audit:verify`), with a filterable auditor UI, CSV export and
+  optional SIEM sinks (stdout, syslog, signed webhook).
+- **Defence in depth on the target:** reads run in a read-only session with
+  statement and lock timeouts (SQL Server has no such session: give it a
+  separate read credential), new connections require TLS, a running query can
+  be stopped, and `GET /metrics` plus `php artisan queryproxy:doctor` show the
+  health of the install.
 
 ## Quick Start
 
@@ -145,17 +153,28 @@ Settings live in `.env`; `.env.example` lists the full set.
 | `QUERYPROXY_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | none | First-boot administrator; ignored once any user exists |
 | `QUERYPROXY_SELECT_DEFAULT_LIMIT` | `1000` | LIMIT injected into SELECTs without one |
 | `QUERYPROXY_SELECT_HARD_LIMIT` | `10000` | Larger LIMITs are clamped to this |
-| `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution |
+| `QUERYPROXY_EXECUTION_TIMEOUT` | `300` | Max seconds per query execution: a whole number above zero, at most `86400` (a larger value is clamped; anything else falls back to `300`). The target database's own statement timeout is derived from it (minus 5 seconds) |
+| `QUERYPROXY_LOCK_TIMEOUT` | `5` | Seconds a statement waits for a lock on the target database (1 to 3600) |
+| `QUERYPROXY_CONNECTION_SLOTS` | `2` | Requests that may run on one target connection at once; `0` disables the limit |
+| `QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY` | `5` | Seconds before a request that found every slot busy retries |
 | `QUERYPROXY_RESULT_DISK` | `local` | Disk for result files (`s3` supported) |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
 | `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none`, `admins`, `dba` or `all` |
-| `QUERYPROXY_CHAT_INCLUDE_SQL` | `true` | Embed a SQL preview in chat notifications |
+| `QUERYPROXY_CHAT_INCLUDE_SQL` | `literals_redacted` | SQL preview in chat: `literals_redacted`, `full` or `none` (`true` means `full`, `false` means `none`) |
+| `QUERYPROXY_PENDING_REMIND_AFTER` | `4` | Hours before one reminder for a `pending` request; `0` turns it off. Requests never expire |
+| `QUERYPROXY_METRICS_TOKEN` / `QUERYPROXY_METRICS_ALLOWED_IPS` | none | Turn on `GET /metrics` for Prometheus (bearer token and/or address allowlist); off until one is set |
+| `QUERYPROXY_SIEM_SINKS` | none | Export audit events to `stdout`, `syslog` and/or `webhook`; the `QUERYPROXY_SIEM_*` settings are in the [audit export guide](https://queryproxy.com/docs/audit-export/) |
+| `APP_KEY_FILE`, `DB_PASSWORD_FILE`, … | none | Read a secret from a file (Docker and Kubernetes secrets); every `*_FILE` is listed in the [configuration guide](https://queryproxy.com/docs/configuration/#secrets-from-files) |
 | `QUERYPROXY_RUN_WORKER` | `true` | Run the queue worker inside the container |
 | `QUERYPROXY_WORKER_PROCESSES` | `1` | Number of queue workers |
 | `QUERYPROXY_RUN_SCHEDULER` | `true` | Run the scheduler inside the container |
 | `QUERYPROXY_SEED_DEMO` | `false` | Seed the demo team and accounts |
 | `TRUSTED_PROXIES` | none | Reverse proxy IPs / CIDRs allowed to set `X-Forwarded-*` |
 <!-- markdownlint-enable MD013 -->
+
+The image derives the worker `--timeout` (`QUERYPROXY_WORKER_TIMEOUT`) from
+`QUERYPROXY_EXECUTION_TIMEOUT` plus 10 on every start; a value you pass for it
+is ignored, so change the execution timeout instead.
 
 The application database defaults to SQLite; set the usual `DB_*` variables for
 MySQL or PostgreSQL. The queue uses the database driver by default; set
@@ -173,16 +192,25 @@ between QueryProxy and the target databases, and give read-only teams a connecti
 whose database user has `SELECT` privileges only.
 
 The [production hardening guide](https://queryproxy.com/docs/production-hardening/)
-has the full checklist. The default image ships `pdo_pgsql`, `pdo_mysql` and
-`pdo_sqlite`; for SQL Server targets see the
+has the full checklist; the
+[threat model](https://queryproxy.com/docs/threat-model/) says what QueryProxy
+defends against and what stays with you. The default image ships `pdo_pgsql`,
+`pdo_mysql` and `pdo_sqlite`; for SQL Server targets see the
 [SQL Server section](https://queryproxy.com/docs/configuration/#sql-server-targets).
-Backups, upgrades and rollbacks are covered in [Upgrading](#upgrading).
+Backups, upgrades and rollbacks are covered in [Upgrading](#upgrading), the
+[upgrade guide](https://queryproxy.com/docs/upgrading/) and the
+[backup guide](https://queryproxy.com/docs/backup-restore/). Run
+`php artisan queryproxy:doctor` (in Docker:
+`docker exec queryproxy php artisan queryproxy:doctor`) after every deploy; the
+[troubleshooting guide](https://queryproxy.com/docs/troubleshooting/) explains
+each check.
 
 ## Upgrading
 
 The container runs `php artisan migrate --force` on start, and migrations are not
 reversed on downgrade. Back up before every upgrade, and read the
-[changelog](CHANGELOG.md) for breaking changes first.
+[changelog](CHANGELOG.md) and the [upgrade guide](https://queryproxy.com/docs/upgrading/)
+for breaking changes first.
 
 1. Stop the container and back up the volume (and your external database, if
    `DB_*` points to MySQL or PostgreSQL). The archive holds the `APP_KEY` next to
@@ -259,6 +287,14 @@ docker run -d --name queryproxy -p 7432:7432 \
   queryproxy/queryproxy:0.2.6
 ```
 
+## Verifying releases
+
+Release images are signed with cosign and carry an SBOM and a provenance
+attestation. The commands to verify them (cosign v3 or later) are in the
+[security policy](SECURITY.md#verifying-release-images). The project's
+[OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/QueryProxy/QueryProxy)
+results are published weekly.
+
 ## Documentation
 
 - [Introduction](https://queryproxy.com/docs/)
@@ -266,6 +302,12 @@ docker run -d --name queryproxy -p 7432:7432 \
 - [Manual installation](https://queryproxy.com/docs/manual-installation/)
 - [Configuration](https://queryproxy.com/docs/configuration/)
 - [Production hardening](https://queryproxy.com/docs/production-hardening/)
+- [Threat model](https://queryproxy.com/docs/threat-model/)
+- [Troubleshooting](https://queryproxy.com/docs/troubleshooting/)
+- [Backup and restore](https://queryproxy.com/docs/backup-restore/)
+- [Upgrading and rolling back](https://queryproxy.com/docs/upgrading/)
+- [Monitoring](https://queryproxy.com/docs/monitoring/)
+- [Audit chain and SIEM export](https://queryproxy.com/docs/audit-export/)
 - [SQL guards](https://queryproxy.com/docs/sql-guards/)
 - [Approval workflow](https://queryproxy.com/docs/approval-workflow/)
 - [Data masking](https://queryproxy.com/docs/data-masking/)
