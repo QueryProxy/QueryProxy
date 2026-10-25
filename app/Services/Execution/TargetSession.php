@@ -176,11 +176,15 @@ class TargetSession
             case DbDriver::Mariadb:
                 $this->applyLimits($db, $driver, false);
 
-                // The characteristic applies to the next transaction, which
-                // beginTransaction() then starts. If that call had to
-                // reconnect, the new session never saw it: fail closed.
+                // Session-wide, not "SET TRANSACTION READ ONLY": that form
+                // covers only the next transaction, and MySQL ends the open
+                // one with an implicit commit before DDL, TRUNCATE, GRANT and
+                // the like. The statement would then run in autocommit mode
+                // on a writable session. The session value also holds for
+                // every transaction after such a commit. If beginTransaction()
+                // had to reconnect, the new session never saw it: fail closed.
                 $pdo = $db->getPdo();
-                $db->unprepared('SET TRANSACTION READ ONLY');
+                $db->unprepared('SET SESSION TRANSACTION READ ONLY');
                 $db->beginTransaction();
 
                 if ($db->getPdo() !== $pdo) {
@@ -215,6 +219,26 @@ class TargetSession
         $this->restoreBufferedFetch($db);
 
         if ($db->transactionLevel() < 1) {
+            return;
+        }
+
+        // Laravel still counts the transaction, but the server may have closed
+        // it already (MySQL commits implicitly before DDL and similar). What
+        // ran after that point ran outside the READ ONLY transaction: say so
+        // instead of letting commit() fail with a bare "no active transaction".
+        // A rollback is cleanup after an error that is already being
+        // reported, so it only resets Laravel's counter and never throws.
+        if (! $db->getPdo()->inTransaction()) {
+            try {
+                // The server has nothing left to roll back.
+                $db->rollBack();
+            } catch (Throwable) {
+            }
+
+            if ($commit) {
+                throw new RuntimeException('The transaction this read ran in was ended by the statement itself (implicit commit); the statement ran outside it, so the read is refused.');
+            }
+
             return;
         }
 

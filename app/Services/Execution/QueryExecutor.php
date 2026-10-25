@@ -42,6 +42,10 @@ class QueryExecutor
      */
     private const LEXER_ALTERING_SQL_MODES = ['NO_BACKSLASH_ESCAPES', 'ANSI_QUOTES'];
 
+    /** What the user sees when the database itself refused a write in the read-only session. */
+    private const READ_ONLY_SESSION_REFUSAL_MESSAGE = 'This statement tried to change data, but read requests run in a read-only database session. '.
+        'Submit it as a write request if the change is intended.';
+
     public function __construct(
         private DynamicConnectionFactory $factory,
         private SqlInspector $inspector,
@@ -204,9 +208,11 @@ class QueryExecutor
             $this->metrics->requestEntered(QueryRequestStatus::Failed, $request->type);
             $this->metrics->executionFinished($request, $durationMs);
 
-            audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: [
+            audit()->record('request.execution_failed', actor: $request->reviewer, request: $request, metadata: array_filter([
                 'error' => $safeMessage,
-            ]);
+                // The label and the statement disagreed: not the database's refusal.
+                'refused_by' => $e instanceof MislabelledReadException ? 'guard' : null,
+            ], fn ($value) => $value !== null));
         } finally {
             $this->factory->purge($connection);
 
@@ -391,6 +397,14 @@ class QueryExecutor
      */
     private function executeRead(QueryRequest $request, string $connectionName, string $sql): array
     {
+        // The request's type was decided when it was submitted and is only a
+        // label by now. Judge the statement that is about to run once more,
+        // so a write that was mislabelled as a read (or a parser gap that
+        // let one through) never reaches the server through the read path.
+        if ($this->inspector->inspect($sql, $request->connection->driver)->type() === StatementType::Write) {
+            throw new MislabelledReadException;
+        }
+
         $disk = $this->resultDisk();
         $path = sprintf('results/%d/%d.ndjson', $request->team_id, $request->id);
         $rules = $this->masker->rulesFor($request->connection);
@@ -480,11 +494,7 @@ class QueryExecutor
             }
 
             if (TargetSession::isReadOnlyViolation($e)) {
-                throw new RuntimeException(
-                    'This statement tried to change data, but read requests run in a read-only database session. '.
-                    'Submit it as a write request if the change is intended.',
-                    previous: $e,
-                );
+                throw new RuntimeException(self::READ_ONLY_SESSION_REFUSAL_MESSAGE, previous: $e);
             }
 
             throw $e;

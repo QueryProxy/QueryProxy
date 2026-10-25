@@ -2,6 +2,7 @@
 
 use App\Enums\DbDriver;
 use App\Enums\QueryRequestStatus;
+use App\Models\AuditLog;
 use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
@@ -9,6 +10,7 @@ use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Execution\BackendCanceller;
 use App\Services\Execution\QueryExecutor;
 use App\Services\Execution\ResultStreamer;
+use Illuminate\Database\Connection as DatabaseConnection;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Database\Events\TransactionCommitted;
@@ -212,7 +214,7 @@ test('a read on SQLite runs with query_only on, so the database refuses a write'
     $request->refresh();
 
     expect($request->status)->toBe(QueryRequestStatus::Failed)
-        ->and($request->error_message)->toContain('read-only database session')
+        ->and($request->error_message)->toContain('submitted as a read request')
         ->and($request->error_message)->toContain('write request');
 
     $pdo = new PDO('sqlite:'.$dbFile);
@@ -261,7 +263,7 @@ test('a read opens a READ ONLY transaction and sets the timeouts for the driver'
     'mysql' => [DbDriver::Mysql, [
         'SET SESSION MAX_EXECUTION_TIME = 60000',
         'SET SESSION innodb_lock_wait_timeout = 7',
-        'SET TRANSACTION READ ONLY',
+        'SET SESSION TRANSACTION READ ONLY',
         'BEGIN',
         'SELECT id FROM customers',
         'COMMIT',
@@ -269,7 +271,7 @@ test('a read opens a READ ONLY transaction and sets the timeouts for the driver'
     'mariadb' => [DbDriver::Mariadb, [
         'SET SESSION max_statement_time = 60',
         'SET SESSION innodb_lock_wait_timeout = 7',
-        'SET TRANSACTION READ ONLY',
+        'SET SESSION TRANSACTION READ ONLY',
         'BEGIN',
         'SELECT id FROM customers',
         'COMMIT',
@@ -280,6 +282,64 @@ test('a read opens a READ ONLY transaction and sets the timeouts for the driver'
         'SELECT id FROM customers',
     ]],
 ]);
+
+test('a mislabelled write never reaches the server through the read path', function (DbDriver $driver, string $sql) {
+    [$request, $dbFile] = sessionSetup($sql, 'read', $driver);
+    $log = sessionCollectQueries();
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toContain('submitted as a read request')
+        ->and($request->error_message)->toContain('write request')
+        ->and(array_values(array_filter(sessionSent($log), fn ($sent) => $sent !== 'SELECT @@SESSION.sql_mode')))->toBe([]);
+
+    $pdo = new PDO('sqlite:'.$dbFile);
+    expect((int) $pdo->query('SELECT count(*) FROM customers')->fetchColumn())->toBe(3);
+})->with([
+    'mysql truncate' => [DbDriver::Mysql, 'TRUNCATE TABLE customers'],
+    'mysql create table' => [DbDriver::Mysql, 'CREATE TABLE created (id integer)'],
+    'mariadb delete' => [DbDriver::Mariadb, 'DELETE FROM customers'],
+    'pgsql update' => [DbDriver::Pgsql, "UPDATE customers SET name = 'x'"],
+    'sqlsrv drop' => [DbDriver::Sqlsrv, 'DROP TABLE customers'],
+]);
+
+test('the audit trail tells a guard refusal of a mislabelled read from a database refusal', function () {
+    [$request] = sessionSetup('DELETE FROM customers', 'read');
+
+    app(QueryExecutor::class)->execute($request);
+
+    $metadata = AuditLog::where('query_request_id', $request->id)->where('action', 'request.execution_failed')->firstOrFail()->metadata;
+
+    expect($metadata['refused_by'])->toBe('guard')
+        ->and($metadata['error'])->toContain('submitted as a read request');
+});
+
+test('a mysql read whose statement ended the transaction by an implicit commit fails closed', function () {
+    [$request, $dbFile] = sessionSetup('SELECT id FROM customers', 'read', DbDriver::Mysql);
+
+    // The fake session cannot reproduce MySQL's implicit commit by itself:
+    // close the transaction behind Laravel's back while the rows are read.
+    app()->bind(ResultStreamer::class, fn () => new class extends ResultStreamer
+    {
+        public function rows(DatabaseConnection $db, DbDriver $driver, string $sql, int $rowLimit, array $logContext = []): Generator
+        {
+            $db->getPdo()->exec('COMMIT');
+
+            yield from parent::rows($db, $driver, $sql, $rowLimit, $logContext);
+        }
+    });
+
+    app(QueryExecutor::class)->execute($request);
+
+    $request->refresh();
+
+    expect($request->status)->toBe(QueryRequestStatus::Failed)
+        ->and($request->error_message)->toContain('ended by the statement itself')
+        ->and($request->error_message)->not->toContain('no active transaction');
+});
 
 test('a failed read rolls its READ ONLY transaction back and the request fails', function () {
     [$request] = sessionSetup('SELECT id FROM missing_table', 'read', DbDriver::Pgsql);

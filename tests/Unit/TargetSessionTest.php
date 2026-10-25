@@ -127,3 +127,38 @@ test('a read-only violation wrapped in another exception is still recognised', f
 
     expect(TargetSession::isReadOnlyViolation($wrapped))->toBeTrue();
 });
+
+test('ending a read-only transaction the server already closed fails closed instead of committing', function () {
+    $db = new SQLiteConnection(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_fake']);
+    $db->beginTransaction();
+
+    // What MySQL does before DDL: the open transaction is committed.
+    $db->getPdo()->exec('COMMIT');
+
+    expect(fn () => app(TargetSession::class)->endReadOnly($db, true))
+        ->toThrow(RuntimeException::class, 'ended by the statement itself')
+        ->and($db->transactionLevel())->toBe(0);
+});
+
+test('cleaning up after an error never throws, even when the server already closed the transaction', function () {
+    $db = new SQLiteConnection(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_cleanup_fake']);
+    $db->beginTransaction();
+    $db->getPdo()->exec('COMMIT');
+
+    app(TargetSession::class)->endReadOnly($db, false);
+
+    expect($db->transactionLevel())->toBe(0);
+});
+
+test('ending a read-only transaction that is still open commits or rolls it back as before', function (bool $commit) {
+    $db = new SQLiteConnection(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'open_transaction_fake']);
+    $db->beginTransaction();
+
+    app(TargetSession::class)->endReadOnly($db, $commit);
+
+    expect($db->transactionLevel())->toBe(0)
+        ->and($db->getPdo()->inTransaction())->toBeFalse();
+})->with([
+    'commit' => [true],
+    'rollback' => [false],
+]);
