@@ -6,6 +6,27 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-25
+
+### Fixed (0.3.3)
+
+- **The Teams webhook field suggests a Workflows URL.** Microsoft has
+  retired Office 365 connectors (see Deprecated in 0.3.0), but the empty
+  Microsoft Teams field on the ChatOps page still showed a
+  `webhook.office.com` example, which pointed new setups at a retired
+  connector. The placeholder now shows a Power Automate Workflows URL, which
+  receives an Adaptive Card, and the hint under it notes that Office 365
+  connectors are retired. A legacy `webhook.office.com` URL you already
+  configured is kept, and QueryProxy still sends it a MessageCard.
+
+### Security (0.3.3)
+
+- **The release workflow verifies the image signature before releasing.**
+  After signing, the workflow runs `cosign verify` against the image in both
+  registries with the certificate identity and issuer documented in
+  `SECURITY.md`. If the check fails, no GitHub Release is created; the image
+  is already pushed by then, so only the release is withheld.
+
 ## [0.3.2] - 2026-10-25
 
 ### Fixed (0.3.2)
@@ -985,7 +1006,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.2.7...v0.3.0
