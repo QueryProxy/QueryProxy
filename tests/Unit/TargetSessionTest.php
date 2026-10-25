@@ -4,6 +4,30 @@ use App\Enums\DbDriver;
 use App\Services\Execution\TargetSession;
 use Illuminate\Database\SQLiteConnection;
 
+/**
+ * A SQLite PDO whose transaction the "server" can end behind Laravel's back.
+ * PHP before 8.4 keeps its own in-transaction flag for SQLite, so a COMMIT sent
+ * by hand is not seen by PDO::inTransaction() there; MySQL's PDO reads the
+ * server status instead (SERVER_STATUS_IN_TRANS) and sees it. This models the
+ * MySQL behaviour on every PHP version.
+ */
+class ServerClosedTransactionPdo extends PDO
+{
+    public bool $serverClosedTransaction = false;
+
+    public function inTransaction(): bool
+    {
+        return ! $this->serverClosedTransaction && parent::inTransaction();
+    }
+
+    /** What MySQL does before DDL: the open transaction is committed. */
+    public function closeTransactionLikeImplicitCommit(): void
+    {
+        $this->exec('COMMIT');
+        $this->serverClosedTransaction = true;
+    }
+}
+
 beforeEach(function () {
     config(['queryproxy.execution_timeout' => 65, 'queryproxy.lock_timeout' => 7]);
 });
@@ -129,11 +153,9 @@ test('a read-only violation wrapped in another exception is still recognised', f
 });
 
 test('ending a read-only transaction the server already closed fails closed instead of committing', function () {
-    $db = new SQLiteConnection(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_fake']);
+    $db = new SQLiteConnection(new ServerClosedTransactionPdo('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_fake']);
     $db->beginTransaction();
-
-    // What MySQL does before DDL: the open transaction is committed.
-    $db->getPdo()->exec('COMMIT');
+    $db->getPdo()->closeTransactionLikeImplicitCommit();
 
     expect(fn () => app(TargetSession::class)->endReadOnly($db, true))
         ->toThrow(RuntimeException::class, 'ended by the statement itself')
@@ -141,9 +163,9 @@ test('ending a read-only transaction the server already closed fails closed inst
 });
 
 test('cleaning up after an error never throws, even when the server already closed the transaction', function () {
-    $db = new SQLiteConnection(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_cleanup_fake']);
+    $db = new SQLiteConnection(new ServerClosedTransactionPdo('sqlite::memory:'), ':memory:', '', ['name' => 'implicit_commit_cleanup_fake']);
     $db->beginTransaction();
-    $db->getPdo()->exec('COMMIT');
+    $db->getPdo()->closeTransactionLikeImplicitCommit();
 
     app(TargetSession::class)->endReadOnly($db, false);
 

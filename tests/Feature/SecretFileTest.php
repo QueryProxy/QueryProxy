@@ -88,13 +88,24 @@ test('SecretFile reads the real environment', function () {
 });
 
 test('SecretFile reads the environment like env(): null and (empty) placeholders mean not set', function (string $placeholder, mixed $expected) {
+    // env() reads $_ENV and $_SERVER before getenv(). A real .env (CI copies
+    // .env.example, which has REDIS_PASSWORD=null) fills them at boot and would
+    // hide the putenv() value below, so take that variable out of all three.
+    $earlier = ['env' => $_ENV['REDIS_PASSWORD'] ?? null, 'server' => $_SERVER['REDIS_PASSWORD'] ?? null, 'process' => getenv('REDIS_PASSWORD')];
+    unset($_ENV['REDIS_PASSWORD'], $_SERVER['REDIS_PASSWORD']);
     putenv('REDIS_PASSWORD='.$placeholder);
 
     try {
         expect(SecretFile::get('REDIS_PASSWORD'))->toBe($expected)
             ->and(SecretFile::get('REDIS_PASSWORD', 'fallback'))->toBe($expected ?? 'fallback');
     } finally {
-        putenv('REDIS_PASSWORD');
+        putenv($earlier['process'] === false ? 'REDIS_PASSWORD' : 'REDIS_PASSWORD='.$earlier['process']);
+
+        foreach (['env' => '_ENV', 'server' => '_SERVER'] as $key => $global) {
+            if ($earlier[$key] !== null) {
+                $GLOBALS[$global]['REDIS_PASSWORD'] = $earlier[$key];
+            }
+        }
     }
 })->with([
     'null' => ['null', null],

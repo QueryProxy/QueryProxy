@@ -578,7 +578,7 @@ test('changing the driver to one that takes no PEM files removes the files', fun
         ->set('driver', $driver);
 
     if ($driver === 'sqlite') {
-        $component->set('host', '')->set('username', '')->set('database', '/var/db/queryproxy-tls-test.sqlite');
+        $component->set('host', '')->set('username', '')->set('database', sys_get_temp_dir().'/queryproxy-tls-test.sqlite');
     }
 
     $component->call('save')->assertHasNoErrors();

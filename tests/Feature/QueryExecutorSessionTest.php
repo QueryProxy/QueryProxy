@@ -28,6 +28,16 @@ class SessionRecordingPdo extends PDO
 
     public static bool $refuseBufferedQuery = false;
 
+    /** Set once the "server" has ended the transaction itself (MySQL's implicit commit). */
+    public static bool $serverClosedTransaction = false;
+
+    public function inTransaction(): bool
+    {
+        // PHP before 8.4 does not see a COMMIT sent by hand on SQLite; MySQL's
+        // PDO reads the server status and does. Model that on every version.
+        return ! self::$serverClosedTransaction && parent::inTransaction();
+    }
+
     public function setAttribute(int $attribute, mixed $value): bool
     {
         if ($attribute === 1000) {
@@ -83,6 +93,7 @@ function sessionFakeDriver(string $dbFile): void
 {
     SessionRecordingPdo::$bufferedQueryCalls = [];
     SessionRecordingPdo::$refuseBufferedQuery = false;
+    SessionRecordingPdo::$serverClosedTransaction = false;
 
     DB::extend('fake_session', function (array $config, string $name) {
         return new class(new SessionRecordingPdo('sqlite:'.$config['database']), $config['database'], '', $config + ['name' => $name]) extends SQLiteConnection
@@ -327,6 +338,7 @@ test('a mysql read whose statement ended the transaction by an implicit commit f
         public function rows(DatabaseConnection $db, DbDriver $driver, string $sql, int $rowLimit, array $logContext = []): Generator
         {
             $db->getPdo()->exec('COMMIT');
+            SessionRecordingPdo::$serverClosedTransaction = true;
 
             yield from parent::rows($db, $driver, $sql, $rowLimit, $logContext);
         }
