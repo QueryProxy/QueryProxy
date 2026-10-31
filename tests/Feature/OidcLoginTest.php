@@ -823,3 +823,133 @@ test('SSO routes count against a bucket of their own, not the one of the passwor
     // /login allows 10 per minute per address; the SSO hits above did not use them.
     $this->post('/login', ['email' => 'nobody@example.test', 'password' => 'x'])->assertSessionHasErrors('email');
 });
+
+test('an SSO sign-in records when it happened, for the fresh-confirmation checks (ADR-024)', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    expect(session(OidcController::SESSION_FLAG))->toBeTrue()
+        ->and(session(OidcController::SESSION_AT_KEY))->toBeInt()
+        ->and(abs(session(OidcController::SESSION_AT_KEY) - now()->getTimestamp()))->toBeLessThan(5);
+});
+
+test('reauthenticating asks the provider to authenticate the user again and returns to the token section', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $user = auth()->user();
+    session([OidcController::SESSION_AT_KEY => now()->subHour()->getTimestamp()]);
+
+    $location = $this->get(route('oidc.reauthenticate'))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+
+    OidcFakeProvider::$claims = ['auth_time' => time()];
+
+    expect($location)->toStartWith('https://idp.test/auth?')
+        ->and($query['prompt'])->toBe('login')
+        ->and($query['max_age'])->toBe('0')
+        ->and(session('oidc.flow.reauth_user_id'))->toBe($user->id);
+
+    $this->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]))
+        ->assertRedirect(route('profile').'#api-tokens');
+
+    expect(auth()->id())->toBe($user->id)
+        ->and(now()->getTimestamp() - session(OidcController::SESSION_AT_KEY))->toBeLessThan(5);
+});
+
+test('an ordinary sign-in does not ask the provider to authenticate again', function () {
+    expect(oidcStartLogin())->not->toHaveKey('prompt');
+});
+
+test('a confirmation that comes back as another account is refused and the session is left as it was', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $alice = auth()->user();
+    $oldAt = now()->subHour()->getTimestamp();
+    session([OidcController::SESSION_AT_KEY => $oldAt]);
+
+    $location = $this->get(route('oidc.reauthenticate'))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    OidcFakeProvider::$claims = ['sub' => 'sub-bob', 'email' => 'bob@example.test', 'name' => 'Bob', 'auth_time' => time()];
+
+    $this->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]))
+        ->assertRedirect(route('profile').'#api-tokens')
+        ->assertSessionHasErrors('sso');
+
+    // Refused before anything is provisioned or linked.
+    expect(auth()->id())->toBe($alice->id)
+        ->and(session(OidcController::SESSION_AT_KEY))->toBe($oldAt)
+        ->and(User::where('email', 'bob@example.test')->exists())->toBeFalse()
+        ->and(AuditLog::where('action', 'user.sso_provisioned')->count())->toBe(1);
+});
+
+test('a signed-in user who did not start a confirmation is still turned away from the callback', function () {
+    $this->actingAs(User::factory()->create())
+        ->get(route('oidc.callback', ['code' => 'auth-code', 'state' => 'x']))
+        ->assertRedirect(route('dashboard'));
+
+    Http::assertNothingSent();
+});
+
+test('reauthenticating needs a signed-in user', function () {
+    $this->get(route('oidc.reauthenticate'))->assertRedirect(route('login'));
+});
+
+test('a confirmation the provider cannot date, or dates before it began, is refused (auth_time)', function (?int $offset) {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $alice = auth()->user();
+    $oldAt = now()->subHour()->getTimestamp();
+    session([OidcController::SESSION_AT_KEY => $oldAt]);
+
+    $location = $this->get(route('oidc.reauthenticate'))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    // The provider ignored prompt=login: it answers with the sign-in it already had.
+    OidcFakeProvider::$claims = ['auth_time' => $offset === null ? null : time() + $offset];
+
+    $this->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]))
+        ->assertRedirect(route('profile').'#api-tokens')
+        ->assertSessionHasErrors('sso');
+
+    expect(auth()->id())->toBe($alice->id)
+        ->and(session(OidcController::SESSION_AT_KEY))->toBe($oldAt);
+})->with([
+    'no auth_time claim' => [null],
+    'signed in an hour ago' => [-3600],
+    'signed in two minutes ago' => [-120],
+]);
+
+test('a confirmation that carries an auth_time from after the attempt began is accepted', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $alice = auth()->user();
+    session([OidcController::SESSION_AT_KEY => now()->subHour()->getTimestamp()]);
+
+    $location = $this->get(route('oidc.reauthenticate'))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    OidcFakeProvider::$claims = ['auth_time' => time() - 10];
+
+    $this->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]))
+        ->assertRedirect(route('profile').'#api-tokens')
+        ->assertSessionHasNoErrors();
+
+    expect(auth()->id())->toBe($alice->id)
+        ->and(now()->getTimestamp() - session(OidcController::SESSION_AT_KEY))->toBeLessThan(5);
+});
+
+test('auth_time from the userinfo endpoint is not taken as proof of a fresh sign-in', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $oldAt = now()->subHour()->getTimestamp();
+    session([OidcController::SESSION_AT_KEY => $oldAt]);
+
+    $location = $this->get(route('oidc.reauthenticate'))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    // No auth_time in the ID token, and no groups, so the userinfo merge runs and offers one.
+    OidcFakeProvider::$claims = ['groups' => null];
+    OidcFakeProvider::$userInfo = ['groups' => ['platform-dba'], 'auth_time' => time()];
+
+    $this->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]))
+        ->assertRedirect(route('profile').'#api-tokens')
+        ->assertSessionHasErrors('sso');
+
+    expect(session(OidcController::SESSION_AT_KEY))->toBe($oldAt);
+});

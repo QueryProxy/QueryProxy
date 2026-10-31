@@ -33,7 +33,7 @@ class OidcClient
     private const HTTP_TIMEOUT = 10;
 
     /** Claims the userinfo response may never overwrite or add to the ID token. */
-    private const PROTECTED_CLAIMS = ['iss', 'aud', 'exp', 'iat', 'nbf', 'nonce', 'sub', 'azp'];
+    private const PROTECTED_CLAIMS = ['iss', 'aud', 'exp', 'iat', 'nbf', 'nonce', 'sub', 'azp', 'auth_time'];
 
     public function isConfigured(): bool
     {
@@ -46,7 +46,11 @@ class OidcClient
         return self::base64Url(random_bytes(48));
     }
 
-    public function authorizationUrl(string $state, string $nonce, string $codeVerifier, string $redirectUri): string
+    /**
+     * @param  bool  $forceLogin  ask the provider to authenticate the user again even if it still has
+     *                            a session for them (`prompt=login`, `max_age=0`), for a fresh confirmation (ADR-024)
+     */
+    public function authorizationUrl(string $state, string $nonce, string $codeVerifier, string $redirectUri, bool $forceLogin = false): string
     {
         $endpoint = $this->metadata()['authorization_endpoint'];
 
@@ -55,7 +59,7 @@ class OidcClient
             array_unshift($scopes, 'openid');
         }
 
-        $query = http_build_query([
+        $query = http_build_query(array_filter([
             'response_type' => 'code',
             'client_id' => $this->setting('client_id'),
             'redirect_uri' => $redirectUri,
@@ -64,7 +68,9 @@ class OidcClient
             'nonce' => $nonce,
             'code_challenge' => self::base64Url(hash('sha256', $codeVerifier, true)),
             'code_challenge_method' => 'S256',
-        ], '', '&', PHP_QUERY_RFC3986);
+            'prompt' => $forceLogin ? 'login' : null,
+            'max_age' => $forceLogin ? 0 : null,
+        ], fn ($value) => $value !== null), '', '&', PHP_QUERY_RFC3986);
 
         return $endpoint.(str_contains($endpoint, '?') ? '&' : '?').$query;
     }

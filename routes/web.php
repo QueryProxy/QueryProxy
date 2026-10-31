@@ -57,15 +57,22 @@ Route::middleware('guest')->group(function () {
     Route::get('/auth/oidc/redirect', [OidcController::class, 'redirect'])
         ->middleware('throttle:30,1,oidc')
         ->name('oidc.redirect');
-    Route::get('/auth/oidc/callback', [OidcController::class, 'callback'])
-        ->middleware('throttle:30,1,oidc')
-        ->name('oidc.callback');
 
     Route::get('/two-factor-challenge', [TwoFactorChallengeController::class, 'create'])->name('two-factor.challenge');
     Route::post('/two-factor-challenge', [TwoFactorChallengeController::class, 'store'])->middleware('throttle:5,1');
 });
 
+// The callback also serves a signed-in user who confirms an action through SSO
+// again (ADR-024); the controller turns away any other signed-in arrival.
+Route::get('/auth/oidc/callback', [OidcController::class, 'callback'])
+    ->middleware('throttle:30,1,oidc')
+    ->name('oidc.callback');
+
 Route::middleware(['auth', '2fa.required'])->group(function () {
+    Route::get('/auth/oidc/reauthenticate', [OidcController::class, 'reauthenticate'])
+        ->middleware('throttle:30,1,oidc')
+        ->name('oidc.reauthenticate');
+
     Route::post('/logout', [LoginController::class, 'destroy'])->name('logout');
     Route::post('/teams/{team}/switch', TeamSwitchController::class)->name('teams.switch');
 

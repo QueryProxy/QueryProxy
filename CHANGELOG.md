@@ -172,6 +172,22 @@ All notable changes to QueryProxy are documented here. The format follows
   the job also lands in `failed_jobs` so `queue:retry` can resend it. With
   `MAIL_MAILER=log` the Profile page says that nothing is delivered. Run
   `php artisan migrate` (adds `users.notification_preferences`).
+- **Create and revoke API tokens on the Profile page.** A new "API tokens"
+  section lets you name a personal access token, choose its scopes and set
+  how many days it lasts (required, up to `QUERYPROXY_API_TOKEN_MAX_DAYS`,
+  90 by default), and lists your tokens with their scopes, expiry and last
+  use. Creating a token asks you to confirm first: enter your password (or
+  a code from your authenticator app when two-factor authentication is on),
+  and wrong tries are rate limited. An account without a local password
+  must have signed in through SSO in the last 15 minutes; otherwise the page
+  sends you through SSO again (the provider is asked to sign you in anew)
+  and brings you back. The token value is shown once, right after you
+  create it, with a Copy button; it is never kept in the page state, so a
+  reload or any later action hides it for good, and only its hash is stored.
+  Revoking a token stops it at once. Only the scopes your roles can use are
+  offered: `approvals:write` needs the DBA role in a team, `requests:submit`
+  a DBA or developer role, and `results:read` is not offered to auditors.
+  Creating and revoking are audited as before.
 
 ### Changed
 

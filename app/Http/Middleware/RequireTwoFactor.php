@@ -3,7 +3,6 @@
 namespace App\Http\Middleware;
 
 use App\Http\Controllers\Auth\OidcController;
-use App\Models\User;
 use App\Services\Auth\TwoFactorService;
 use Closure;
 use Illuminate\Http\Request;
@@ -28,19 +27,11 @@ class RequireTwoFactor
         $user = $request->user();
 
         if ($user
-            && ! $user->hasTwoFactorEnabled()
-            && ! $this->signedInThroughSso($request, $user)
-            && $this->twoFactor->isRequiredFor($user)
+            && $this->twoFactor->mustEnrol($user, $request->session()->get(OidcController::SESSION_FLAG) === true)
             && ! $request->routeIs('profile', 'logout')) {
             return redirect()->route('profile');
         }
 
         return $next($request);
-    }
-
-    private function signedInThroughSso(Request $request, User $user): bool
-    {
-        return $user->isSsoUser()
-            && ($user->getAuthPassword() === null || $request->session()->get(OidcController::SESSION_FLAG) === true);
     }
 }

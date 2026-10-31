@@ -116,4 +116,6 @@
             <x-ui.btn type="submit" variant="primary" class="mt-1 self-start">Save preferences</x-ui.btn>
         </form>
     </x-ui.panel>
+
+    <livewire:profile.api-tokens />
 </div>

@@ -132,4 +132,31 @@ class TwoFactorService
             default => false,
         };
     }
+
+    /**
+     * Must this user enrol in 2FA before using the application? True for a
+     * user the requirement covers who has not enrolled. The one place the
+     * rule lives: the RequireTwoFactor middleware and everything that would
+     * otherwise let a password alone stand in for 2FA (creating and using API
+     * tokens, ADR-016, ADR-024) ask it.
+     *
+     * Users who sign in through OIDC are outside the requirement (ADR-016
+     * amendment, ADR-023). A local account linked to the provider that still
+     * has a password stays covered when it signs in with that password.
+     *
+     * @param  bool|null  $ssoSession  whether the current session was opened through SSO;
+     *                                 null when there is no session (an API token), where only an SSO
+     *                                 account without a local password counts as outside the requirement
+     */
+    public function mustEnrol(User $user, ?bool $ssoSession): bool
+    {
+        if ($user->hasTwoFactorEnabled()) {
+            return false;
+        }
+
+        $outside = $user->isSsoUser()
+            && ($user->getAuthPassword() === null || $ssoSession === true);
+
+        return ! $outside && $this->isRequiredFor($user);
+    }
 }

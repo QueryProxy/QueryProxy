@@ -147,3 +147,40 @@ test('each token has its own rate limit and exceeding it gets 429', function () 
     ApiWorld::as($first)->getJson('/api/v1/connections')->assertStatus(429)->assertHeader('Retry-After');
     ApiWorld::as($second)->getJson('/api/v1/connections')->assertOk();
 });
+
+test('the token of an owner the 2FA requirement covers is refused until they enrol (ADR-016)', function () {
+    $world = ApiWorld::make();
+    $token = ApiWorld::token($world->dba);
+
+    ApiWorld::as($token)->getJson('/api/v1/connections')->assertOk();
+
+    // The requirement is switched on later: the dba has not enrolled.
+    config(['queryproxy.require_two_factor' => 'dba']);
+
+    ApiWorld::as($token)->getJson('/api/v1/connections')->assertUnauthorized();
+    expect(PersonalAccessToken::count())->toBe(1);
+
+    // A developer is outside "dba" and carries on.
+    ApiWorld::as(ApiWorld::token($world->developer))->getJson('/api/v1/connections')->assertOk();
+
+    // Enrolling brings the token back: it was refused, not revoked.
+    $world->dba->forceFill(['two_factor_secret' => 'JBSWY3DPEHPK3PXP', 'two_factor_confirmed_at' => now()])->save();
+
+    ApiWorld::as($token)->getJson('/api/v1/connections')->assertOk();
+});
+
+test('the token of an SSO account without a local password is outside the 2FA requirement', function () {
+    config(['queryproxy.require_two_factor' => 'all']);
+    $sso = User::factory()->create(['password' => null, 'auth_provider' => 'oidc', 'external_id' => 'sub-t']);
+    $token = $sso->createToken('sso', ['requests:read'], now()->addDay())->plainTextToken;
+
+    ApiWorld::as($token)->getJson('/api/v1/connections')->assertOk();
+});
+
+test('the token of an SSO account that still has a password is refused unless it has enrolled', function () {
+    config(['queryproxy.require_two_factor' => 'all']);
+    $linked = User::factory()->create(['auth_provider' => 'oidc', 'external_id' => 'sub-u']);
+    $token = $linked->createToken('linked', ['requests:read'], now()->addDay())->plainTextToken;
+
+    ApiWorld::as($token)->getJson('/api/v1/connections')->assertUnauthorized();
+});

@@ -8,6 +8,7 @@ use App\Http\Middleware\EnsureTeamRole;
 use App\Models\QueryRequest;
 use App\Models\User;
 use App\Services\Api\TokenService;
+use App\Services\Auth\TwoFactorService;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Database\LostConnectionDetector as LostConnectionDetectorContract;
@@ -117,12 +118,16 @@ class AppServiceProvider extends ServiceProvider
 
         // A token authenticates only while it has an expiry (TokenService always
         // sets one; a row without one, however it got there, is refused) and its
-        // owner is not suspended. A deleted owner never resolves at all.
+        // owner is not suspended. A deleted owner never resolves at all. An owner
+        // the 2FA requirement covers but who has not enrolled gets no API access
+        // (ADR-016): a token must not stand in for the second factor. The token
+        // is kept and works again once the owner enrols.
         Sanctum::authenticateAccessTokensUsing(
             fn ($accessToken, bool $isValid) => $isValid
                 && $accessToken->expires_at !== null
                 && $accessToken->tokenable instanceof User
-                && ! $accessToken->tokenable->isSuspended(),
+                && ! $accessToken->tokenable->isSuspended()
+                && ! app(TwoFactorService::class)->mustEnrol($accessToken->tokenable, null),
         );
 
         // Reuse Livewire's own update path so this replaces the default route
