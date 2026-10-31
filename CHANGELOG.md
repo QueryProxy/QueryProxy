@@ -120,8 +120,22 @@ All notable changes to QueryProxy are documented here. The format follows
   in force. New audit events: `grant.requested`, `grant.approved`,
   `grant.rejected` and `grant.expired` (ADR-025). Removing a grant by hand
   still records `connection.grant_revoked`, and `connection.grant_added` now
-  carries `access_level`, `expires_at` and `reason` in its metadata. The
-  screens for requesting and deciding follow in a later change.
+  carries `access_level`, `expires_at` and `reason` in its metadata.
+- **Screens for time-bound access.** On the dashboard a developer can ask for
+  access to a connection of their team: pick the level (read or write), a
+  period (1 hour, 4 hours, 1 day, 7 days or a custom amount up to 30 days) and
+  give the reason, which is required. A developer who holds a timed grant sees
+  its level and the time left, and can ask to extend it at the same level; the
+  open requests and the decisions of the last seven days, with the DBA's
+  rejection reason, are listed on the same page. The Approvals page has a new
+  "Access requests" tab where a DBA of the team approves a request or rejects
+  it with a reason; nobody can decide their own request, and a request for
+  another level than the grant in force cannot be approved (change the
+  existing grant on the Connections page). On the Connections page the grants
+  panel now sets the level, the period (permanent by default) and an optional
+  reason for each grant, shows each developer's level and remaining time, and
+  replaces or revokes an existing grant. The dashboard now also shows the
+  confirmation after a DBA approves a request from it.
 
 ### Changed
 

@@ -253,21 +253,25 @@ test('the connections page grants with a period and revokes through the service'
 
     $component = Livewire::actingAs($dba)->test(ConnectionsIndex::class);
 
-    $component->call('toggleGrant', $connection->id, $developer->id, 90, 'read');
+    $component->set('grantLevel', 'read')
+        ->set('grantDuration', 'custom')
+        ->set('grantCustomAmount', '90')
+        ->set('grantCustomUnit', 'minutes')
+        ->call('grantAccess', $connection->id, $developer->id);
 
     $grant = $connection->grantFor($developer);
     expect($grant->access_level)->toBe(GrantAccessLevel::Read)
         ->and($grant->expires_at->between(now()->addMinutes(89), now()->addMinutes(91)))->toBeTrue();
 
-    $component->call('toggleGrant', $connection->id, $developer->id);
+    $component->call('revokeGrant', $connection->id, $developer->id);
     expect($connection->isGrantedTo($developer))->toBeFalse()
         ->and(grantAudit('connection.grant_revoked'))->toHaveCount(1);
 
-    $component->call('toggleGrant', $connection->id, $developer->id, 0)->assertHasErrors('grant');
-    $component->call('toggleGrant', $connection->id, $developer->id, null, 'admin')->assertHasErrors('grant');
+    $component->set('grantCustomAmount', '0')->call('grantAccess', $connection->id, $developer->id)->assertHasErrors('grantDuration');
+    $component->set('grantDuration', 'permanent')->set('grantLevel', 'admin')->call('grantAccess', $connection->id, $developer->id)->assertHasErrors('grantLevel');
     expect($connection->isGrantedTo($developer))->toBeFalse();
 
-    $component->call('toggleGrant', $connection->id, $developer->id);
+    $component->set('grantLevel', 'write')->call('grantAccess', $connection->id, $developer->id);
     expect($connection->grantFor($developer)->isPermanent())->toBeTrue();
 });
 

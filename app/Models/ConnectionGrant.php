@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\GrantAccessLevel;
+use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Support\Carbon;
 
@@ -34,6 +35,29 @@ class ConnectionGrant extends Pivot
     public function isPermanent(): bool
     {
         return $this->expires_at === null;
+    }
+
+    /**
+     * Time left as "3h 59m", "2d 4h" or "<1m"; null for a permanent grant.
+     * Minutes are the finest unit: the page is not refreshed live, so seconds
+     * would only look exact.
+     */
+    public function remaining(): ?string
+    {
+        if ($this->expires_at === null) {
+            return null;
+        }
+
+        if ($this->expires_at->lte(now()->addMinute())) {
+            return '<1m';
+        }
+
+        return $this->expires_at->diffForHumans([
+            'syntax' => CarbonInterface::DIFF_ABSOLUTE,
+            'short' => true,
+            'parts' => 2,
+            'minimumUnit' => 'minute',
+        ]);
     }
 
     /** "read access until 2026-10-31 14:00 UTC" or "write access, permanent". */

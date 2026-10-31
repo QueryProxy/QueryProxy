@@ -5,9 +5,12 @@ namespace App\Livewire\Connections;
 use App\Enums\DbDriver;
 use App\Enums\GrantAccessLevel;
 use App\Enums\TeamRole;
+use App\Livewire\Concerns\ChoosesGrantDuration;
 use App\Models\Connection;
+use App\Models\ConnectionGrant;
 use App\Models\QueryRequest;
 use App\Models\Team;
+use App\Models\User;
 use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Connections\GrantException;
 use App\Services\Connections\GrantService;
@@ -20,11 +23,28 @@ use Livewire\Component;
 #[Title('Connections')]
 class Index extends Component
 {
+    use ChoosesGrantDuration;
+
     public bool $showForm = false;
 
     public ?int $editingId = null;
 
     public ?int $grantsForId = null;
+
+    /** What the grant buttons of the open grants panel give (ADR-025). */
+    public string $grantLevel = 'write';
+
+    /** "permanent", a preset's minutes, or "custom". */
+    public string $grantDuration = 'permanent';
+
+    public string $grantCustomAmount = '';
+
+    public string $grantCustomUnit = 'hours';
+
+    public string $grantReason = '';
+
+    /** "connectionId:userId" of the row waiting for the DBA to confirm replacing its grant. */
+    public ?string $replacingKey = null;
 
     public string $name = '';
 
@@ -372,49 +392,87 @@ class Index extends Component
     public function toggleGrants(int $connectionId): void
     {
         $this->grantsForId = $this->grantsForId === $connectionId ? null : $connectionId;
+        $this->replacingKey = null;
+        $this->resetErrorBag();
     }
 
     /**
-     * Grant a team developer access, or revoke it when they hold one now.
-     * Without $durationMinutes a new grant is permanent; with it the grant
-     * ends after that many minutes (ADR-025).
+     * Replacing a grant needs a second click: the settings in the panel may
+     * still be the defaults (permanent, write), and a replace can turn a
+     * timed read grant into a permanent write one (ADR-025).
      */
-    public function toggleGrant(int $connectionId, int $userId, ?int $durationMinutes = null, string $accessLevel = 'write'): void
+    public function startReplace(int $connectionId, int $userId): void
+    {
+        $this->replacingKey = $connectionId.':'.$userId;
+        $this->resetErrorBag();
+    }
+
+    public function cancelReplace(): void
+    {
+        $this->replacingKey = null;
+    }
+
+    /**
+     * Give a team developer access with the level, period and reason set in
+     * the grants panel. A developer who already holds a grant gets it replaced:
+     * the DBA changes an existing grant directly (ADR-025).
+     */
+    public function grantAccess(int $connectionId, int $userId, GrantService $grants): void
     {
         $team = $this->team();
         $connection = Connection::forTeam($team)->findOrFail($connectionId);
         $this->authorize('update', $connection);
 
         $developer = $team->users()->wherePivot('role', TeamRole::Developer->value)->findOrFail($userId);
-        $grants = app(GrantService::class);
 
-        $this->resetErrorBag('grant');
+        $this->resetErrorBag();
+        $this->replacingKey = null;
 
-        if ($connection->isGrantedTo($developer)) {
-            $grants->revoke($connection, $developer, auth()->user());
+        $level = GrantAccessLevel::tryFrom($this->grantLevel);
+
+        if ($level === null) {
+            $this->addError('grantLevel', 'Choose an access level.');
 
             return;
         }
 
-        $level = GrantAccessLevel::tryFrom($accessLevel);
+        $expiresAt = null;
 
-        if ($level === null) {
-            $this->addError('grant', 'Unknown access level.');
+        if ($this->grantDuration !== 'permanent') {
+            $minutes = $this->chosenMinutes($this->grantDuration, $this->grantCustomAmount, $this->grantCustomUnit, 'grantDuration');
 
-            return;
+            if ($minutes === null) {
+                return;
+            }
+
+            $expiresAt = $grants->expiryAfter($minutes);
         }
 
         try {
-            $grants->grant(
-                $connection,
-                $developer,
-                auth()->user(),
-                $durationMinutes === null ? null : $grants->expiryAfter($durationMinutes),
-                $level,
-            );
+            $grants->grant($connection, $developer, auth()->user(), $expiresAt, $level, $this->grantReason);
         } catch (GrantException $e) {
             $this->addError('grant', $e->getMessage());
+
+            return;
         }
+
+        $this->reset('grantReason');
+    }
+
+    /** Take a developer's access away now, whatever its level or end time. */
+    public function revokeGrant(int $connectionId, int $userId, GrantService $grants): void
+    {
+        $connection = Connection::forTeam($this->team())->findOrFail($connectionId);
+        $this->authorize('update', $connection);
+
+        ConnectionGrant::query()
+            ->where('connection_id', $connection->id)
+            ->where('user_id', $userId)
+            ->firstOrFail();
+
+        $this->resetErrorBag();
+
+        $grants->revoke($connection, User::withTrashed()->findOrFail($userId), auth()->user());
     }
 
     private function resetForm(): void
@@ -438,6 +496,9 @@ class Index extends Component
             'connections' => $connections,
             'developers' => $team->users()->wherePivot('role', TeamRole::Developer->value)->orderBy('name')->get(),
             'drivers' => DbDriver::cases(),
+            'replacementSummary' => $this->replacementSummary(),
+            'durationPresets' => self::DURATION_PRESETS,
+            'durationUnits' => array_keys(self::DURATION_UNITS),
             // Which PEMs are already stored for the connection being edited
             // (the PEM text itself is never sent back to the browser).
             'storedPem' => collect(Connection::TLS_PEM_KINDS)
@@ -448,5 +509,19 @@ class Index extends Component
             // not refuse the save.
             'sqliteDirUnrestricted' => blank(config('queryproxy.sqlite_allowed_dir')),
         ]);
+    }
+
+    /** What the panel's settings would give, in the words of ConnectionGrant::describe(). */
+    private function replacementSummary(): string
+    {
+        $level = GrantAccessLevel::tryFrom($this->grantLevel)?->value ?? 'unknown';
+
+        $period = match (true) {
+            $this->grantDuration === 'permanent' => ', permanent',
+            $this->grantDuration === 'custom' => ' for '.trim($this->grantCustomAmount).' '.$this->grantCustomUnit,
+            default => ' for '.(self::DURATION_PRESETS[(int) $this->grantDuration] ?? 'an unknown period'),
+        };
+
+        return $level.' access'.$period;
     }
 }

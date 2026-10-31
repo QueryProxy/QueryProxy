@@ -231,18 +231,110 @@
                     <tr class="bg-canvas">
                         <td colspan="6" class="border-b border-line px-3.5 py-3.5">
                             <p class="eyebrow mb-2.5">Developer access to “{{ $connection->name }}”</p>
-                            <div class="flex flex-wrap gap-x-5 gap-y-2">
-                                @forelse ($developers as $developer)
-                                    <label class="inline-flex items-center gap-2 text-[12.5px] text-ink-3">
-                                        <x-ui.checkbox wire:change="toggleGrant({{ $connection->id }}, {{ $developer->id }})"
-                                                       @checked($connection->grantedUsers->contains($developer)) />
-                                        {{ $developer->name }}
-                                        <span class="font-mono text-[11px] text-mute-4">{{ $developer->email }}</span>
-                                    </label>
-                                @empty
-                                    <p class="text-[12.5px] text-mute-4">This team has no developers yet.</p>
-                                @endforelse
+
+                            <div class="mb-3.5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                                <x-ui.field label="Access level" for="grant-level" :error="$errors->first('grantLevel')">
+                                    <x-ui.select id="grant-level" wire:model.live="grantLevel">
+                                        @foreach (\App\Enums\GrantAccessLevel::cases() as $level)
+                                            <option value="{{ $level->value }}">{{ $level->label() }}{{ $level->allowsWrite() ? ' (writes and DDL, each request still approved)' : ' (SELECT only)' }}</option>
+                                        @endforeach
+                                    </x-ui.select>
+                                </x-ui.field>
+
+                                <x-ui.field label="For how long" for="grant-duration" :error="$errors->first('grantDuration')">
+                                    <x-ui.select id="grant-duration" wire:model.live="grantDuration">
+                                        <option value="permanent">Permanent</option>
+                                        @foreach ($durationPresets as $minutes => $label)
+                                            <option value="{{ $minutes }}">{{ $label }}</option>
+                                        @endforeach
+                                        <option value="custom">Custom…</option>
+                                    </x-ui.select>
+                                </x-ui.field>
+
+                                @if ($grantDuration === 'custom')
+                                    <div class="flex gap-2.5">
+                                        <x-ui.field label="Amount" for="grant-custom-amount" class="w-24 shrink-0">
+                                            <x-ui.input id="grant-custom-amount" type="number" min="1" step="1" inputmode="numeric" wire:model.live="grantCustomAmount" />
+                                        </x-ui.field>
+                                        <x-ui.field label="Unit" for="grant-custom-unit" class="flex-1">
+                                            <x-ui.select id="grant-custom-unit" wire:model.live="grantCustomUnit">
+                                                @foreach ($durationUnits as $unit)
+                                                    <option value="{{ $unit }}">{{ ucfirst($unit) }}</option>
+                                                @endforeach
+                                            </x-ui.select>
+                                        </x-ui.field>
+                                    </div>
+                                @endif
+
+                                <x-ui.field label="Reason" hint="optional" for="grant-reason">
+                                    <x-ui.input id="grant-reason" type="text" wire:model="grantReason" maxlength="1000" placeholder="e.g. incident 4711" />
+                                </x-ui.field>
                             </div>
+
+                            <p class="mb-2.5 text-[12px] text-mute-3">
+                                The buttons below use these settings. Granting to a developer who already has access replaces that grant. Timed access ends on its own; times are shown as of the last refresh of this page.
+                            </p>
+
+                            @error('grant')
+                                <x-ui.alert tone="danger" icon="alert" role="alert" class="mb-2.5">{{ $message }}</x-ui.alert>
+                            @enderror
+
+                            <ul class="flex flex-col">
+                                @forelse ($developers as $developer)
+                                    @php($grant = $connection->grantedUsers->firstWhere('id', $developer->id)?->pivot)
+
+                                    <li wire:key="grant-{{ $connection->id }}-{{ $developer->id }}"
+                                        class="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-line py-2 first:border-t-0">
+                                        <div class="min-w-0 basis-52 flex-1">
+                                            <span class="text-[12.5px] text-ink-3">{{ $developer->name }}</span>
+                                            <span class="block truncate font-mono text-[11px] text-mute-4">{{ $developer->email }}</span>
+                                        </div>
+
+                                        <div class="flex min-w-[10rem] items-center gap-2">
+                                            @if ($grant)
+                                                <x-ui.badge :tone="$grant->access_level->value">{{ $grant->access_level->label() }}</x-ui.badge>
+                                                @if ($grant->isPermanent())
+                                                    <span class="font-mono text-[11px] text-mute-3">permanent</span>
+                                                @else
+                                                    <span class="font-mono text-[11px] text-mute-3"
+                                                          title="until {{ $grant->expires_at->copy()->utc()->format('Y-m-d H:i') }} UTC">
+                                                        {{ $grant->remaining() }} left
+                                                    </span>
+                                                @endif
+                                            @else
+                                                <span class="font-mono text-[11px] text-mute-4">no access</span>
+                                            @endif
+                                        </div>
+
+                                        <div class="flex items-center gap-2.5">
+                                            @if ($grant)
+                                                <x-ui.btn size="sm" wire:click="startReplace({{ $connection->id }}, {{ $developer->id }})"
+                                                          aria-label="Replace the grant of {{ $developer->name }}">Replace grant</x-ui.btn>
+                                                <x-ui.action wire:click="revokeGrant({{ $connection->id }}, {{ $developer->id }})"
+                                                             wire:confirm="Revoke {{ $developer->name }}'s access to {{ $connection->name }}?"
+                                                             aria-label="Revoke access of {{ $developer->name }}" tone="danger">Revoke</x-ui.action>
+                                            @else
+                                                <x-ui.btn size="sm" wire:click="grantAccess({{ $connection->id }}, {{ $developer->id }})"
+                                                          wire:loading.attr="disabled" wire:target="grantAccess({{ $connection->id }}, {{ $developer->id }})"
+                                                          aria-label="Grant access to {{ $developer->name }}">Grant access</x-ui.btn>
+                                            @endif
+                                        </div>
+
+                                        @if ($grant && $replacingKey === $connection->id.':'.$developer->id)
+                                            <div class="flex basis-full flex-wrap items-center gap-x-3 gap-y-2" role="group" aria-label="Confirm replacing the grant of {{ $developer->name }}">
+                                                <x-ui.alert tone="pending" icon="alert" class="min-w-0 flex-1">
+                                                    Replace {{ $grant->describe() }} with {{ $replacementSummary }} for {{ $developer->name }}? The old grant is gone as soon as you confirm.
+                                                </x-ui.alert>
+                                                <x-ui.btn size="sm" variant="primary" wire:click="grantAccess({{ $connection->id }}, {{ $developer->id }})"
+                                                          wire:loading.attr="disabled" wire:target="grantAccess({{ $connection->id }}, {{ $developer->id }})">Confirm replace</x-ui.btn>
+                                                <x-ui.btn size="sm" wire:click="cancelReplace">Cancel</x-ui.btn>
+                                            </div>
+                                        @endif
+                                    </li>
+                                @empty
+                                    <li class="text-[12.5px] text-mute-4">This team has no developers yet.</li>
+                                @endforelse
+                            </ul>
                         </td>
                     </tr>
                 @endif
