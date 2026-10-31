@@ -6,7 +6,42 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
+## [0.4.0] - 2026-10-31
+
+Step-by-step upgrade and rollback instructions, with the migration list, are
+on the [upgrading page](https://queryproxy.com/docs/upgrading/). Upgrade from
+0.3.3, the tested starting point: the container runs five new migrations on
+start (`2026_10_26_000001`, `2026_10_26_000010`, `2026_10_26_000011`,
+`2026_10_26_000020` and `2026_10_31_072351`), so back up the data volume and
+the application database first. Every new setting is optional and every
+feature is off or empty until you use it: `QUERYPROXY_OIDC_*` (single
+sign-on), `QUERYPROXY_LOCAL_LOGIN`, `QUERYPROXY_API_TOKEN_MAX_DAYS`,
+and `QUERYPROXY_API_RATE_LIMIT`. Keep the scheduler running: it now
+removes expired connection grants every minute.
+Three changes below are listed as **Breaking**; read them before you
+upgrade.
+
+### Breaking (0.4.0)
+
+- **`users.password` can be empty.** SSO-only accounts have no local password,
+  and `users` gains `auth_provider`, `external_issuer` and `external_id`. A
+  script or integration that reads the `users` table directly must expect an
+  empty password. Changing `QUERYPROXY_OIDC_ISSUER` later does not carry
+  existing SSO accounts over: they are tied to the old issuer and are refused
+  rather than taken over by e-mail. No password can be set for an account
+  without one through the reset link. Migration `2026_10_26_000001` adds the
+  columns; rolling it back stops while such accounts exist.
+- **`connection_user` has new columns:** `expires_at`, `granted_by`, `reason`
+  and `access_level`. Existing rows stay permanent and `write`. A script that
+  inserts grant rows without them gets the same defaults, and a row whose
+  `expires_at` has passed no longer gives access. Migration
+  `2026_10_26_000010` adds the columns; rolling it back stops while a timed or
+  `read` grant exists.
+- **`QUERYPROXY_LOCAL_LOGIN` is new.** The default `all` changes nothing, but
+  an unknown value (a typo, for example) is treated as `admins_only`, which
+  limits password login to system administrators.
+
+### Added (0.4.0)
 
 - **`php artisan queryproxy:migrate-appdb --to=<dsn>` moves the application
   database to another server.** It is meant for installations that started on
@@ -150,7 +185,10 @@ All notable changes to QueryProxy are documented here. The format follows
   human approval, an approval that would be an override is refused with `403`
   and a link to the web form, and a token can never approve its owner's own
   request. Column names of a result are result data: an auditor does not get
-  them. Each token is limited to `QUERYPROXY_API_RATE_LIMIT` calls per minute
+  them. A user the `QUERYPROXY_REQUIRE_2FA` policy covers cannot create a
+  token until they have enrolled, and an existing token of such a user is
+  answered with `401` until then; the token is kept and works again afterwards.
+  Each token is limited to `QUERYPROXY_API_RATE_LIMIT` calls per minute
   (default 60), and failed authentications are limited per address to the same
   number. Token creation and revocation are audited as `token.created` and
   `token.revoked`; API submissions, approvals, rejections, cancellations and
@@ -174,8 +212,8 @@ All notable changes to QueryProxy are documented here. The format follows
   or who turned the event off, before the worker sends the e-mail gets none.
   A mail failure never blocks the request: it is logged, and on a real queue
   the job also lands in `failed_jobs` so `queue:retry` can resend it. With
-  `MAIL_MAILER=log` the Profile page says that nothing is delivered. Run
-  `php artisan migrate` (adds `users.notification_preferences`).
+  `MAIL_MAILER=log` the Profile page says that nothing is delivered. The
+  migration adds `users.notification_preferences`.
 - **Create and revoke API tokens on the Profile page.** A new "API tokens"
   section lets you name a personal access token, choose its scopes and set
   how many days it lasts (required, up to `QUERYPROXY_API_TOKEN_MAX_DAYS`,
@@ -193,23 +231,16 @@ All notable changes to QueryProxy are documented here. The format follows
   a DBA or developer role, and `results:read` is not offered to auditors.
   Creating and revoking are audited as before.
 
-### Changed
+### Changed (0.4.0)
 
 - **A pre-release no longer moves `latest`.** A pre-release tag such as
   `v0.4.0-rc.1` now publishes only its version tag; `latest` stays on the
   most recently published stable release.
-- **`users.password` can be empty, and users have an `auth_provider`, an
-  `external_issuer` and an `external_id`.** Changing `QUERYPROXY_OIDC_ISSUER`
-  later does not carry existing SSO accounts over: they are tied to the old
-  issuer and are refused rather than taken over by e-mail. Migration `2026_10_26_000001` adds the columns; accounts that
-  sign in through SSO have no local password, so no password can be set for them
-  through the reset link. Rolling the migration back stops while such accounts
-  exist.
 - **SSO users are outside `QUERYPROXY_REQUIRE_2FA`.** Their second factor is the
   identity provider's, so enforce MFA there. A local account that was linked to
   the provider and still signs in with its password stays covered.
 
-### Security
+### Security (0.4.0)
 
 - **The release workflow refuses tags users could not verify.** A tag that
   matches the `v*.*.*` trigger but not the certificate identity in
@@ -1217,7 +1248,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...v0.3.1

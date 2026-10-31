@@ -315,7 +315,7 @@ docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
 docker run -d --name queryproxy -p 7432:7432 \
   --env-file queryproxy.env \
   -v queryproxy-data:/var/www/html/storage/app \
-  queryproxy/queryproxy:0.3.3
+  queryproxy/queryproxy:0.4.0
 ```
 
 ## Verifying Releases
@@ -352,7 +352,7 @@ All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
 ## Project Status
 
-**Beta.** QueryProxy is at version 0.3.3; breaking changes can land in any 0.y
+**Beta.** QueryProxy is at version 0.4.0; breaking changes can land in any 0.y
 release and are listed in the [changelog](CHANGELOG.md).
 
 ## Contributing
