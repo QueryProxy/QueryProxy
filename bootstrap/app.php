@@ -6,18 +6,23 @@ use App\Http\Middleware\EnsureTeamRole;
 use App\Http\Middleware\EnsureUserIsActive;
 use App\Http\Middleware\RequireTwoFactor;
 use App\Http\Middleware\SecurityHeaders;
+use App\Http\Middleware\ThrottleFailedApiAuthentication;
 use App\Http\Middleware\VerifySlackSignature;
 use App\Http\Middleware\VerifyTeamsHmac;
+use Illuminate\Contracts\Auth\Middleware\AuthenticatesRequests;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Request;
 use Illuminate\Session\Middleware\AuthenticateSession;
 use Illuminate\Support\Facades\Route;
+use Laravel\Sanctum\Http\Middleware\CheckAbilities;
+use Laravel\Sanctum\Http\Middleware\CheckForAnyAbility;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
         web: __DIR__.'/../routes/web.php',
+        api: __DIR__.'/../routes/api.php',
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
         then: function (): void {
@@ -109,7 +114,17 @@ return Application::configure(basePath: dirname(__DIR__))
             '2fa.required' => RequireTwoFactor::class,
             'slack.signature' => VerifySlackSignature::class,
             'teams.hmac' => VerifyTeamsHmac::class,
+            'abilities' => CheckAbilities::class,
+            'ability' => CheckForAnyAbility::class,
         ]);
+
+        // Laravel sorts these by priority and runs authentication before anything
+        // that is not listed, so without this the 401s the API answers would never
+        // reach the middleware that counts them (ADR-024 rate limit).
+        $middleware->prependToPriorityList(
+            before: AuthenticatesRequests::class,
+            prepend: ThrottleFailedApiAuthentication::class,
+        );
 
         $middleware->validateCsrfTokens(except: [
             'webhooks/*',

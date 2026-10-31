@@ -180,6 +180,27 @@ jobs:
         if: ${{ failure() }}
         run: docker logs keycloak
 
+  # The REST API description (ADR-024). The spec is linted here; its agreement
+  # with the routes is checked by tests/Feature/Api/OpenApiSpecTest.php in the
+  # test matrix. Warnings fail the job too, and the linter is pinned so a new
+  # release cannot turn the job red on its own.
+  openapi:
+    name: openapi (spectral)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Lint docs/openapi.yaml
+        run: npx --yes @stoplight/spectral-cli@6.17.0 lint docs/openapi.yaml --fail-severity=warn
+
   test:
     needs: tests
     if: ${{ !cancelled() }}

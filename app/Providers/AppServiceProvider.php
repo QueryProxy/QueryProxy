@@ -7,6 +7,7 @@ use App\Http\Middleware\EnsureAdmin;
 use App\Http\Middleware\EnsureTeamRole;
 use App\Models\QueryRequest;
 use App\Models\User;
+use App\Services\Api\TokenService;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Database\LostConnectionDetector as LostConnectionDetectorContract;
@@ -19,6 +20,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
+use Laravel\Sanctum\Sanctum;
 use Livewire\Livewire;
 use Livewire\Mechanisms\HandleRequests\EndpointResolver;
 
@@ -93,6 +95,35 @@ class AppServiceProvider extends ServiceProvider
         RateLimiter::for('livewire', function (Request $request) {
             return Limit::perMinute(180)->by($request->user()?->id ?: $request->ip());
         });
+
+        // REST API (ADR-024): the budget is per token. Laravel runs authentication
+        // before throttling, so only authenticated calls get here; calls that fail
+        // to authenticate are counted per address by ThrottleFailedApiAuthentication.
+        RateLimiter::for('api', function (Request $request) {
+            return Limit::perMinute(max(1, (int) config('queryproxy.api.rate_limit_per_minute', 60)))
+                ->by('api-token:'.($request->user()?->currentAccessToken()?->id ?? $request->ip()));
+        });
+
+        // A token does not outlive the suspension or deletion of its owner:
+        // lifting a suspension (for example after an account takeover and a
+        // password reset) must not bring back a token the attacker may hold.
+        User::updated(function (User $user): void {
+            if ($user->wasChanged('suspended_at') && $user->isSuspended()) {
+                app(TokenService::class)->revokeAll($user, 'user_suspended');
+            }
+        });
+
+        User::deleted(fn (User $user) => app(TokenService::class)->revokeAll($user, 'user_deleted'));
+
+        // A token authenticates only while it has an expiry (TokenService always
+        // sets one; a row without one, however it got there, is refused) and its
+        // owner is not suspended. A deleted owner never resolves at all.
+        Sanctum::authenticateAccessTokensUsing(
+            fn ($accessToken, bool $isValid) => $isValid
+                && $accessToken->expires_at !== null
+                && $accessToken->tokenable instanceof User
+                && ! $accessToken->tokenable->isSuspended(),
+        );
 
         // Reuse Livewire's own update path so this replaces the default route
         // in place (rather than adding a second, un-throttled endpoint).

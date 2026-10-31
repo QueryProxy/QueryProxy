@@ -136,6 +136,23 @@ All notable changes to QueryProxy are documented here. The format follows
   reason for each grant, shows each developer's level and remaining time, and
   replaces or revokes an existing grant. The dashboard now also shows the
   confirmation after a DBA approves a request from it.
+- REST API under `/api/v1` (ADR-024): submit a query request, read its status
+  and its masked result (NDJSON, or CSV with `Accept: text/csv`), approve,
+  reject or cancel it, and list connections. Authentication uses Laravel
+  Sanctum personal access tokens (prefixed `qp_`) with the scopes
+  `requests:submit`, `requests:read`, `results:read` and `approvals:write`;
+  every token expires (`QUERYPROXY_API_TOKEN_MAX_DAYS`, default 90) and is
+  revoked when its owner is suspended or deleted. Requests still wait for
+  human approval, an approval that would be an override is refused with `403`
+  and a link to the web form, and a token can never approve its owner's own
+  request. Column names of a result are result data: an auditor does not get
+  them. Each token is limited to `QUERYPROXY_API_RATE_LIMIT` calls per minute
+  (default 60), and failed authentications are limited per address to the same
+  number. Token creation and revocation are audited as `token.created` and
+  `token.revoked`; API submissions, approvals, rejections, cancellations and
+  result reads carry `channel = api` in the audit log.
+- OpenAPI 3.1 description of the API in `docs/openapi.yaml`, linted by
+  Spectral in CI and checked against the routes by a test.
 
 ### Changed
 

@@ -310,6 +310,23 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | REST API (ADR-024)
+    |--------------------------------------------------------------------------
+    | /api/v1 is authenticated with personal access tokens. A token always
+    | expires: `token_max_days` is the longest lifetime one can be given (and
+    | the age after which any token stops working, whatever its own expiry);
+    | App\Services\Api\TokenService refuses a longer one. `rate_limit_per_minute`
+    | is the request budget of each token.
+    */
+
+    'api' => [
+        'token_max_days' => max(1, (int) env('QUERYPROXY_API_TOKEN_MAX_DAYS', 90)),
+
+        'rate_limit_per_minute' => max(1, (int) env('QUERYPROXY_API_RATE_LIMIT', 60)),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | SIEM sinks (ADR-021)
     |--------------------------------------------------------------------------
     | Every audit event can also be exported to external systems. All sinks are

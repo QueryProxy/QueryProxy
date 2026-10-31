@@ -58,6 +58,10 @@ enum AuditEvent: string
     case GrantRejected = 'grant.rejected';
     case GrantExpired = 'grant.expired';
 
+    // API tokens (ADR-024)
+    case TokenCreated = 'token.created';
+    case TokenRevoked = 'token.revoked';
+
     // Masking
     case MaskingRuleCreated = 'masking_rule.created';
     case MaskingRuleUpdated = 'masking_rule.updated';
@@ -132,6 +136,9 @@ enum AuditEvent: string
             self::GrantRejected => 'A DBA rejected an access request (metadata.grant_request_id, metadata.developer, metadata.reason).',
             self::GrantExpired => 'A time-bound grant ended and the scheduled job removed it (actor system; metadata.developer, metadata.access_level, metadata.expires_at). Access itself ended at expires_at; this record is written when the job runs.',
 
+            self::TokenCreated => 'A user created a personal access token for the REST API (metadata.token_id, metadata.name, metadata.scopes, metadata.expires_at). The token value is never recorded.',
+            self::TokenRevoked => 'A personal access token was revoked (metadata.token_id, metadata.name). When it was revoked because its owner was suspended or deleted, the actor is the administrator who did it and metadata.owner_id and metadata.reason (user_suspended | user_deleted) are set.',
+
             self::MaskingRuleCreated => 'A masking rule was created.',
             self::MaskingRuleUpdated => 'A masking rule was changed.',
             self::MaskingRuleToggled => 'A masking rule was enabled or disabled.',
@@ -147,17 +154,17 @@ enum AuditEvent: string
             self::ChatIdentityLinked => 'A chat identity was linked to a user.',
             self::ChatIdentityRemoved => 'A chat identity was unlinked from a user.',
 
-            self::RequestSubmitted => 'A query request was submitted for approval.',
+            self::RequestSubmitted => 'A query request was submitted for approval (metadata.channel = web | api).',
             self::RequestApproved => 'A query request was approved (metadata.override marks an admin override; an override always carries metadata.reason).',
             self::RequestRejected => 'A query request was rejected, with channel and reason.',
-            self::RequestCancelled => 'A pending query request was cancelled (by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
+            self::RequestCancelled => 'A pending query request was cancelled (metadata.channel = web | api when a user did it; by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
             self::RequestExecutionStarted => 'Execution of an approved request started.',
             self::RequestExecutionCompleted => 'Execution of a request completed.',
             self::RequestExecutionFailed => 'Execution of a request failed (masked error message; metadata.refused_by = guard when a read request carried a write statement).',
             self::RequestExecutionDeferred => 'An approved request was put back on the queue because every slot of its connection was busy.',
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
             self::ExecutionCancelled => 'A user stopped a running request: the database was asked to cancel the statement (metadata.signalled tells whether it was reached; metadata.duration_ms is the run time so far).',
-            self::ResultDownloaded => 'The stored result of a request was downloaded.',
+            self::ResultDownloaded => 'The stored result of a request was downloaded (since v0.4.0 the REST API records metadata.channel = api and metadata.format).',
         };
     }
 
