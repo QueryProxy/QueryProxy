@@ -26,8 +26,8 @@
 use App\Models\AuditLog;
 use App\Models\Team;
 use App\Models\User;
-use GuzzleHttp\Cookie\CookieJar;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Testing\TestResponse;
@@ -92,9 +92,95 @@ function keycloakResetMembership(): void
 }
 
 /**
+ * A browser, as far as Keycloak's login pages are concerned: it keeps the
+ * cookies a response sets and sends them back, and it never follows redirects.
+ *
+ * Guzzle's own CookieJar is not used on purpose. Keycloak 26 treats
+ * http://localhost as a secure context (as browsers do) and marks its cookies
+ * `Secure`; Guzzle holds a Secure cookie back on any http:// URL, so the login
+ * form was posted without AUTH_SESSION_ID and Keycloak answered 400 "Cookie not
+ * found". Here every cookie goes back to the host it came from, whatever its
+ * flags, which is what a browser does for localhost.
+ */
+final class KeycloakBrowser
+{
+    /** @var array<string, string> cookie name => value */
+    private array $cookies = [];
+
+    public function get(string $url): Response
+    {
+        return $this->send(fn ($request) => $request->get($url));
+    }
+
+    /** @param array<string, string> $form */
+    public function submit(string $url, array $form): Response
+    {
+        return $this->send(fn ($request) => $request->asForm()->post($url, $form));
+    }
+
+    /** What went wrong in a page that was not what we expected: no cookie values, no secrets. */
+    public function describe(Response $response): string
+    {
+        $text = (string) preg_replace('#<(script|style|head)\b.*?</\1>#si', ' ', $response->body());
+        $text = trim((string) preg_replace('/\s+/', ' ', html_entity_decode(strip_tags($text))));
+
+        $setCookies = array_map(function (string $header) {
+            $parts = array_map('trim', explode(';', $header));
+
+            return explode('=', $parts[0], 2)[0].' ['.implode('; ', array_slice($parts, 1)).']';
+        }, $response->toPsrResponse()->getHeader('Set-Cookie'));
+
+        return sprintf(
+            "HTTP %d. Page text: %s\nCookies held (names only): %s\nSet-Cookie of this response: %s",
+            $response->status(),
+            substr($text, 0, 500),
+            implode(', ', array_keys($this->cookies)) ?: '(none)',
+            implode(' | ', $setCookies) ?: '(none)',
+        );
+    }
+
+    private function send(callable $call): Response
+    {
+        $request = Http::withOptions(['allow_redirects' => false]);
+
+        if ($this->cookies !== []) {
+            $request = $request->withHeaders(['Cookie' => implode('; ', array_map(
+                fn (string $name, string $value) => $name.'='.$value,
+                array_keys($this->cookies),
+                $this->cookies,
+            ))]);
+        }
+
+        $response = $call($request);
+
+        foreach ($response->toPsrResponse()->getHeader('Set-Cookie') as $header) {
+            $this->remember($header);
+        }
+
+        return $response;
+    }
+
+    private function remember(string $header): void
+    {
+        $parts = array_map('trim', explode(';', $header));
+        [$name, $value] = array_pad(explode('=', array_shift($parts), 2), 2, '');
+
+        $expired = $value === '' || array_filter($parts, fn (string $attribute) => preg_match('/^max-age=0*$/i', $attribute)) !== [];
+
+        if ($expired) {
+            unset($this->cookies[$name]);
+
+            return;
+        }
+
+        $this->cookies[$name] = $value;
+    }
+}
+
+/**
  * One complete browser sign-in as alice: the redirect the application gives,
  * Keycloak's login form, the credentials, and the callback back to the
- * application. A fresh cookie jar every time, so Keycloak always shows its form.
+ * application. A fresh browser every time, so Keycloak always shows its form.
  */
 function keycloakSignIn(): TestResponse
 {
@@ -103,25 +189,24 @@ function keycloakSignIn(): TestResponse
 
     expect($authorizationUrl)->toStartWith(keycloakIssuer().'/protocol/openid-connect/auth');
 
-    $jar = new CookieJar;
-    $browser = fn () => Http::withOptions(['cookies' => $jar, 'allow_redirects' => false]);
+    $browser = new KeycloakBrowser;
 
-    $page = $browser()->get($authorizationUrl);
-    test()->assertSame(200, $page->status(), 'Keycloak did not show its login page: '.substr($page->body(), 0, 300));
+    $page = $browser->get($authorizationUrl);
+    test()->assertSame(200, $page->status(), 'Keycloak did not show its login page. '.$browser->describe($page));
 
-    test()->assertSame(1, preg_match('/<form\b[^>]*\bid="kc-form-login"[^>]*>/s', $page->body(), $form), 'No login form on the Keycloak page.');
+    test()->assertSame(1, preg_match('/<form\b[^>]*\bid="kc-form-login"[^>]*>/s', $page->body(), $form), 'No login form on the Keycloak page. '.$browser->describe($page));
     test()->assertSame(1, preg_match('/\baction="([^"]+)"/', $form[0], $action));
 
-    $submitted = $browser()->asForm()->post(html_entity_decode($action[1]), [
+    $submitted = $browser->submit(html_entity_decode($action[1]), [
         'username' => 'alice',
         'password' => 'alice-password',
         'credentialId' => '',
     ]);
 
-    test()->assertSame(302, $submitted->status(), 'Keycloak did not accept the login: '.substr($submitted->body(), 0, 300));
+    test()->assertSame(302, $submitted->status(), 'Keycloak did not accept the login. '.$browser->describe($submitted));
 
     $callback = parse_url($submitted->header('Location'));
-    expect($callback['path'])->toBe('/auth/oidc/callback');
+    test()->assertSame('/auth/oidc/callback', $callback['path'] ?? null, 'Keycloak redirected somewhere unexpected: '.$submitted->header('Location'));
 
     return test()->get($callback['path'].'?'.$callback['query']);
 }
