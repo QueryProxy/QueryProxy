@@ -3,11 +3,14 @@
 namespace App\Livewire\Connections;
 
 use App\Enums\DbDriver;
+use App\Enums\GrantAccessLevel;
 use App\Enums\TeamRole;
 use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\Team;
 use App\Services\Connections\DynamicConnectionFactory;
+use App\Services\Connections\GrantException;
+use App\Services\Connections\GrantService;
 use App\Services\Connections\TlsPemStore;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
@@ -371,20 +374,46 @@ class Index extends Component
         $this->grantsForId = $this->grantsForId === $connectionId ? null : $connectionId;
     }
 
-    public function toggleGrant(int $connectionId, int $userId): void
+    /**
+     * Grant a team developer access, or revoke it when they hold one now.
+     * Without $durationMinutes a new grant is permanent; with it the grant
+     * ends after that many minutes (ADR-025).
+     */
+    public function toggleGrant(int $connectionId, int $userId, ?int $durationMinutes = null, string $accessLevel = 'write'): void
     {
         $team = $this->team();
         $connection = Connection::forTeam($team)->findOrFail($connectionId);
         $this->authorize('update', $connection);
 
         $developer = $team->users()->wherePivot('role', TeamRole::Developer->value)->findOrFail($userId);
+        $grants = app(GrantService::class);
+
+        $this->resetErrorBag('grant');
 
         if ($connection->isGrantedTo($developer)) {
-            $connection->grantedUsers()->detach($developer->id);
-            audit()->record('connection.grant_revoked', connection: $connection, metadata: ['developer' => $developer->email]);
-        } else {
-            $connection->grantedUsers()->attach($developer->id);
-            audit()->record('connection.grant_added', connection: $connection, metadata: ['developer' => $developer->email]);
+            $grants->revoke($connection, $developer, auth()->user());
+
+            return;
+        }
+
+        $level = GrantAccessLevel::tryFrom($accessLevel);
+
+        if ($level === null) {
+            $this->addError('grant', 'Unknown access level.');
+
+            return;
+        }
+
+        try {
+            $grants->grant(
+                $connection,
+                $developer,
+                auth()->user(),
+                $durationMinutes === null ? null : $grants->expiryAfter($durationMinutes),
+                $level,
+            );
+        } catch (GrantException $e) {
+            $this->addError('grant', $e->getMessage());
         }
     }
 

@@ -73,9 +73,19 @@ class User extends Authenticatable
             ->withTimestamps();
     }
 
+    /**
+     * Connections the user holds a grant for that is still in force: permanent,
+     * or not yet expired (ADR-025), as Connection::grantedUsers() counts them.
+     */
     public function grantedConnections(): BelongsToMany
     {
-        return $this->belongsToMany(Connection::class)->withTimestamps();
+        return $this->belongsToMany(Connection::class)
+            ->using(ConnectionGrant::class)
+            ->withPivot(['expires_at', 'granted_by', 'reason', 'access_level'])
+            ->withTimestamps()
+            ->where(fn ($query) => $query
+                ->whereNull('connection_user.expires_at')
+                ->orWhere('connection_user.expires_at', '>', now()));
     }
 
     public function isAdmin(): bool

@@ -4,9 +4,12 @@ namespace App\Services\Chat;
 
 use App\Enums\ChatProvider;
 use App\Enums\ChatSqlMode;
+use App\Enums\GrantRequestStatus;
 use App\Enums\QueryRequestStatus;
 use App\Models\ChatApprovalToken;
 use App\Models\ChatIntegration;
+use App\Models\ConnectionGrant;
+use App\Models\ConnectionGrantRequest;
 use App\Models\QueryRequest;
 use App\Services\Sql\SqlRedactor;
 use Illuminate\Support\Facades\Http;
@@ -87,9 +90,64 @@ class ChatNotifier
             $request->reviewer?->name ?? 'a reviewer',
         );
 
-        foreach ($this->integrations($request) as $integration) {
+        $this->postText($request->team_id, $text);
+    }
+
+    /**
+     * A developer asked for time-bound access (ADR-025). Text only, with no
+     * action buttons: the DBA decides in the web UI. The free-text reason is
+     * left out on purpose; the DBA reads it in the app. Names are escaped for
+     * Slack in postText().
+     */
+    public function grantRequested(ConnectionGrantRequest $grantRequest): void
+    {
+        $this->postText($grantRequest->team_id, sprintf(
+            '🔑 %s asked for %s access to %s for %s. Decide in QueryProxy.',
+            $grantRequest->requester->name,
+            $grantRequest->access_level->value,
+            $grantRequest->connection->name,
+            $grantRequest->durationLabel(),
+        ));
+    }
+
+    /**
+     * The DBA's decision on an access request (ADR-025). $grant is the grant
+     * as stored after an approval, so the message states what is in force
+     * (an earlier, wider grant is never shortened by an approval).
+     */
+    public function grantDecided(ConnectionGrantRequest $grantRequest, ?ConnectionGrant $grant = null): void
+    {
+        $approved = $grantRequest->status === GrantRequestStatus::Approved;
+
+        $this->postText($grantRequest->team_id, sprintf(
+            '%s Access request #%d (%s, %s) by %s was %s by %s%s.',
+            $approved ? '✅' : '⛔',
+            $grantRequest->id,
+            $grantRequest->connection->name,
+            $grantRequest->access_level->value,
+            $grantRequest->requester->name,
+            $approved ? 'approved' : 'rejected',
+            $grantRequest->decider?->name ?? 'a reviewer',
+            $approved && $grant !== null ? '; now in force: '.$grant->describe() : '',
+        ));
+    }
+
+    /**
+     * One plain-text message to every enabled integration of the team. Slack
+     * reads `<!channel>` and similar in a message, so the three characters
+     * Slack documents as control characters are escaped there; a user name
+     * cannot raise a mention.
+     */
+    private function postText(int $teamId, string $text): void
+    {
+        $integrations = ChatIntegration::query()
+            ->where('team_id', $teamId)
+            ->where('enabled', true)
+            ->get();
+
+        foreach ($integrations as $integration) {
             $payload = match (true) {
-                $integration->provider === ChatProvider::Slack => ['text' => $text],
+                $integration->provider === ChatProvider::Slack => ['text' => str_replace(['&', '<', '>'], ['&amp;', '&lt;', '&gt;'], $text)],
                 $this->usesAdaptiveCard($integration) => $this->adaptiveMessage([
                     ['type' => 'TextBlock', 'text' => $text, 'wrap' => true],
                 ], $text),

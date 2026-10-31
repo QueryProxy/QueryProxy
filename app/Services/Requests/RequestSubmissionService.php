@@ -4,6 +4,7 @@ namespace App\Services\Requests;
 
 use App\Enums\AuditEvent;
 use App\Enums\QueryRequestStatus;
+use App\Enums\StatementType;
 use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\User;
@@ -35,7 +36,8 @@ class RequestSubmissionService
      * @param  string|null  $reason  Free-text note for the approver.
      * @param  string  $channel  Where the submission came from; recorded in the audit entry.
      *
-     * @throws AuthorizationException when the user may not use the connection, or is suspended or deleted
+     * @throws AuthorizationException when the user may not use the connection (no grant in force, or a
+     *                                read-only grant and a write statement), or is suspended or deleted
      * @throws RequestSubmissionException when the SQL guard refuses the statement
      */
     public function submit(
@@ -57,6 +59,11 @@ class RequestSubmissionService
             $this->metrics->guardRejected($result->violations);
 
             throw new RequestSubmissionException($result->violations);
+        }
+
+        // A read-only grant (ADR-025) cannot file a write or DDL request.
+        if ($result->type() === StatementType::Write || $result->hasDdl()) {
+            Gate::forUser($user)->authorize('write', $connection);
         }
 
         // A warning for the approver only: a failure here must never stop the submission.

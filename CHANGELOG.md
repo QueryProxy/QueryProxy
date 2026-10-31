@@ -96,6 +96,32 @@ All notable changes to QueryProxy are documented here. The format follows
   settings, including S3-compatible endpoints) and the `predis` Redis client
   (`REDIS_CLIENT=predis`, for cache, queue and sessions). Both are optional;
   the default setup is unchanged.
+- **Time-bound connection grants.** A DBA can give a developer access to a
+  connection for a period ("4 hours, read-only") instead of until someone
+  remembers to remove it, and a developer can ask for such access with a
+  reason; a DBA of the team approves or rejects the request. The grant starts
+  when it is approved. Nobody decides their own request, not even a DBA the
+  requester became while it was open. `connection_user` gains `expires_at`,
+  `granted_by`, `reason` and `access_level` (`read` or `write`); existing
+  grants stay permanent with full access. Access ends at `expires_at` (an
+  expired grant is ignored at once), and the new `connections:expire-grants`
+  command, scheduled every minute, removes the rows and records
+  `grant.expired`. A `read` grant cannot file a request the SQL guard
+  classifies as a write or DDL: the studio answers 403. Requests that were
+  already pending or approved when a grant ends are not cancelled.
+  A request must match the grant the developer already holds: a request for
+  another access level than the grant in force, or for any level while a
+  permanent grant of that level exists, is refused when it is filed and when
+  it is approved, so a time-bound approval never replaces or widens standing
+  access. An approval for the same level only extends a time-bound grant; it
+  never shortens it or makes it permanent. To change an existing grant, a DBA
+  edits it directly. DBAs are notified in the app and in the team's
+  Slack/Teams channels (without the free-text reason); the requester is told the decision and the grant that is
+  in force. New audit events: `grant.requested`, `grant.approved`,
+  `grant.rejected` and `grant.expired` (ADR-025). Removing a grant by hand
+  still records `connection.grant_revoked`, and `connection.grant_added` now
+  carries `access_level`, `expires_at` and `reason` in its metadata. The
+  screens for requesting and deciding follow in a later change.
 
 ### Changed
 

@@ -52,6 +52,12 @@ enum AuditEvent: string
     case ConnectionGrantAdded = 'connection.grant_added';
     case ConnectionGrantRevoked = 'connection.grant_revoked';
 
+    // Time-bound grants (ADR-025)
+    case GrantRequested = 'grant.requested';
+    case GrantApproved = 'grant.approved';
+    case GrantRejected = 'grant.rejected';
+    case GrantExpired = 'grant.expired';
+
     // Masking
     case MaskingRuleCreated = 'masking_rule.created';
     case MaskingRuleUpdated = 'masking_rule.updated';
@@ -118,8 +124,13 @@ enum AuditEvent: string
             self::ConnectionUpdated => 'A database connection was changed.',
             self::ConnectionDeleted => 'A database connection was deleted.',
             self::ConnectionTested => 'A database connection was tested.',
-            self::ConnectionGrantAdded => 'A developer was granted access to a connection.',
-            self::ConnectionGrantRevoked => 'A developer lost access to a connection.',
+            self::ConnectionGrantAdded => 'A DBA granted a developer access to a connection (metadata.developer, metadata.access_level = read|write, metadata.expires_at is null for a permanent grant, metadata.reason).',
+            self::ConnectionGrantRevoked => 'A DBA removed a developer\'s access to a connection by hand (since v0.4.0 metadata.developer, metadata.access_level, metadata.expires_at, metadata.was_expired). Grants that end by time are recorded as grant.expired.',
+
+            self::GrantRequested => 'A developer asked for time-bound access to a connection (metadata.grant_request_id, metadata.access_level, metadata.duration_minutes, metadata.reason).',
+            self::GrantApproved => 'A DBA approved an access request; the grant starts now (metadata.grant_request_id, metadata.developer, metadata.access_level, metadata.expires_at, metadata.duration_minutes).',
+            self::GrantRejected => 'A DBA rejected an access request (metadata.grant_request_id, metadata.developer, metadata.reason).',
+            self::GrantExpired => 'A time-bound grant ended and the scheduled job removed it (actor system; metadata.developer, metadata.access_level, metadata.expires_at). Access itself ended at expires_at; this record is written when the job runs.',
 
             self::MaskingRuleCreated => 'A masking rule was created.',
             self::MaskingRuleUpdated => 'A masking rule was changed.',
