@@ -4,6 +4,7 @@ namespace App\Models;
 
 use App\Enums\MailEvent;
 use App\Enums\TeamRole;
+use App\Support\SqlServerReferentialActions;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
@@ -25,6 +26,18 @@ class User extends Authenticatable
     public const PROVIDER_LOCAL = 'local';
 
     public const PROVIDER_OIDC = 'oidc';
+
+    protected static function booted(): void
+    {
+        // SQL Server only: the keys that would SET NULL on a hard delete cannot
+        // do so there (more than one cascade path), so it is done here. Users
+        // are soft deleted in normal use (ADR-018); this is for forceDelete().
+        static::forceDeleting(function (User $user) {
+            if (SqlServerReferentialActions::isSqlServer($user->getConnection())) {
+                SqlServerReferentialActions::releaseUserReferences($user->getConnection(), $user->id);
+            }
+        });
+    }
 
     protected function casts(): array
     {

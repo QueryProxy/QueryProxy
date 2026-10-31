@@ -115,8 +115,12 @@ application database.
 
 **Tested versions.** Target databases: PostgreSQL 17, MySQL 8.4, MariaDB 11.4
 and 11.8, SQL Server 2022 and SQLite. Application database: SQLite, MySQL 8.4,
-MariaDB 11.4 and 11.8, and PostgreSQL 17. Other versions may work but are not
-tested.
+MariaDB 11.4 and 11.8, PostgreSQL 17 and SQL Server 2022 (the `mssql` image
+variant; a raw SQL delete of a team or user is refused there only while a row
+references it through one of eight specific foreign keys (rows that cascade
+from it do not block it), see the [configuration
+guide](https://queryproxy.com/docs/configuration/#application-database)). Other
+versions may work but are not tested.
 
 **Without Docker.** You need PHP 8.3 or newer (with the pdo drivers for your target
 databases), Composer, and Node 20.19+ or 22.12+.
@@ -225,16 +229,15 @@ defends against and what stays with you. The default image ships `pdo_pgsql`,
 `pdo_mysql` and `pdo_sqlite`; for SQL Server targets use the `mssql` image
 variant (`queryproxy/queryproxy:<version>-mssql`), described in the
 [SQL Server section](https://queryproxy.com/docs/configuration/#sql-server-targets).
-To move the application database from SQLite to PostgreSQL or MySQL, see
-`php artisan queryproxy:migrate-appdb` in the
-[configuration guide](https://queryproxy.com/docs/configuration/#application-database).
+To move the application database from SQLite to PostgreSQL, MySQL, MariaDB or
+SQL Server, see `php artisan queryproxy:migrate-appdb` in the [configuration
+guide](https://queryproxy.com/docs/configuration/#application-database).
 Backups, upgrades and rollbacks are covered in [Upgrading](#upgrading), the
-[upgrade guide](https://queryproxy.com/docs/upgrading/) and the
-[backup guide](https://queryproxy.com/docs/backup-restore/). Run
-`php artisan queryproxy:doctor` (in Docker:
-`docker exec queryproxy php artisan queryproxy:doctor`) after every deploy; the
-[troubleshooting guide](https://queryproxy.com/docs/troubleshooting/) explains
-each check.
+[upgrade guide](https://queryproxy.com/docs/upgrading/) and the [backup
+guide](https://queryproxy.com/docs/backup-restore/). Run `php artisan
+queryproxy:doctor` (in Docker: `docker exec queryproxy php artisan
+queryproxy:doctor`) after every deploy; the [troubleshooting
+guide](https://queryproxy.com/docs/troubleshooting/) explains each check.
 
 ## Upgrading
 

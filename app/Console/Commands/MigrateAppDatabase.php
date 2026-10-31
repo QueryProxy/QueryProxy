@@ -58,6 +58,9 @@ class MigrateAppDatabase extends Command
     /** SQL Server allows 2100 parameters per statement; stay below it everywhere. */
     private const MAX_PARAMETERS = 2000;
 
+    /** SQL Server allows 1000 row value expressions per INSERT. */
+    private const MAX_ROWS_PER_INSERT = 500;
+
     /** @var list<string> */
     private array $secrets = [];
 
@@ -100,6 +103,10 @@ class MigrateAppDatabase extends Command
         $dryRun = (bool) $this->option('dry-run');
         $config = $this->targetConfig($dsn);
         $source = DB::connection($sourceName);
+
+        if (! in_array($source->getDriverName(), self::DRIVERS, true)) {
+            throw new RuntimeException("The source database driver [{$source->getDriverName()}] is not supported as an application database.");
+        }
 
         if ($this->isSameDatabase($source->getConfig(), $config)) {
             throw new RuntimeException('The source and the target are the same database.');
@@ -317,6 +324,12 @@ class MigrateAppDatabase extends Command
         $builder = $connection->getSchemaBuilder();
         $schema = $builder->getCurrentSchemaListing();
 
+        // SQL Server's builder has no schema list; its default schema (dbo) is
+        // what the application's tables live in.
+        if ($schema === null && $connection->getDriverName() === 'sqlsrv') {
+            $schema = [$builder->getCurrentSchemaName()];
+        }
+
         $names = array_column($builder->getTables($schema), 'name');
         sort($names);
 
@@ -429,9 +442,9 @@ class MigrateAppDatabase extends Command
         }
 
         $primary = $this->primaryKey($sourceSchema, $table);
-        $identity = $this->identityColumn($targetSchema, $table);
         $booleans = $target->getDriverName() === 'pgsql' ? $this->booleanColumns($targetSchema, $table) : [];
-        $perInsert = max(1, intdiv(self::MAX_PARAMETERS, count($columns)));
+        $identity = $this->identityColumn($targetSchema, $table);
+        $perInsert = max(1, min(self::MAX_ROWS_PER_INSERT, intdiv(self::MAX_PARAMETERS, count($columns))));
         $wrappedTable = $target->getQueryGrammar()->wrapTable($table);
 
         // Seeded by the migration; the source's row replaces it.
@@ -439,7 +452,10 @@ class MigrateAppDatabase extends Command
             $target->table($table)->delete();
         }
 
-        if ($identity !== null && $target->getDriverName() === 'sqlsrv') {
+        // SQL Server refuses explicit values for an IDENTITY column unless told.
+        $identityInsert = $identity !== null && $target->getDriverName() === 'sqlsrv';
+
+        if ($identityInsert) {
             $target->unprepared("SET IDENTITY_INSERT {$wrappedTable} ON");
         }
 
@@ -480,8 +496,13 @@ class MigrateAppDatabase extends Command
                 $copied += $rows->count();
             }
         } finally {
-            if ($identity !== null && $target->getDriverName() === 'sqlsrv') {
-                $target->unprepared("SET IDENTITY_INSERT {$wrappedTable} OFF");
+            if ($identityInsert) {
+                try {
+                    $target->unprepared("SET IDENTITY_INSERT {$wrappedTable} OFF");
+                } catch (Throwable) {
+                    // A failed statement may already have ended the session's
+                    // transaction; the original error is the one to report.
+                }
             }
         }
 

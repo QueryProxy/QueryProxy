@@ -1,5 +1,6 @@
 <?php
 
+use App\Support\SqlServerReferentialActions;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
@@ -15,7 +16,7 @@ return new class extends Migration
     {
         Schema::table('connection_user', function (Blueprint $table) {
             $table->timestamp('expires_at')->nullable()->index();
-            $table->foreignId('granted_by')->nullable()->constrained('users')->nullOnDelete();
+            SqlServerReferentialActions::nullOnDelete($table, $table->foreignId('granted_by')->nullable()->constrained('users'));
             $table->text('reason')->nullable();
             $table->string('access_level', 10)->default('write');
         });

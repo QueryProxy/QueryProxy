@@ -145,7 +145,7 @@ final class LiveAppDb
      * theirs from their environment). Creating it here, in the one place every
      * live test starts from, keeps the tests independent of the order they run in.
      */
-    private static function ensureDatabase(): void
+    public static function ensureDatabase(): void
     {
         if (self::driver() !== 'sqlsrv') {
             return;

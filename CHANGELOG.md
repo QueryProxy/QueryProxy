@@ -45,7 +45,7 @@ upgrade.
 
 - **`php artisan queryproxy:migrate-appdb --to=<dsn>` moves the application
   database to another server.** It is meant for installations that started on
-  the default SQLite file and now want PostgreSQL or MySQL
+  the default SQLite file and now want PostgreSQL, MySQL, MariaDB or SQL Server
   (`--to=pgsql://user:password@host:5432/queryproxy`; URL-encode special
   characters in the password). It runs the migrations on the target, copies
   every table in foreign key order in chunks (ids, audit hashes and the chain
@@ -68,6 +68,30 @@ upgrade.
   signed and attested like the default image. The Microsoft driver is under
   Microsoft's own licence (<https://aka.ms/odbc18eula>); using the variant
   means accepting it. The default image is unchanged.
+- **SQL Server is now supported as the application database.** The
+  application schema could not be created there: SQL Server refuses foreign
+  keys that give a table more than one cascade path, and the schema had
+  several. On SQL Server only, eight foreign keys are created with
+  `ON DELETE NO ACTION` (`query_requests.team_id`, `masking_rules.team_id`,
+  `connection_grant_requests.team_id`, `connections.created_by`,
+  `connection_user.granted_by`, `connection_grant_requests.decided_by`, and
+  the two `query_requests` keys to users that are `RESTRICT` on every driver
+  since ADR-018), and the application does what the database would have done
+  on a delete: deleting a team removes its requests, masking rules and grant
+  requests first, and hard deleting a user who has no requests sets the keys
+  that referenced them to NULL. Raw SQL that deletes a team or user is
+  refused on SQL Server only while rows still point at it through one of
+  those eight keys (for a team: requests, masking rules or grant requests;
+  for a user: connections it created, grants it gave, grant requests it
+  decided, or requests it filed or reviewed). For the six keys that cascade
+  or set NULL elsewhere, the delete is refused there instead of cascading or
+  setting NULL; the two request keys to users are refused on every driver.
+  Nothing changes on PostgreSQL,
+  MySQL, MariaDB or SQLite: no new migration, no change to an existing
+  installation, same delete results. Use the `:mssql` image (the default image
+  has no `pdo_sqlsrv`); `php artisan queryproxy:migrate-appdb
+  --to="sqlsrv://user:password@host:1433/queryproxy?trust_server_certificate=true"`
+  moves an installation there.
 - **CI tests the upgrade from the previous release.** The new `upgrade` job in
   the Integration workflow creates data on the 0.3.3 image, starts the image
   built from the branch on the same data volume, and checks that the data is

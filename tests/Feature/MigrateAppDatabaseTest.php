@@ -6,7 +6,9 @@ use App\Models\Team;
 use App\Models\User;
 use App\Services\Audit\AuditTriggers;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\Live\LiveAppDb;
 
 /**
@@ -281,6 +283,9 @@ it('moves the application database to a real server', function () {
 
     $config = LiveAppDb::connectionConfig();
 
+    // SQL Server starts without our database; the other live tests create it too.
+    LiveAppDb::ensureDatabase();
+
     if (! str_ends_with((string) $config['database'], '_test') && getenv(LiveAppDb::ENV_PREFIX.'ALLOW_ANY_DATABASE') !== '1') {
         throw new RuntimeException('Refusing to drop every table of a database whose name does not end in "_test".');
     }
@@ -313,9 +318,14 @@ it('moves the application database to a real server', function () {
     seedAppDatabase();
 
     try {
-        $this->artisan('queryproxy:migrate-appdb', ['--to' => $dsn, '--force' => true])
-            ->expectsOutputToContain('Audit chain intact: 3 records verified.')
-            ->assertExitCode(0);
+        // The command output is kept so that a red CI run shows why. The command
+        // never prints the password (it scrubs it), and the server is a throwaway one.
+        $output = new BufferedOutput;
+        $status = Artisan::call('queryproxy:migrate-appdb', ['--to' => $dsn, '--force' => true], $output);
+        $text = $output->fetch();
+
+        expect($status)->toBe(0, "queryproxy:migrate-appdb failed:\n{$text}")
+            ->and($text)->toContain('Audit chain intact: 3 records verified.');
 
         $live = DB::connection(LiveAppDb::CONNECTION);
 
@@ -332,6 +342,31 @@ it('moves the application database to a real server', function () {
         ]);
 
         expect($next)->toBeGreaterThan((int) DB::table('teams')->max('id'));
+
+        // Deleting works on the moved data. On SQL Server some foreign keys are
+        // NO ACTION (SqlServerReferentialActions) and the models do the rest.
+        $originalDefault = DB::getDefaultConnection();
+        DB::setDefaultConnection(LiveAppDb::CONNECTION);
+
+        try {
+            $admin = User::where('is_admin', true)->firstOrFail();
+            $live->table('connections')->update(['created_by' => $admin->id]);
+            $admin->forceDelete();
+
+            expect($live->table('connections')->whereNotNull('created_by')->count())->toBe(0)
+                ->and($live->table('users')->count())->toBe(DB::table('users')->count() - 1);
+
+            Team::where('slug', '!=', 'after-the-move')->orderBy('id')->firstOrFail()->delete();
+
+            foreach (['team_user', 'connections', 'connection_user', 'query_requests', 'masking_rules', 'connection_grant_requests', 'chat_approval_tokens'] as $table) {
+                expect($live->table($table)->count())->toBe(0, $table);
+            }
+
+            // Only the team that was added after the move is left.
+            expect($live->table('teams')->count())->toBe(1);
+        } finally {
+            DB::setDefaultConnection($originalDefault);
+        }
     } finally {
         $clean();
         DB::purge(LiveAppDb::CONNECTION);
