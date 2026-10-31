@@ -72,7 +72,7 @@ it('copies every table to a second database and the audit chain still verifies',
     $target = targetConnection($path);
 
     foreach (['users', 'teams', 'team_user', 'connections', 'query_requests', 'audit_logs', 'audit_chain_lock'] as $table) {
-        expect($target->table($table)->count())->toBe(DB::table($table)->count(), $table);
+        $this->assertSame(DB::table($table)->count(), $target->table($table)->count(), "row count of {$table} on the target");
     }
 
     // Ids, hashes and the chain head travel unchanged.
@@ -139,7 +139,7 @@ it('leaves a migrated, empty target when the copy fails, and a retry succeeds', 
     $target = targetConnection($path);
 
     foreach (['users', 'teams', 'team_user', 'connections', 'query_requests', 'audit_logs'] as $table) {
-        expect($target->table($table)->count())->toBe(0, $table);
+        $this->assertSame(0, $target->table($table)->count(), "{$table} must be empty after the rolled back copy");
     }
 
     expect((int) $target->table('audit_chain_lock')->sum('sequence'))->toBe(0);
@@ -324,13 +324,19 @@ it('moves the application database to a real server', function () {
         $status = Artisan::call('queryproxy:migrate-appdb', ['--to' => $dsn, '--force' => true], $output);
         $text = $output->fetch();
 
-        expect($status)->toBe(0, "queryproxy:migrate-appdb failed:\n{$text}")
-            ->and($text)->toContain('Audit chain intact: 3 records verified.');
+        // Assertions use assertSame() with a message: Pest's toBe() drops one,
+        // and a red CI run has to say which table or step failed.
+        $this->assertSame(0, $status, "queryproxy:migrate-appdb failed:\n{$text}");
+        $this->assertStringContainsString('Audit chain intact: 3 records verified.', $text, "audit:verify did not report an intact chain:\n{$text}");
 
         $live = DB::connection(LiveAppDb::CONNECTION);
 
+        // Counts on the source (SQLite), taken before the default connection moves to the live one.
+        $sourceCounts = [];
+
         foreach (['users', 'teams', 'team_user', 'connections', 'query_requests', 'audit_logs'] as $table) {
-            expect($live->table($table)->count())->toBe(DB::table($table)->count(), $table);
+            $sourceCounts[$table] = DB::table($table)->count();
+            $this->assertSame($sourceCounts[$table], $live->table($table)->count(), "row count of {$table} on the live database");
         }
 
         // The next insert must not collide with the copied ids.
@@ -341,7 +347,7 @@ it('moves the application database to a real server', function () {
             'updated_at' => now(),
         ]);
 
-        expect($next)->toBeGreaterThan((int) DB::table('teams')->max('id'));
+        $this->assertGreaterThan((int) DB::table('teams')->max('id'), $next, 'id of a team inserted after the move (sequence or identity not advanced)');
 
         // Deleting works on the moved data. On SQL Server some foreign keys are
         // NO ACTION (SqlServerReferentialActions) and the models do the rest.
@@ -353,17 +359,17 @@ it('moves the application database to a real server', function () {
             $live->table('connections')->update(['created_by' => $admin->id]);
             $admin->forceDelete();
 
-            expect($live->table('connections')->whereNotNull('created_by')->count())->toBe(0)
-                ->and($live->table('users')->count())->toBe(DB::table('users')->count() - 1);
+            $this->assertSame(0, $live->table('connections')->whereNotNull('created_by')->count(), 'connections.created_by of a force deleted user must be NULL');
+            $this->assertSame($sourceCounts['users'] - 1, $live->table('users')->count(), 'users left on the live database after forceDelete()');
 
             Team::where('slug', '!=', 'after-the-move')->orderBy('id')->firstOrFail()->delete();
 
             foreach (['team_user', 'connections', 'connection_user', 'query_requests', 'masking_rules', 'connection_grant_requests', 'chat_approval_tokens'] as $table) {
-                expect($live->table($table)->count())->toBe(0, $table);
+                $this->assertSame(0, $live->table($table)->count(), "rows left in {$table} after deleting the team");
             }
 
             // Only the team that was added after the move is left.
-            expect($live->table('teams')->count())->toBe(1);
+            $this->assertSame(1, $live->table('teams')->count(), 'teams left after deleting the moved team');
         } finally {
             DB::setDefaultConnection($originalDefault);
         }

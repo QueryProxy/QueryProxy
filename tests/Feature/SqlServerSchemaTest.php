@@ -186,8 +186,10 @@ test('every key the SQL Server substitution names exists, and only those differ'
             $listed = in_array($table['name'].'.'.$column, SqlServerReferentialActions::NO_ACTION, true);
 
             // Listed keys are NO ACTION on SQL Server; every other key is the same there.
-            expect(isset($sqlServer[$table['name'].'|'.$key['foreign_table'].'|'.($listed ? 'no action' : ($usual === 'restrict' ? 'no action' : $usual))]))
-                ->toBeTrue("{$table['name']}.{$column}");
+            $this->assertTrue(
+                isset($sqlServer[$table['name'].'|'.$key['foreign_table'].'|'.($listed ? 'no action' : ($usual === 'restrict' ? 'no action' : $usual))]),
+                "foreign key {$table['name']}.{$column} has the wrong action on SQL Server",
+            );
 
             if ($listed) {
                 $differing[] = $table['name'].'.'.$column;
@@ -206,7 +208,7 @@ test('the SQL Server statements use nothing SQL Server lacks', function () {
     $maxColumns = [];
 
     foreach ($statements as $sql) {
-        expect($sql)->not->toMatch('/on delete restrict/i');
+        $this->assertDoesNotMatchRegularExpression('/on delete restrict/i', $sql, 'SQL Server has no ON DELETE RESTRICT');
 
         if (preg_match('/^create table "(\w+)" \((.*)\)$/s', $sql, $m)) {
             preg_match_all('/"(\w+)" nvarchar\(max\)/', $m[2], $columns);
@@ -220,7 +222,7 @@ test('the SQL Server statements use nothing SQL Server lacks', function () {
         if (preg_match('/^create (?:unique )?index "\w+" on "(\w+)" \((.*)\)/i', $sql, $m)) {
             preg_match_all('/"(\w+)"/', $m[2], $indexed);
 
-            expect(array_intersect($indexed[1], $maxColumns[$m[1]] ?? []))->toBe([], $sql);
+            $this->assertSame([], array_values(array_intersect($indexed[1], $maxColumns[$m[1]] ?? [])), "index on an nvarchar(max) column: {$sql}");
         }
     }
 });
