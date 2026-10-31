@@ -953,3 +953,119 @@ test('auth_time from the userinfo endpoint is not taken as proof of a fresh sign
 
     expect(session(OidcController::SESSION_AT_KEY))->toBe($oldAt);
 });
+
+test('an Entra-like token with only xms_edov true provisions an account', function (mixed $edov) {
+    oidcTeams();
+
+    oidcLogin(['email_verified' => null, 'xms_edov' => $edov])->assertRedirect(route('dashboard'));
+
+    $user = User::where('email', 'alice@example.test')->firstOrFail();
+    expect(auth()->id())->toBe($user->id)->and($user->email_verified_at)->not->toBeNull();
+})->with([
+    'boolean true' => [true],
+    'string "true"' => ['true'],
+]);
+
+test('an Entra-like token with only xms_edov true links a local account', function () {
+    $local = User::factory()->create(['email' => 'alice@example.test', 'password' => 'secret-password']);
+
+    oidcLogin(['email_verified' => null, 'xms_edov' => true])->assertRedirect(route('dashboard'));
+
+    expect(auth()->id())->toBe($local->id)
+        ->and($local->fresh()->auth_provider)->toBe('oidc')
+        ->and(oidcAuditActions())->toContain('user.sso_linked');
+});
+
+test('without email_verified, xms_edov must be true to count', function (array $claims) {
+    $local = User::factory()->create(['email' => 'alice@example.test', 'password' => 'secret-password']);
+
+    oidcLogin($claims)->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+    expect(auth()->check())->toBeFalse()->and($local->fresh()->auth_provider)->toBe('local');
+
+    $local->forceDelete();
+
+    oidcLogin($claims)->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+    expect(auth()->check())->toBeFalse()->and(User::count())->toBe(0)
+        ->and(oidcAuditActions())->toBe(['auth.sso_refused', 'auth.sso_refused']);
+})->with([
+    'xms_edov false' => [['email_verified' => null, 'xms_edov' => false]],
+    'xms_edov string "false"' => [['email_verified' => null, 'xms_edov' => 'false']],
+    'xms_edov missing' => [['email_verified' => null]],
+    'xms_edov 1' => [['email_verified' => null, 'xms_edov' => 1]],
+    'xms_edov "yes"' => [['email_verified' => null, 'xms_edov' => 'yes']],
+    'xms_edov "1"' => [['email_verified' => null, 'xms_edov' => '1']],
+]);
+
+test('an explicit email_verified is never overridden by xms_edov', function (mixed $verified) {
+    $local = User::factory()->create(['email' => 'alice@example.test', 'password' => 'secret-password']);
+
+    oidcLogin(['email_verified' => $verified, 'xms_edov' => true])->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+    expect(auth()->check())->toBeFalse()->and($local->fresh()->auth_provider)->toBe('local');
+
+    $local->forceDelete();
+
+    oidcLogin(['email_verified' => $verified, 'xms_edov' => true])->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+    expect(auth()->check())->toBeFalse()->and(User::count())->toBe(0);
+})->with([
+    'false' => [false],
+    'string "false"' => ['false'],
+    'string "yes"' => ['yes'],
+]);
+
+/** How many times the fake provider's userinfo endpoint was asked. */
+function oidcUserInfoRequests(): int
+{
+    return Http::recorded(fn (Request $request) => $request->url() === 'https://idp.test/userinfo')->count();
+}
+
+test('xms_edov from the userinfo endpoint counts when the ID token says nothing about verification', function () {
+    OidcFakeProvider::$userInfo = ['xms_edov' => true];
+
+    oidcLogin(['email_verified' => null])->assertRedirect(route('dashboard'));
+
+    expect(auth()->check())->toBeTrue()
+        ->and(oidcUserInfoRequests())->toBe(1); // the endpoint really was asked
+});
+
+test('a userinfo xms_edov of false or garbage does not verify the address', function (mixed $edov) {
+    OidcFakeProvider::$userInfo = ['xms_edov' => $edov];
+
+    oidcLogin(['email_verified' => null])->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+
+    expect(auth()->check())->toBeFalse()
+        ->and(User::count())->toBe(0)
+        ->and(oidcUserInfoRequests())->toBe(1);
+})->with([
+    'false' => [false],
+    'string "yes"' => ['yes'],
+]);
+
+test('an explicit email_verified false in the token ends the matter: userinfo is not even asked', function () {
+    OidcFakeProvider::$userInfo = ['xms_edov' => true, 'email_verified' => true];
+
+    oidcLogin(['email_verified' => false])->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+
+    expect(auth()->check())->toBeFalse()
+        ->and(User::count())->toBe(0)
+        ->and(oidcUserInfoRequests())->toBe(0);
+});
+
+test('userinfo, asked for the groups, cannot overwrite an email_verified false the token carries', function () {
+    config(['queryproxy.oidc.role_map' => '']);
+    OidcFakeProvider::$userInfo = ['groups' => ['platform-dba'], 'xms_edov' => true, 'email_verified' => true];
+
+    // The token has no group claim, so the endpoint is asked; what it adds is only what the token lacks.
+    oidcLogin(['email_verified' => false, 'groups' => null])->assertRedirect(route('login'))->assertSessionHasErrors('sso');
+
+    expect(auth()->check())->toBeFalse()
+        ->and(User::count())->toBe(0)
+        ->and(oidcUserInfoRequests())->toBe(1);
+});
+
+test('the userinfo endpoint is not called when the token already speaks of verification', function () {
+    OidcFakeProvider::$userInfo = ['groups' => ['platform-dba']];
+
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    expect(oidcUserInfoRequests())->toBe(0);
+});

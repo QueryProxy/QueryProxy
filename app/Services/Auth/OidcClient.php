@@ -98,8 +98,12 @@ class OidcClient
         $claims = $this->validatedClaims($idToken, $metadata, $nonce);
 
         $accessToken = $tokens['access_token'] ?? null;
-        if ($wantedClaim !== null
-            && ! self::hasClaim($claims, $wantedClaim)
+        // The userinfo endpoint is asked only for what the token lacks: the
+        // group claim, or any statement about the e-mail being verified.
+        $lacksGroups = $wantedClaim !== null && ! self::hasClaim($claims, $wantedClaim);
+        $lacksVerification = ! isset($claims['email_verified']) && ! isset($claims['xms_edov']);
+
+        if (($lacksGroups || $lacksVerification)
             && is_string($accessToken) && $accessToken !== ''
             && is_string($metadata['userinfo_endpoint'] ?? null)) {
             $claims = $this->mergeUserInfo($claims, $metadata['userinfo_endpoint'], $accessToken);

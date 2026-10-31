@@ -162,11 +162,18 @@ class OidcUserProvisioner
         throw new OidcException($logMessage);
     }
 
-    /** email_verified is a JSON boolean; a few providers send the string "true". */
+    /**
+     * Does the provider vouch for the e-mail address? `email_verified` decides
+     * when it is there: a JSON boolean, or the string "true" some providers
+     * send; any other value, "false" included, means not verified. Entra ID
+     * never sends it, so only when it is absent does `xms_edov` (Entra's "email
+     * domain owner verified") count, with the same two accepted spellings of
+     * true. An explicit `email_verified` is never overridden by `xms_edov`.
+     */
     private function emailIsVerified(array $claims): bool
     {
-        $verified = $claims['email_verified'] ?? false;
+        $claim = $claims['email_verified'] ?? $claims['xms_edov'] ?? null;
 
-        return $verified === true || $verified === 'true';
+        return $claim === true || $claim === 'true';
     }
 }

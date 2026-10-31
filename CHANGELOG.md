@@ -48,7 +48,11 @@ All notable changes to QueryProxy are documented here. The format follows
   redirect URI. The first sign-in creates the user, and an existing local account
   with the same e-mail address is linked, but only when the provider says the
   address is verified (`email_verified`); otherwise the sign-in is refused and
-  the refusal is audited (`auth.sso_refused`). A user is identified by issuer and
+  the refusal is audited (`auth.sso_refused`).
+  Entra ID does not send `email_verified`; there the optional `xms_edov` claim
+  (add it to the app registration's token configuration) counts instead, but
+  only when `email_verified` is absent, and an explicit `email_verified: false`
+  always wins. A user is identified by issuer and
   subject together. `QUERYPROXY_OIDC_ROLE_MAP` (`group:team:role`, comma-separated)
   turns the groups in `QUERYPROXY_OIDC_GROUP_CLAIM` (default `groups`) into team
   roles at every sign-in: memberships in the teams the map names are added,
