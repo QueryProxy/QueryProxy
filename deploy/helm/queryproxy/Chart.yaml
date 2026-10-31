@@ -1,0 +1,18 @@
+apiVersion: v2
+name: queryproxy
+description: Approval workflow, masking and audit trail in front of production databases (web, worker and scheduler Deployments from one image).
+type: application
+version: 0.4.0
+appVersion: "0.4.0"
+kubeVersion: ">=1.27.0-0"
+home: https://queryproxy.com
+sources:
+  - https://github.com/QueryProxy/QueryProxy
+keywords:
+  - queryproxy
+  - database
+  - query-approval
+  - audit
+maintainers:
+  - name: QueryProxy
+    url: https://github.com/QueryProxy/QueryProxy

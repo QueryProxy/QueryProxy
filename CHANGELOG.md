@@ -68,6 +68,34 @@ All notable changes to QueryProxy are documented here. The format follows
 - **CI signs in to a real Keycloak.** The new `oidc` job in the CI workflow
   imports a test realm and checks the sign-in and the group-to-role sync end to
   end.
+- **A Helm chart runs QueryProxy on Kubernetes, with an HA reference setup.**
+  `deploy/helm/queryproxy` starts the one image as separate `web`, `worker`
+  and `scheduler` Deployments (roles switched with `QUERYPROXY_RUN_WORKER` and
+  `QUERYPROXY_RUN_SCHEDULER`); the scheduler is always one replica with the
+  `Recreate` strategy. Migrations run as a `pre-install,pre-upgrade` hook Job.
+  `values-ha.yaml` sets up an external PostgreSQL, S3 result storage, several
+  web and worker pods, an Ingress, a PodDisruptionBudget and a NetworkPolicy.
+  The worker can scale on the `queryproxy_queue_depth` metric (HorizontalPodAutoscaler,
+  off by default; a prometheus-adapter example is in `values.yaml`). `APP_KEY`
+  and the database password come from a Secret (your own, for example from the
+  External Secrets Operator, or one the chart creates and keeps), optionally
+  mounted as files (`*_FILE`). With SQLite the chart renders one all-in-one
+  Deployment (web, worker and scheduler, one replica) and refuses more than one
+  web replica, because a SQLite file cannot be shared between pods; the role
+  split applies with an external database. The chart adds the Service's
+  in-cluster names to `TRUSTED_HOSTS`, so Prometheus can scrape `/metrics`
+  through the Service. The pods run as a non-root user with all capabilities
+  dropped; the root filesystem is still writable because the image's
+  entrypoint writes to it. The architecture and the options are in
+  `deploy/helm/queryproxy/README.md`. A new `Helm` workflow lints the chart on
+  Helm 3 and 4 and installs it into a kind cluster, where a sample request is
+  approved and run by the worker pod, and an upgrade and a rollback are
+  checked.
+- **The image can store result files on S3 and use Redis.** It now includes the
+  Flysystem S3 adapter (`QUERYPROXY_RESULT_DISK=s3` with the usual `AWS_*`
+  settings, including S3-compatible endpoints) and the `predis` Redis client
+  (`REDIS_CLIENT=predis`, for cache, queue and sessions). Both are optional;
+  the default setup is unchanged.
 
 ### Changed
 

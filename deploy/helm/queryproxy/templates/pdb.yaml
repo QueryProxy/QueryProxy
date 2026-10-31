@@ -1,0 +1,18 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $sqlite := eq (include "queryproxy.isSqlite" .) "true" }}
+{{- range $role := ternary (list "web") (list "web" "worker") $sqlite }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "queryproxy.fullname" $ }}-{{ $role }}
+  labels:
+    {{- include "queryproxy.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
+spec:
+  maxUnavailable: {{ $.Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "queryproxy.selectorLabels" (dict "ctx" $ "component" $role) | nindent 6 }}
+{{- end }}
+{{- end }}

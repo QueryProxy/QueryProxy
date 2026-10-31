@@ -1,0 +1,107 @@
+# High-availability profile: external PostgreSQL, S3 result storage, several web
+# and worker pods, a single scheduler. Use it on top of values.yaml:
+#
+#   helm upgrade --install queryproxy deploy/helm/queryproxy \
+#     -f deploy/helm/queryproxy/values-ha.yaml -n queryproxy --create-namespace
+#
+# Before installing:
+#   1. Create the application database and role on your PostgreSQL (managed
+#      service or an operator such as CloudNativePG). It carries the queue,
+#      sessions and the audit chain, so give it its own backups.
+#   2. Create the Secret named in secrets.existingSecret (README: External
+#      Secrets Operator example) with APP_KEY, DB_PASSWORD and, unless the pods
+#      get credentials from IRSA, AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+#   3. Create the S3 bucket (private, no public access).
+#
+# Replace every example.* value below.
+
+config:
+  appUrl: https://queryproxy.example.com
+  sessionSecureCookie: true
+  # The ingress controller's pod CIDR (or the load balancer's addresses).
+  # Never "*".
+  trustedProxies: "10.0.0.0/8"
+  extraEnv:
+    QUERYPROXY_REQUIRE_2FA: admins
+
+database:
+  connection: pgsql
+  host: postgres.example.internal
+  port: 5432
+  name: queryproxy
+  username: queryproxy
+  sslMode: require
+
+# All three pods read and write the same database, so the pods share nothing
+# else: no volume.
+persistence:
+  enabled: false
+
+results:
+  disk: s3
+  s3:
+    bucket: queryproxy-results-example
+    region: eu-west-1
+    # useSecretCredentials: false   # when the ServiceAccount carries IRSA / Workload Identity
+
+secrets:
+  existingSecret: queryproxy-secrets
+
+serviceAccount:
+  annotations: {}
+  #  eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/queryproxy-results
+
+# Redis is optional and only takes load off the database (cache, queue, sessions).
+# The image carries predis, the chart's default client.
+# redis:
+#   enabled: true
+#   host: redis.example.internal
+#   auth: true            # REDIS_PASSWORD must then be in the Secret
+
+# A topologySpreadConstraint without a labelSelector counts the pods of that role
+# in this release; the chart fills the selector in.
+web:
+  replicas: 2
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+worker:
+  replicas: 2
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+  # Scale on the queue backlog once Prometheus and prometheus-adapter serve
+  # queryproxy_queue_depth (example in values.yaml), and set metrics.enabled.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+  hosts:
+    - host: queryproxy.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: queryproxy-tls
+      hosts:
+        - queryproxy.example.com
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx

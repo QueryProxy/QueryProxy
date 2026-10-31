@@ -1,0 +1,33 @@
+QueryProxy {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+{{- if eq (include "queryproxy.isSqlite" .) "true" }}
+
+Mode: SQLite, one all-in-one pod running web, worker and scheduler (the SQLite
+exception to the role split, ADR-007 Amendment). This suits an evaluation or a
+small team; move to PostgreSQL/MySQL (values-ha.yaml) to get separate web,
+worker and scheduler Deployments, with `php artisan queryproxy:migrate-appdb --to=<dsn>`.
+{{- else }}
+
+Mode: separate web ({{ .Values.web.replicas }}), worker ({{ if .Values.worker.autoscaling.enabled }}{{ .Values.worker.autoscaling.minReplicas }}-{{ .Values.worker.autoscaling.maxReplicas }}, autoscaled{{ else }}{{ .Values.worker.replicas }}{{ end }}) and scheduler (1) Deployments.
+{{- if and (eq .Values.results.disk "local") (not .Values.persistence.enabled) }}
+
+WARNING: results.disk=local without a shared volume. Result files are written
+by the worker pod and cannot be downloaded through the web pods. Use
+results.disk=s3 or a ReadWriteMany persistence volume.
+{{- end }}
+{{- end }}
+
+Open the portal:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "queryproxy.fullname" . }} 7432:{{ .Values.service.port }}
+  then browse to {{ .Values.config.appUrl }} (config.appUrl must match the address you use).
+{{- end }}
+{{- if not .Values.secrets.existingSecret }}
+
+APP_KEY lives in Secret "{{ include "queryproxy.secretName" . }}" and is kept on uninstall.
+Back it up: connection credentials in the database cannot be decrypted without it.
+{{- end }}

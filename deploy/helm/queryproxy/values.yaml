@@ -1,0 +1,385 @@
+# Default values for the QueryProxy chart.
+#
+# One image, up to three Deployments (ADR-001/ADR-007 amendments, 2026-10-26):
+#
+#   web        nginx + php-fpm                       QUERYPROXY_RUN_WORKER=false  RUN_SCHEDULER=false
+#   worker     executes approved queries (queue)     QUERYPROXY_RUN_WORKER=true   RUN_SCHEDULER=false
+#   scheduler  result retention, reminders           QUERYPROXY_RUN_WORKER=false  RUN_SCHEDULER=true
+#
+# The defaults below describe the simplest installation: SQLite on one volume.
+# Exception to the role split (ADR-007 Amendment, 2026-10-26, "Exception for
+# SQLite", user decision 2026-10-31): a SQLite file cannot be shared between
+# pods, so with database.connection=sqlite the chart renders ONE all-in-one
+# Deployment with a single replica that runs web, worker and scheduler, exactly
+# like the docker-compose container. The role split (three Deployments, web and
+# worker scaling on their own) applies only with an external application
+# database: set database.connection to pgsql/mysql/mariadb (see values-ha.yaml).
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: queryproxy/queryproxy
+  # Defaults to the chart's appVersion. Pin a version, never `latest`.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Application settings (rendered into a ConfigMap, read as environment).
+# ---------------------------------------------------------------------------
+config:
+  # The public URL. Its host is also the only Host header the app accepts
+  # (TrustHosts), so the probes send it too. Use the https:// URL of your
+  # Ingress in production.
+  appUrl: http://localhost:7432
+  logLevel: info
+  # Comma-separated IPs/CIDRs of the reverse proxies allowed to set
+  # X-Forwarded-*, e.g. the ingress controller's pod CIDR. Never "*".
+  trustedProxies: ""
+  # Extra hostnames the app answers to besides appUrl's host, comma-separated.
+  # The chart always adds the Service's in-cluster names (<fullname>,
+  # <fullname>.<namespace>[.svc[.cluster.local]]), so clients inside the
+  # cluster, Prometheus included, can use them as the Host.
+  trustedHosts: ""
+  # Set to true when appUrl is https.
+  sessionSecureCookie: false
+  # Seconds a single query may run. The worker's terminationGracePeriodSeconds
+  # and its --timeout are derived from it (execution timeout + 30 / + 10).
+  executionTimeout: 300
+  # Queue worker processes inside each worker pod.
+  workerProcesses: 1
+  resultTtlDays: 30
+  # Any other environment variable from .env.example (QUERYPROXY_*, TRUSTED_*,
+  # MAIL_*, QUERYPROXY_SIEM_*, ...). Plain values only; secrets go through
+  # `secrets` or `extraEnvFrom`.
+  extraEnv: {}
+  #   QUERYPROXY_REQUIRE_2FA: admins
+  #   QUERYPROXY_SELECT_HARD_LIMIT: "5000"
+  # Raw `envFrom` entries added to every container (for example another Secret).
+  extraEnvFrom: []
+
+# First-boot administrator (web pod only; a no-op once the instance has users).
+# The password comes from the Secret (secrets.adminPassword). Unset both once
+# the account exists.
+admin:
+  name: Admin
+  email: ""
+
+# ---------------------------------------------------------------------------
+# Application database.
+# ---------------------------------------------------------------------------
+database:
+  # sqlite | pgsql | mysql | mariadb
+  # sqlite: single replica with a PVC (persistence below); the chart refuses
+  # web.replicas > 1, worker autoscaling and a volume that is not persistent.
+  connection: sqlite
+  host: ""
+  # Empty means the driver default (5432 for pgsql, 3306 for mysql/mariadb).
+  port: ""
+  name: queryproxy
+  username: queryproxy
+  # pgsql only: disable | allow | prefer | require | verify-ca | verify-full.
+  # Empty keeps the application default (prefer).
+  sslMode: ""
+  # The password is read from the Secret (secrets.dbPassword / DB_PASSWORD).
+
+# Optional Redis for cache, queue and sessions. Everything works on the
+# database alone (ADR-002); Redis only takes load off it.
+# The client is predis (the predis/predis package is in the image). Use
+# `phpredis` only with an image that carries that extension. A Redis ACL user
+# or another database number go in config.extraEnv (REDIS_USERNAME, REDIS_DB,
+# REDIS_CACHE_DB). TLS to a managed
+# Redis (rediss://) is possible only through REDIS_URL in config.extraEnvFrom,
+# because config/database.php has no scheme setting; the URL carries the
+# password, so keep it in a Secret.
+redis:
+  enabled: false
+  host: ""
+  port: 6379
+  client: predis
+  # Read REDIS_PASSWORD from the Secret (secrets.redisPassword).
+  auth: false
+  useForCache: true
+  useForQueue: true
+  useForSessions: true
+
+# Where result files are stored. `local` keeps them on the pod's disk (SQLite
+# mode: on the PVC), which only works while web and worker share that disk.
+# With separate pods use s3, or a ReadWriteMany volume (persistence below).
+# The image carries league/flysystem-aws-s3-v3, so the s3 disk works.
+results:
+  disk: local
+  s3:
+    bucket: ""
+    region: us-east-1
+    # S3-compatible endpoint (MinIO, Ceph, ...). Empty for AWS.
+    endpoint: ""
+    pathStyle: false
+    # Read AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the Secret. Set to
+    # false when the pods get credentials from the environment (IRSA, Workload
+    # Identity; annotate the ServiceAccount).
+    useSecretCredentials: true
+
+# Volume mounted at /var/www/html/storage/app (SQLite database, result files,
+# generated APP_KEY).
+persistence:
+  enabled: true
+  existingClaim: ""
+  size: 5Gi
+  storageClass: ""
+  # SQLite: ReadWriteOnce. With an external database a volume shared by
+  # several pods must be ReadWriteMany, or set enabled: false.
+  accessMode: ReadWriteOnce
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Secrets: APP_KEY, database password, Redis password, metrics token, ...
+# ---------------------------------------------------------------------------
+secrets:
+  # Name of a Secret you manage yourself (External Secrets Operator, Sealed
+  # Secrets, ...). Empty: the chart creates one from the values below. The
+  # chart-managed Secret is created before the migration hook and kept on
+  # `helm uninstall`, so the APP_KEY it holds is never lost with the release.
+  existingSecret: ""
+  # Mount the Secret as files and pass NAME_FILE=/run/secrets/queryproxy/<key>
+  # (docker/secret-files.sh) instead of putting the values in the environment.
+  # AWS_* credentials have no _FILE form and stay environment variables.
+  mountAsFiles: false
+  mountPath: /run/secrets/queryproxy
+  # Key names inside the Secret.
+  keys:
+    appKey: APP_KEY
+    dbPassword: DB_PASSWORD
+    redisPassword: REDIS_PASSWORD
+    metricsToken: QUERYPROXY_METRICS_TOKEN
+    adminPassword: QUERYPROXY_ADMIN_PASSWORD
+    awsAccessKeyId: AWS_ACCESS_KEY_ID
+    awsSecretAccessKey: AWS_SECRET_ACCESS_KEY
+  # Values for the chart-managed Secret (ignored with existingSecret). Do not
+  # keep real values in a values file under version control.
+  # appKey: when empty, a key is generated on first install and reused on every
+  # upgrade (lookup). All pods MUST share one APP_KEY.
+  # GitOps tools that render without cluster access (Argo CD, `helm template`)
+  # cannot look it up: set existingSecret or appKey there.
+  appKey: ""
+  dbPassword: ""
+  redisPassword: ""
+  metricsToken: ""
+  adminPassword: ""
+  awsAccessKeyId: ""
+  awsSecretAccessKey: ""
+
+# /metrics (ADR-022) is off until a token is set. true: QUERYPROXY_METRICS_TOKEN
+# is taken from the Secret (secrets.metricsToken).
+metrics:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+web:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  extraEnv: {}
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  # Horizontal scaling on the queue backlog (ADR-022 queryproxy_queue_depth).
+  # Off by default: it needs Prometheus scraping /metrics plus the
+  # prometheus-adapter (or KEDA) serving the metric as an external metric.
+  # Example prometheus-adapter chart values:
+  #
+  #   rules:
+  #     external:
+  #       - seriesQuery: 'queryproxy_queue_depth{queue!=""}'
+  #         resources:
+  #           overrides:
+  #             namespace: {resource: namespace}
+  #         name:
+  #           matches: "^queryproxy_queue_depth$"
+  #           as: "queryproxy_queue_depth"
+  #         # Every pod reports the same database-backed value; max() de-duplicates
+  #         # scrapes of several pods.
+  #         metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (queue)'
+  #
+  # The `namespace` label must be present on the series. Scrape /metrics with
+  # the bearer token from secrets.metricsToken (metrics.enabled=true), and scrape
+  # it through the Service's DNS name (<fullname>.<namespace>.svc:80), not the
+  # pod IPs: QueryProxy only answers to trusted Host names (TrustHosts), and a
+  # scrape of a pod IP gets 400. A pod-IP target (the default of a
+  # ServiceMonitor) needs `relabelings` that replace __address__ with the
+  # Service name; README has a static scrape config. One scrape is enough: the
+  # value comes from the database.
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    metricName: queryproxy_queue_depth
+    # Queue label of the metric: the queue the worker drains.
+    queue: queries
+    # Waiting jobs per worker pod that triggers a scale-up (AverageValue).
+    queueDepthPerPod: "5"
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies:
+          - type: Pods
+            value: 2
+            periodSeconds: 60
+      # A scale-down terminates pods that may be running a query: be slow.
+      scaleDown:
+        stabilizationWindowSeconds: 600
+        policies:
+          - type: Pods
+            value: 1
+            periodSeconds: 120
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  extraEnv: {}
+
+# Always exactly one replica, Recreate strategy: two schedulers would run every
+# scheduled task twice. Not rendered in SQLite mode (the web pod runs it).
+scheduler:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: {}
+
+# `php artisan migrate --force` as a pre-install/pre-upgrade hook Job. Not
+# rendered in SQLite mode (the single pod migrates on start). Pods of the other
+# roles still run `migrate` on start, which is a no-op after the hook.
+migration:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: queryproxy.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: queryproxy-tls
+  #    hosts: [queryproxy.example.com]
+
+# NetworkPolicy example. Ingress: only the listed peers reach port 7432.
+# Egress is left open unless networkPolicy.egress.restrict is true, because the
+# worker has to reach every target database you register, on any port.
+networkPolicy:
+  enabled: false
+  # Raw `from` entries for the HTTP port. Empty: any source.
+  ingressFrom: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: ingress-nginx
+  egress:
+    restrict: false
+    # Allow DNS (kube-dns/CoreDNS in kube-system) when restricting.
+    allowDns: true
+    # Raw egress rules for the application database, Redis, S3, target
+    # databases, chat webhooks and the SIEM sinks.
+    rules: []
+    #  - to:
+    #      - ipBlock: {cidr: 10.0.0.0/16}
+    #    ports:
+    #      - {protocol: TCP, port: 5432}
+
+# Voluntary disruptions (node drains). Applies to web and worker.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# ---------------------------------------------------------------------------
+# Pod hardening
+# ---------------------------------------------------------------------------
+# 82 is www-data in the Alpine image. Numeric on purpose: the kubelet cannot
+# verify runAsNonRoot for the image's `USER www-data` by name.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 82
+  runAsGroup: 82
+  fsGroup: 82
+  seccompProfile:
+    type: RuntimeDefault
+
+# readOnlyRootFilesystem is false on purpose: the image's entrypoint writes
+# /var/www/html/.env, bootstrap/cache and storage/ at start. See the README.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: [ALL]
+
+# /up answers once the entrypoint has migrated and warmed the caches, which
+# can take a while on a cold database: the startup probe waits for it.
+probes:
+  startup:
+    periodSeconds: 5
+    failureThreshold: 60
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+terminationGracePeriodSeconds:
+  web: 30

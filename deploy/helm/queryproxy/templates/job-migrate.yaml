@@ -1,0 +1,84 @@
+{{- if eq (include "queryproxy.usesMigrationHook" .) "true" }}
+{{- $spec := dict "ctx" . "role" "migrate" "secret" (include "queryproxy.migrationSecretName" .) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "queryproxy.fullname" . }}-migrate
+  labels:
+    {{- include "queryproxy.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "queryproxy.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # The ServiceAccount is an ordinary release resource and does not exist
+      # yet on a first install; the default account is enough (no token).
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "queryproxy.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # Not `supervisord`, so the entrypoint only resolves *_FILE secrets
+          # and APP_KEY, then runs this command.
+          args: ["php", "artisan", "migrate", "--force"]
+          {{- with .Values.config.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            # The ConfigMap does not exist yet on a first install: same settings, inline.
+            {{- range $name, $value := fromYaml (include "queryproxy.configData" .) }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- include "queryproxy.roleEnv" $spec | nindent 12 }}
+            {{- include "queryproxy.secretEnv" $spec | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          {{- if .Values.secrets.mountAsFiles }}
+          volumeMounts:
+            - name: secrets
+              mountPath: {{ .Values.secrets.mountPath }}
+              readOnly: true
+          {{- end }}
+      {{- if .Values.secrets.mountAsFiles }}
+      volumes:
+        - name: secrets
+          secret:
+            secretName: {{ include "queryproxy.migrationSecretName" . }}
+            defaultMode: 0440
+            items:
+              {{- range $e := fromYamlArray (include "queryproxy.secretSpec" $spec) }}
+              {{- if $e.file }}
+              - key: {{ $e.key }}
+                path: {{ $e.key }}
+              {{- end }}
+              {{- end }}
+      {{- end }}
+      {{- with .Values.migration.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.migration.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
