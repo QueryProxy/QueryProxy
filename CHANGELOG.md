@@ -247,6 +247,11 @@ upgrade.
   `SECURITY.md` (for example `v1.2.3.4` or `v1.2.3+build`) now stops the
   workflow before anything is built or pushed. Use `vX.Y.Z` or
   `vX.Y.Z-<pre-release>`.
+- **Updated `symfony/mime` to 7.4.22 (and `symfony/polyfill-mbstring` to
+  1.43.3).** It fixes CVE-2026-45070 (e-mail header injection through
+  non-token characters in MIME parameter names). QueryProxy does not build
+  e-mail headers or MIME parameter names from user input, so it was not
+  exploitable here; the update clears `composer audit`.
 
 ## [0.3.3] - 2026-10-25
 
