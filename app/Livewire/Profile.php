@@ -2,6 +2,7 @@
 
 namespace App\Livewire;
 
+use App\Enums\MailEvent;
 use App\Services\Auth\TwoFactorService;
 use Livewire\Attributes\Title;
 use Livewire\Component;
@@ -21,9 +22,26 @@ class Profile extends Component
 
     public string $disablePassword = '';
 
+    /** @var array<string, bool> e-mail choice per MailEvent value */
+    public array $mailPreferences = [];
+
     public function mount(): void
     {
         $this->name = auth()->user()->name;
+        $this->mailPreferences = auth()->user()->mailPreferences();
+    }
+
+    public function saveNotificationPreferences(): void
+    {
+        $this->validate([
+            'mailPreferences' => ['array'],
+            'mailPreferences.*' => ['boolean'],
+        ]);
+
+        auth()->user()->setMailPreferences($this->mailPreferences);
+        $this->mailPreferences = auth()->user()->mailPreferences();
+
+        session()->flash('status', 'Notification preferences saved.');
     }
 
     public function updateName(): void
@@ -135,6 +153,8 @@ class Profile extends Component
         return view('livewire.profile', [
             'twoFactorEnabled' => $user->hasTwoFactorEnabled(),
             'twoFactorRequired' => $twoFactor->isRequiredFor($user),
+            'mailEvents' => MailEvent::cases(),
+            'mailConfigured' => ! in_array(config('mail.default'), [null, '', 'log', 'array'], true),
             'setupSecret' => $setupSecret,
             'setupQrSvg' => $setupSecret ? $twoFactor->qrCodeSvg($user, $setupSecret) : null,
         ]);

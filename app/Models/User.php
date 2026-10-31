@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use App\Enums\MailEvent;
 use App\Enums\TeamRole;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
@@ -32,6 +33,7 @@ class User extends Authenticatable
             'password' => 'hashed',
             'is_admin' => 'boolean',
             'suspended_at' => 'datetime',
+            'notification_preferences' => 'array',
             'two_factor_secret' => 'encrypted',
             'two_factor_recovery_codes' => 'array',
             'two_factor_confirmed_at' => 'datetime',
@@ -54,6 +56,45 @@ class User extends Authenticatable
     public function scopeActive(Builder $query): Builder
     {
         return $query->whereNull($query->qualifyColumn('suspended_at'));
+    }
+
+    /** True when the user turned on e-mail for this event; off by default. */
+    public function wantsMail(MailEvent $event): bool
+    {
+        return ($this->notification_preferences[$event->value] ?? false) === true;
+    }
+
+    /**
+     * Every event with the user's choice, in catalog order.
+     *
+     * @return array<string, bool>
+     */
+    public function mailPreferences(): array
+    {
+        $preferences = [];
+
+        foreach (MailEvent::cases() as $event) {
+            $preferences[$event->value] = $this->wantsMail($event);
+        }
+
+        return $preferences;
+    }
+
+    /**
+     * Stores the choices; keys outside the catalog are dropped.
+     *
+     * @param  array<string, mixed>  $preferences
+     */
+    public function setMailPreferences(array $preferences): void
+    {
+        $stored = [];
+
+        foreach (MailEvent::cases() as $event) {
+            // The values the `boolean` validation rule accepts as true.
+            $stored[$event->value] = in_array($preferences[$event->value] ?? false, [true, 1, '1'], true);
+        }
+
+        $this->forceFill(['notification_preferences' => $stored])->save();
     }
 
     public function hasTwoFactorEnabled(): bool

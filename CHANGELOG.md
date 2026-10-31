@@ -153,6 +153,25 @@ All notable changes to QueryProxy are documented here. The format follows
   result reads carry `channel = api` in the audit log.
 - OpenAPI 3.1 description of the API in `docs/openapi.yaml`, linted by
   Spectral in CI and checked against the routes by a test.
+- **Users can get request and access-request events by e-mail.** On the
+  Profile page each user chooses which events also arrive by e-mail:
+  a request waiting for review, a decision on their request, a finished,
+  failed or stopped request, the pending-request reminder, an access request
+  waiting for a DBA, and the decision on an access request. Everything is
+  off by default, so nothing changes until a user turns it on. An e-mail
+  never carries query results, a reviewer's reason, a decision note or an
+  error message. The submission and reminder e-mails show the statement with
+  its values hidden (the same redaction as chat, ADR-017; none with
+  `QUERYPROXY_CHAT_INCLUDE_SQL=none`, and never the raw SQL, even with
+  `full`). Links open the request in QueryProxy and need a signed-in
+  session; nothing is approved from an e-mail. The e-mail is sent from the
+  queue (the `default` queue the worker already listens to); the in-app
+  notification is still written at once. A user who is suspended or deleted,
+  or who turned the event off, before the worker sends the e-mail gets none.
+  A mail failure never blocks the request: it is logged, and on a real queue
+  the job also lands in `failed_jobs` so `queue:retry` can resend it. With
+  `MAIL_MAILER=log` the Profile page says that nothing is delivered. Run
+  `php artisan migrate` (adds `users.notification_preferences`).
 
 ### Changed
 

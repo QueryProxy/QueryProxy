@@ -2,20 +2,38 @@
 
 namespace App\Notifications;
 
+use App\Enums\MailEvent;
 use App\Enums\QueryRequestStatus;
 use App\Models\QueryRequest;
+use App\Notifications\Concerns\DeliversByMail;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notification;
 
-class QueryRequestFinished extends Notification
+class QueryRequestFinished extends Notification implements ShouldQueue
 {
-    use Queueable;
+    use DeliversByMail, Queueable;
 
     public function __construct(public QueryRequest $request) {}
 
-    public function via(object $notifiable): array
+    protected function mailEvent(): MailEvent
     {
-        return ['database'];
+        return MailEvent::RequestFinished;
+    }
+
+    /** Neither the result nor the error text is e-mailed; both are read in the app. */
+    public function toMail(object $notifiable): MailMessage
+    {
+        $request = $this->request;
+        $completed = $request->status === QueryRequestStatus::Completed;
+
+        $message = $this->mailMessage(sprintf('Request #%d %s', $request->id, $completed ? 'completed' : 'failed'))
+            ->line($completed
+                ? sprintf('Your request #%d on %s completed in %d ms.', $request->id, $this->mailText($request->connection->name), $request->duration_ms)
+                : sprintf('Your request #%d on %s failed. Open the request to see the error.', $request->id, $this->mailText($request->connection->name)));
+
+        return $this->mailClosing($message->action('Open the request', route('requests.show', $request)));
     }
 
     /**
