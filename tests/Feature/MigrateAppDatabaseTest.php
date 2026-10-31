@@ -356,13 +356,47 @@ it('moves the application database to a real server', function () {
 
         try {
             $admin = User::where('is_admin', true)->firstOrFail();
+            $owner = User::findOrFail($live->table('query_requests')->value('user_id'));
+            $team = Team::where('slug', '!=', 'after-the-move')->orderBy('id')->firstOrFail();
+            $connectionId = $live->table('connections')->value('id');
+
+            // Rows for every key that is NO ACTION on SQL Server, so the
+            // application-layer deletes are exercised for all eight: the team's
+            // requests and masking rules are in the copied data; these are the rest.
+            $live->table('connection_user')->insert(['connection_id' => $connectionId, 'user_id' => $owner->id, 'granted_by' => $admin->id]);
+            $live->table('connection_grant_requests')->insert([
+                'team_id' => $team->id, 'connection_id' => $connectionId, 'user_id' => $owner->id,
+                'access_level' => 'read', 'duration_minutes' => 60, 'reason' => 'live test', 'status' => 'approved', 'decided_by' => $admin->id,
+            ]);
+
+            // A user who has requests cannot be hard deleted (ADR-018) on any
+            // driver, and what refers to them stays as it is.
+            $live->table('connections')->update(['created_by' => $owner->id]);
+            $refused = false;
+
+            try {
+                $owner->forceDelete();
+            } catch (QueryException) {
+                $refused = true;
+            }
+
+            $this->assertTrue($refused, 'forceDelete() of a user with requests must be refused');
+            $this->assertSame(
+                $live->table('connections')->count(),
+                $live->table('connections')->where('created_by', $owner->id)->count(),
+                'connections.created_by must stay while the delete of its user is refused',
+            );
+
             $live->table('connections')->update(['created_by' => $admin->id]);
             $admin->forceDelete();
 
             $this->assertSame(0, $live->table('connections')->whereNotNull('created_by')->count(), 'connections.created_by of a force deleted user must be NULL');
+            $this->assertSame(0, $live->table('connection_user')->whereNotNull('granted_by')->count(), 'connection_user.granted_by of a force deleted user must be NULL');
+            $this->assertSame(0, $live->table('connection_grant_requests')->whereNotNull('decided_by')->count(), 'connection_grant_requests.decided_by of a force deleted user must be NULL');
+            $this->assertSame(1, $live->table('connection_grant_requests')->count(), 'the grant request itself must stay');
             $this->assertSame($sourceCounts['users'] - 1, $live->table('users')->count(), 'users left on the live database after forceDelete()');
 
-            Team::where('slug', '!=', 'after-the-move')->orderBy('id')->firstOrFail()->delete();
+            $team->delete();
 
             foreach (['team_user', 'connections', 'connection_user', 'query_requests', 'masking_rules', 'connection_grant_requests', 'chat_approval_tokens'] as $table) {
                 $this->assertSame(0, $live->table($table)->count(), "rows left in {$table} after deleting the team");
