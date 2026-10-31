@@ -6,6 +6,39 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`php artisan queryproxy:migrate-appdb --to=<dsn>` moves the application
+  database to another server.** It is meant for installations that started on
+  the default SQLite file and now want PostgreSQL or MySQL
+  (`--to=pgsql://user:password@host:5432/queryproxy`; URL-encode special
+  characters in the password). It runs the migrations on the target, copies
+  every table in foreign key order in chunks (ids, audit hashes and the chain
+  head unchanged, PostgreSQL sequences reset), then compares the row count of
+  every table and runs `audit:verify` on the target. The audit triggers
+  (ADR-020) are never dropped: they are installed by the migrations before the
+  copy, which only inserts. The whole copy is one transaction, so a failure
+  leaves a migrated, empty target you can retry. The target must be empty (a
+  database that was only migrated is fine); `--dry-run` checks everything and
+  writes nothing; without `--force` the command asks you to confirm that
+  QueryProxy is stopped. The target password is never printed. The `cache`
+  tables are not copied. After the move, switch `DB_CONNECTION` and the
+  `DB_*` settings and start QueryProxy again.
+- **An image with SQL Server support: `queryproxy/queryproxy:<version>-mssql`
+  and `:mssql`.** It adds the Microsoft ODBC Driver 18 and the `pdo_sqlsrv`
+  extension (build it yourself with `--build-arg INSTALL_SQLSRV=1`). `:mssql`
+  moves only with stable releases and never takes `latest`; a pre-release
+  publishes its `-mssql` version tag only. The variant is built for `linux/amd64`
+  and `linux/arm64` (Microsoft ships the driver for Alpine on both), scanned,
+  signed and attested like the default image. The Microsoft driver is under
+  Microsoft's own licence (<https://aka.ms/odbc18eula>); using the variant
+  means accepting it. The default image is unchanged.
+- **CI tests the upgrade from the previous release.** The new `upgrade` job in
+  the Integration workflow creates data on the 0.3.3 image, starts the image
+  built from the branch on the same data volume, and checks that the data is
+  still there, that `audit:verify` passes across the upgrade, and that `/up`
+  and the login page answer.
+
 ### Changed
 
 - **A pre-release no longer moves `latest`.** A pre-release tag such as

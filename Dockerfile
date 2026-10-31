@@ -36,9 +36,36 @@ RUN apk upgrade --no-cache \
 # opcache is not in that list: PHP 8.5 links it statically and enables it by
 # default, so docker-php-ext-install has no module to install. The tuning in
 # docker/php.ini still applies.
-# SQL Server targets need the Microsoft ODBC driver + sqlsrv PECL extension;
-# see https://queryproxy.com/docs/configuration/#sql-server-targets if you
-# proxy MSSQL databases.
+
+# SQL Server targets need the Microsoft ODBC driver and the pdo_sqlsrv PECL
+# extension. They are not in the default image; the `:mssql` variant is built
+# with --build-arg INSTALL_SQLSRV=1. The ODBC driver is Microsoft software under
+# its own licence (https://aka.ms/odbc18eula); building the variant means
+# accepting it. The driver package is pinned and checked against a SHA-256, for
+# both architectures Microsoft ships for Alpine.
+ARG INSTALL_SQLSRV=0
+ARG MSODBCSQL_VERSION=18.7.1.1-1
+ARG MSODBCSQL_URL=https://download.microsoft.com/download/ade174b7-8cea-4543-91a6-c33ae320c2f0
+ARG MSODBCSQL_SHA256_AMD64=9ff10ec65dcbbe9ad57ed7fca648d8e7d09d4a25fc3c1095046f36a29f86b84a
+ARG MSODBCSQL_SHA256_ARM64=d42f31124b2eb88633ed1ef5159add84541149d2ecebacdfa6e638719e26a48c
+ARG PDO_SQLSRV_VERSION=5.13.3
+RUN if [ "${INSTALL_SQLSRV}" = "1" ]; then \
+        set -eux; \
+        case "$(uname -m)" in \
+            x86_64) arch=amd64; sha256="${MSODBCSQL_SHA256_AMD64}" ;; \
+            aarch64) arch=arm64; sha256="${MSODBCSQL_SHA256_ARM64}" ;; \
+            *) echo "No Microsoft ODBC driver for $(uname -m)" >&2; exit 1 ;; \
+        esac; \
+        apk add --no-cache unixodbc libstdc++; \
+        apk add --no-cache --virtual .sqlsrv-build ${PHPIZE_DEPS} unixodbc-dev; \
+        curl -fsSL -o /tmp/msodbcsql18.apk "${MSODBCSQL_URL}/msodbcsql18_${MSODBCSQL_VERSION}_${arch}.apk"; \
+        echo "${sha256}  /tmp/msodbcsql18.apk" | sha256sum -c -; \
+        apk add --no-cache --allow-untrusted /tmp/msodbcsql18.apk; \
+        pecl install "pdo_sqlsrv-${PDO_SQLSRV_VERSION}"; \
+        docker-php-ext-enable pdo_sqlsrv; \
+        rm -rf /tmp/msodbcsql18.apk /tmp/pear; \
+        apk del --no-cache .sqlsrv-build; \
+    fi
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 

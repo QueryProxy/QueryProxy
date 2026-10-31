@@ -196,3 +196,26 @@ jobs:
     steps:
       - name: Check matrix result
         run: test "${{ needs.databases.result }}" = "success"
+
+  # Upgrade test: data written by the previous release (0.3.3) must survive
+  # starting the image built from this checkout, which runs the new migrations
+  # on the same data volume. tests/Integration/upgrade/run.sh does the work:
+  # seed on the old image, start the new one, check the rows, `audit:verify`
+  # across the upgrade, then /up and /login.
+  upgrade:
+    name: upgrade (0.3.3 to this build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image from this checkout
+        run: docker build -t queryproxy:upgrade-candidate .
+
+      - name: Upgrade from 0.3.3
+        env:
+          OLD_IMAGE: queryproxy/queryproxy:0.3.3
+          NEW_IMAGE: queryproxy:upgrade-candidate
+        run: tests/Integration/upgrade/run.sh
