@@ -38,12 +38,52 @@ All notable changes to QueryProxy are documented here. The format follows
   built from the branch on the same data volume, and checks that the data is
   still there, that `audit:verify` passes across the upgrade, and that `/up`
   and the login page answer.
+- **Single sign-on through OpenID Connect, with team roles from IdP groups.**
+  Set `QUERYPROXY_OIDC_ISSUER` and `QUERYPROXY_OIDC_CLIENT_ID` (and
+  `QUERYPROXY_OIDC_CLIENT_SECRET`, or `QUERYPROXY_OIDC_CLIENT_SECRET_FILE`) and
+  the login page offers "Log in with SSO". It works with any provider that
+  publishes discovery (Keycloak, Entra ID, Okta, Google, Authentik): authorization
+  code flow with PKCE, `state` and `nonce`, and the ID token signature is checked
+  against the provider's keys. Register `{APP_URL}/auth/oidc/callback` as the
+  redirect URI. The first sign-in creates the user, and an existing local account
+  with the same e-mail address is linked, but only when the provider says the
+  address is verified (`email_verified`); otherwise the sign-in is refused and
+  the refusal is audited (`auth.sso_refused`). A user is identified by issuer and
+  subject together. `QUERYPROXY_OIDC_ROLE_MAP` (`group:team:role`, comma-separated)
+  turns the groups in `QUERYPROXY_OIDC_GROUP_CLAIM` (default `groups`) into team
+  roles at every sign-in: memberships in the teams the map names are added,
+  changed and removed to match the IdP, and each change is audited
+  (`user.role_synced`). Memberships in other teams are not touched. While a role
+  map is set, a token without the group claim (including a "groups overage"
+  reference) is refused and nothing is changed; an empty group list is applied
+  as such. Suspended and deleted users cannot sign in through SSO either. `QUERYPROXY_OIDC_SCOPES`
+  changes the requested scopes (some providers need `groups`). New audit events:
+  `auth.sso_login`, `auth.sso_refused`, `user.sso_provisioned`, `user.sso_linked`,
+  `user.role_synced`.
+  Role changes at the IdP apply at the next sign-in.
+- **`QUERYPROXY_LOCAL_LOGIN` limits password login: `all` (default), `admins_only`
+  or `none`.** With `admins_only` only system admins sign in with a password
+  (break-glass access); with `none` password login and password reset are off, so
+  make sure SSO works first. An unknown value is treated as `admins_only`.
+- **CI signs in to a real Keycloak.** The new `oidc` job in the CI workflow
+  imports a test realm and checks the sign-in and the group-to-role sync end to
+  end.
 
 ### Changed
 
 - **A pre-release no longer moves `latest`.** A pre-release tag such as
   `v0.4.0-rc.1` now publishes only its version tag; `latest` stays on the
   most recently published stable release.
+- **`users.password` can be empty, and users have an `auth_provider`, an
+  `external_issuer` and an `external_id`.** Changing `QUERYPROXY_OIDC_ISSUER`
+  later does not carry existing SSO accounts over: they are tied to the old
+  issuer and are refused rather than taken over by e-mail. Migration `2026_10_26_000001` adds the columns; accounts that
+  sign in through SSO have no local password, so no password can be set for them
+  through the reset link. Rolling the migration back stops while such accounts
+  exist.
+- **SSO users are outside `QUERYPROXY_REQUIRE_2FA`.** Their second factor is the
+  identity provider's, so enforce MFA there. A local account that was linked to
+  the provider and still signs in with its password stays covered.
 
 ### Security
 

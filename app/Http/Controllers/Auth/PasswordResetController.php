@@ -11,8 +11,12 @@ use Illuminate\View\View;
 
 class PasswordResetController extends Controller
 {
-    public function request(): View
+    public function request(): View|RedirectResponse
     {
+        if ($this->resetDisabled()) {
+            return redirect()->route('login')->withErrors(['email' => __('Password reset is disabled. Use single sign-on.')]);
+        }
+
         return view('auth.forgot-password');
     }
 
@@ -20,15 +24,21 @@ class PasswordResetController extends Controller
     {
         $request->validate(['email' => ['required', 'email']]);
 
-        // The response is identical whether or not the account exists, so the
-        // form cannot be used to enumerate users.
-        Password::sendResetLink($request->only('email'));
+        // The response is identical whether or not the account exists (or may
+        // reset a password at all), so the form cannot be used to enumerate users.
+        if (! $this->resetDisabled() && $this->mayReset((string) $request->input('email'))) {
+            Password::sendResetLink($request->only('email'));
+        }
 
         return back()->with('status', __('If that address belongs to an account, a reset link is on its way.'));
     }
 
-    public function reset(string $token): View
+    public function reset(string $token): View|RedirectResponse
     {
+        if ($this->resetDisabled()) {
+            return redirect()->route('login')->withErrors(['email' => __('Password reset is disabled. Use single sign-on.')]);
+        }
+
         return view('auth.reset-password', ['token' => $token]);
     }
 
@@ -39,6 +49,15 @@ class PasswordResetController extends Controller
             'email' => ['required', 'email'],
             'password' => ['required', 'string', 'min:8', 'confirmed'],
         ]);
+
+        if ($this->resetDisabled()) {
+            return redirect()->route('login')->withErrors(['email' => __('Password reset is disabled. Use single sign-on.')]);
+        }
+
+        // Same answer as an invalid token for an account that may not reset.
+        if (! $this->mayReset((string) $request->input('email'))) {
+            return back()->withErrors(['email' => __(Password::INVALID_TOKEN)]);
+        }
 
         $status = Password::reset(
             $request->only('email', 'password', 'password_confirmation', 'token'),
@@ -52,5 +71,33 @@ class PasswordResetController extends Controller
         return $status === Password::PasswordReset
             ? redirect()->route('login')->with('status', __('Your password has been reset. You can log in now.'))
             : back()->withErrors(['email' => __($status)]);
+    }
+
+    /** QUERYPROXY_LOCAL_LOGIN=none switches password reset off together with password login. */
+    private function resetDisabled(): bool
+    {
+        return config('queryproxy.local_login') === 'none';
+    }
+
+    /**
+     * Whether a reset may be offered to this address. Under `admins_only` only
+     * system admins have a use for a password; an account that signs in
+     * through SSO and has no local password must not be handed one, or it
+     * would outlive its deprovisioning at the identity provider.
+     */
+    private function mayReset(string $email): bool
+    {
+        $user = User::where('email', $email)->first();
+
+        if ($user === null) {
+            // Unknown address: let the broker answer as it always did.
+            return true;
+        }
+
+        if ($user->isSsoUser() && $user->getAuthPassword() === null) {
+            return false;
+        }
+
+        return config('queryproxy.local_login') !== 'admins_only' || $user->isAdmin();
     }
 }

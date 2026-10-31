@@ -18,6 +18,8 @@ enum AuditEvent: string
     case AuthLogin = 'auth.login';
     case AuthLogout = 'auth.logout';
     case AuthPasswordReset = 'auth.password_reset';
+    case AuthSsoLogin = 'auth.sso_login';
+    case AuthSsoRefused = 'auth.sso_refused';
 
     // Users
     case UserCreated = 'user.created';
@@ -31,6 +33,9 @@ enum AuditEvent: string
     case UserTwoFactorEnabled = 'user.two_factor_enabled';
     case UserTwoFactorDisabled = 'user.two_factor_disabled';
     case UserTwoFactorReset = 'user.two_factor_reset';
+    case UserSsoProvisioned = 'user.sso_provisioned';
+    case UserSsoLinked = 'user.sso_linked';
+    case UserRoleSynced = 'user.role_synced';
 
     // Teams
     case TeamCreated = 'team.created';
@@ -85,6 +90,8 @@ enum AuditEvent: string
             self::AuthLogin => 'A user signed in (metadata.two_factor is set for the second factor).',
             self::AuthLogout => 'A user signed out.',
             self::AuthPasswordReset => 'A user reset their own password through the reset link.',
+            self::AuthSsoLogin => 'A user signed in through the OpenID Connect identity provider (metadata.issuer; metadata.groups_claim_present tells whether the provider sent the group claim).',
+            self::AuthSsoRefused => 'An SSO sign-in was refused because the provider does not assert the e-mail address as verified (metadata.reason = link_unverified_email | provision_unverified_email, metadata.user, metadata.issuer). No account was created or linked.',
 
             self::UserCreated => 'An administrator created a user.',
             self::UserDeleted => 'An administrator deleted (soft-deleted) a user; metadata.cancelled_requests lists the pending requests cancelled with it.',
@@ -97,6 +104,9 @@ enum AuditEvent: string
             self::UserTwoFactorEnabled => 'A user enabled two-factor authentication.',
             self::UserTwoFactorDisabled => 'A user disabled two-factor authentication.',
             self::UserTwoFactorReset => 'An administrator reset the two-factor authentication of a user.',
+            self::UserSsoProvisioned => 'A user account was created at the first SSO sign-in (just-in-time provisioning; metadata.user is the e-mail address, metadata.issuer the provider).',
+            self::UserSsoLinked => 'An existing local account was linked to an identity provider subject because the provider asserted the e-mail address as verified (metadata.user, metadata.issuer).',
+            self::UserRoleSynced => 'A team membership of an SSO user was added, changed or removed to match the identity provider groups (metadata.change = added|changed|removed, metadata.team, metadata.from, metadata.to).',
 
             self::TeamCreated => 'A team was created.',
             self::TeamDeleted => 'A team was deleted.',

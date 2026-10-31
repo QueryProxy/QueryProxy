@@ -119,6 +119,67 @@ jobs:
           ./vendor/bin/pest --ci --filter='dumped for promtool'
           docker run --rm -i --entrypoint promtool prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3 check metrics < "$QUERYPROXY_METRICS_DUMP"
 
+  # OIDC sign-in and group-to-role sync against a real Keycloak (ADR-023). A
+  # service container cannot mount files from the repository (it starts before
+  # the checkout), so Keycloak is started with docker run after it, importing
+  # the realm in tests/Integration/keycloak/realm-export.json. The image is
+  # pinned by digest (the multi-arch index of 26.8.1), like the actions above;
+  # to bump it, re-resolve the digest of the new tag
+  # (docker buildx imagetools inspect quay.io/keycloak/keycloak:<tag>) - never
+  # edit the tag alone. Dependabot does not watch this line.
+  oidc:
+    name: oidc (keycloak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # A missing or unreachable Keycloak fails the test instead of skipping it.
+      QUERYPROXY_IT_OIDC_REQUIRED: '1'
+      QUERYPROXY_IT_OIDC_ISSUER: http://localhost:8080/realms/queryproxy
+      QUERYPROXY_IT_OIDC_ADMIN_USER: admin
+      QUERYPROXY_IT_OIDC_ADMIN_PASSWORD: admin
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, intl, zip, bcmath
+          coverage: none
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Start Keycloak with the test realm
+        run: |
+          docker run -d --name keycloak -p 8080:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+            -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -v "$GITHUB_WORKSPACE/tests/Integration/keycloak:/opt/keycloak/data/import:ro" \
+            quay.io/keycloak/keycloak:26.8.1@sha256:a78d6b79572168cb25886b80a8b5b8d4ed4390743e3eecb810538683e209dd6b \
+            start-dev --import-realm
+
+      - name: Wait for the realm
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS "$QUERYPROXY_IT_OIDC_ISSUER/.well-known/openid-configuration" > /dev/null; then
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs keycloak
+          echo "Keycloak did not come up with the test realm." >&2
+          exit 1
+
+      - name: OIDC login and group sync
+        run: ./vendor/bin/pest --ci tests/Integration/Oidc/KeycloakLoginTest.php
+
+      - name: Keycloak log
+        if: ${{ failure() }}
+        run: docker logs keycloak
+
   test:
     needs: tests
     if: ${{ !cancelled() }}

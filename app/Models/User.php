@@ -20,6 +20,10 @@ class User extends Authenticatable
     /** @use HasFactory<UserFactory> */
     use HasFactory, Notifiable, SoftDeletes;
 
+    public const PROVIDER_LOCAL = 'local';
+
+    public const PROVIDER_OIDC = 'oidc';
+
     protected function casts(): array
     {
         return [
@@ -32,6 +36,12 @@ class User extends Authenticatable
             'two_factor_confirmed_at' => 'datetime',
             'two_factor_last_used_timestamp' => 'integer',
         ];
+    }
+
+    /** True when the account is identified by the OpenID Connect provider (users.auth_provider). */
+    public function isSsoUser(): bool
+    {
+        return $this->auth_provider === self::PROVIDER_OIDC;
     }
 
     public function isSuspended(): bool
