@@ -2,16 +2,11 @@
 
 namespace App\Livewire\Studio;
 
-use App\Enums\QueryRequestStatus;
 use App\Models\Connection;
-use App\Models\QueryRequest;
 use App\Models\Team;
-use App\Models\User;
-use App\Services\Approvals\ApprovalNotifier;
-use App\Services\Masking\SensitiveFilterDetector;
-use App\Services\Metrics\MetricsRecorder;
+use App\Services\Requests\RequestSubmissionException;
+use App\Services\Requests\RequestSubmissionService;
 use App\Services\Sql\SqlInspector;
-use Illuminate\Support\Facades\DB;
 use Livewire\Attributes\Title;
 use Livewire\Component;
 
@@ -79,7 +74,7 @@ class QueryStudio extends Component
         return $result->passes();
     }
 
-    public function submit(SqlInspector $inspector, SensitiveFilterDetector $sensitiveFilters): void
+    public function submit(RequestSubmissionService $submissions): void
     {
         $this->validate([
             'connectionId' => ['required', 'integer'],
@@ -89,60 +84,17 @@ class QueryStudio extends Component
         ]);
 
         $connection = Connection::forTeam($this->team())->findOrFail($this->connectionId);
-        $this->authorize('use', $connection);
 
-        if (! $this->validateSql($inspector)) {
-            // Counted here and not in validateSql(): that also backs the
-            // Validate button, which is a preview that can be pressed any
-            // number of times, not a refused submission.
-            app(MetricsRecorder::class)->guardRejected($this->violations);
+        try {
+            $request = $submissions->submit(auth()->user(), $connection, $this->sql, $this->note, 'web', $this->title);
+        } catch (RequestSubmissionException $e) {
+            $this->violations = $e->violations;
+            $this->preparedPreview = null;
+            $this->previewType = null;
+            $this->validated = false;
 
             return;
         }
-
-        $result = $inspector->inspect($this->sql, $connection->driver);
-
-        // A warning for the approver only: a failure here must never stop the submission.
-        try {
-            $sensitiveFilterColumns = $sensitiveFilters->detect($result->preparedSql(), $connection);
-        } catch (\Throwable $e) {
-            report($e);
-            $sensitiveFilterColumns = null;
-        }
-
-        $request = DB::transaction(function () use ($connection, $result, $sensitiveFilterColumns) {
-            // Same row lock as UserLifecycle::delete: a user deleted or
-            // suspended since the request began cannot leave a pending request.
-            $owner = User::whereKey(auth()->id())->lockForUpdate()->first();
-            abort_if($owner === null || $owner->isSuspended(), 403);
-
-            $request = QueryRequest::create([
-                'team_id' => $this->team()->id,
-                'connection_id' => $connection->id,
-                'user_id' => auth()->id(),
-                'title' => $this->title ?: null,
-                'note' => trim($this->note) !== '' ? trim($this->note) : null,
-                'sql_original' => $this->sql,
-                'sql_prepared' => $result->preparedSql(),
-                'statement_count' => count($result->statements),
-                'is_transaction' => $result->isTransaction,
-                'is_ddl' => $result->hasDdl(),
-                'type' => $result->type(),
-                'status' => QueryRequestStatus::Pending,
-                'sensitive_filter_columns' => $sensitiveFilterColumns,
-            ]);
-
-            audit()->record('request.submitted', request: $request, sql: $request->sql_prepared, metadata: [
-                'type' => $request->type->value,
-                'statements' => $request->statement_count,
-            ]);
-
-            return $request;
-        }, attempts: 3);
-
-        app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Pending, $request->type);
-
-        ApprovalNotifier::requestSubmitted($request);
 
         session()->flash('status', 'Query request #'.$request->id.' submitted for approval.');
 
