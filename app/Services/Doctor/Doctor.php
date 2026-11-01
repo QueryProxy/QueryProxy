@@ -16,6 +16,7 @@ use App\Services\Doctor\Checks\QueueTimingCheck;
 use App\Services\Doctor\Checks\ResultDiskCheck;
 use App\Services\Doctor\Checks\SchedulerCheck;
 use App\Services\Doctor\Checks\SecretFilesCheck;
+use App\Services\Doctor\Checks\SecretStoreCheck;
 use App\Services\Doctor\Checks\SiemCheck;
 use App\Services\Doctor\Checks\SqliteAllowedDirCheck;
 use App\Services\Doctor\Checks\StoragePermissionsCheck;
@@ -42,6 +43,7 @@ class Doctor
             new AppKeyCheck,
             new AppKeyLocationCheck,
             new SecretFilesCheck,
+            new SecretStoreCheck,
             new AppEnvironmentCheck,
             new DatabaseCheck,
             new QueueTimingCheck,

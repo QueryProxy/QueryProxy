@@ -185,17 +185,63 @@ jobs:
         if: ${{ always() }}
         run: docker compose -f ${{ matrix.compose-file }} down --volumes
 
+  # External secret references (ADR-028): the Vault driver against a real
+  # dev-mode Vault. The AWS and Azure drivers have no such container; their
+  # tests (tests/Feature/Secrets) run in ci.yml against faked answers.
+  vault:
+    name: integration (vault)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # A missing server fails the test instead of skipping it.
+      QUERYPROXY_IT_VAULT_REQUIRED: '1'
+      QUERYPROXY_IT_VAULT_ADDR: http://127.0.0.1:18200
+      # Must match -dev-root-token-id in docker-compose.integration.yml.
+      QUERYPROXY_IT_VAULT_TOKEN: queryproxy-test-root
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          extensions: pdo_sqlite, intl, zip, bcmath
+          coverage: none
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Prepare application
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Start Vault
+        run: docker compose -f docker-compose.integration.yml up -d --wait vault
+
+      - name: Vault secret reference tests
+        run: ./vendor/bin/pest --group=integration --filter=VaultSecret
+
+      - name: Server logs
+        if: ${{ failure() }}
+        run: docker compose -f docker-compose.integration.yml logs --no-color --tail=200 vault
+
+      - name: Stop Vault
+        if: ${{ always() }}
+        run: docker compose -f docker-compose.integration.yml down --volumes
+
   # Matrix jobs report as "integration (pgsql)", "integration (mariadb 11.8)", ... so
   # branch protection requires the single `integration` job below, which
   # aggregates their result (the same shape as `test` in ci.yml).
   integration:
-    needs: databases
+    needs: [databases, vault]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check matrix result
-        run: test "${{ needs.databases.result }}" = "success"
+        run: test "${{ needs.databases.result }}" = "success" && test "${{ needs.vault.result }}" = "success"
 
   # Upgrade test: data written by the previous release (0.3.3) must survive
   # starting the image built from this checkout, which runs the new migrations

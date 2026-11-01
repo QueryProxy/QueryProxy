@@ -9,6 +9,10 @@ use App\Models\QueryRequest;
 use App\Models\User;
 use App\Services\Api\TokenService;
 use App\Services\Auth\TwoFactorService;
+use App\Services\Secrets\Drivers\AwsSecretsManagerDriver;
+use App\Services\Secrets\Drivers\AzureKeyVaultDriver;
+use App\Services\Secrets\Drivers\VaultDriver;
+use App\Services\Secrets\SecretResolver;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Database\LostConnectionDetector as LostConnectionDetectorContract;
@@ -46,6 +50,14 @@ class AppServiceProvider extends ServiceProvider
         $this->app->extend(LostConnectionDetectorContract::class, function (LostConnectionDetectorContract $detector) {
             return new ReadOnlyAwareLostConnectionDetector($detector);
         });
+
+        // External secret references (ADR-028). Singletons on purpose: the
+        // resolver keeps the resolved values and each driver its access token in
+        // process memory, which is the only cache the values may live in.
+        $this->app->singleton(SecretResolver::class);
+        $this->app->singleton(VaultDriver::class);
+        $this->app->singleton(AwsSecretsManagerDriver::class);
+        $this->app->singleton(AzureKeyVaultDriver::class);
     }
 
     public function boot(): void

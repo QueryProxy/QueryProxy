@@ -13,6 +13,9 @@
 #   mariadb   mariadb       13316  no TLS           mariadb-tls   13317  TLS
 #   sqlsrv    mssql         11433  TLS (self-signed), no way to switch it off
 #
+# The `vault` service (dev-mode HashiCorp Vault, 18200) is not a database: it is
+# the secret store of tests/Integration/VaultSecretTest.php (ADR-028).
+#
 # MariaDB runs on two LTS lines. This file holds 11.4; 11.8 has the same pair of
 # servers in its own file, tests/Integration/docker/mariadb-11-8/docker-compose.yml
 # (ports 13318 no TLS, 13319 TLS), which is used on its own, never merged with
@@ -196,3 +199,20 @@ services:
       timeout: 5s
       retries: 40
       start_period: 20s
+
+  vault:
+    # Dev mode: in-memory, unsealed, KV v2 mounted at secret/, and a fixed root
+    # token. Test-only; never reachable beyond the loopback interface.
+    image: hashicorp/vault:1.20.4@sha256:268bb80aa9c6d13d65fcfa05c0c268caca068952240a8087291a6ce0b66e3a10
+    command: ["server", "-dev", "-dev-root-token-id=queryproxy-test-root", "-dev-listen-address=0.0.0.0:8200"]
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_ADDR: http://127.0.0.1:8200
+    ports:
+      - "127.0.0.1:18200:8200"
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

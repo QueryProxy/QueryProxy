@@ -86,12 +86,15 @@ class QueryExecutor
         // rows are mutable and cascade-deletable, the audit trail is not.
         audit()->record('request.execution_started', actor: $request->reviewer, request: $request, sql: $request->sql_prepared);
 
-        $connectionName = $this->factory->configure($connection);
         $start = hrtime(true);
         $settled = false;
         $owned = false;
 
         try {
+            // Inside the try: resolving an external secret reference (ADR-028)
+            // can fail, and that has to end the request as failed.
+            $connectionName = $this->factory->configure($connection);
+
             $this->assertDefaultQuoting($connection, $connectionName);
 
             $statements = $this->inspector->splitStatements($request->sql_prepared);

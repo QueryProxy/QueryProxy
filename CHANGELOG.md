@@ -8,6 +8,23 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Added
 
+- External secret references for connection passwords (ADR-028): a
+  connection's password can be `vault://<mount>/<path>#<key>`,
+  `aws-sm://<secret-id>[#<json-key>]` or
+  `azure-kv://<vault-name>/<secret-name>[/<version>]` instead of a value. It
+  is resolved when the connection is opened and never stored. HashiCorp
+  Vault (KV v2/v1; token, AppRole, Kubernetes auth), AWS Secrets Manager
+  (default credential chain, IRSA included) and Azure Key Vault (client
+  secret, workload identity, managed identity) are supported. Resolution is
+  fail-closed: the request fails with a generic message and the new
+  `secret.resolve_failed` audit event records the reference, never the
+  value. Values are cached in process memory only
+  (`QUERYPROXY_SECRET_CACHE_TTL`, default 300 s). A system admin sets the
+  reference prefixes each team may use (`queryproxy:team:secret-prefixes`);
+  a team without prefixes cannot use references. Optional
+  `QUERYPROXY_SECRET_ALLOWED_REFERENCES` limits references instance-wide.
+  "Test connection" resolves the reference; `queryproxy:doctor` checks the
+  store settings.
 - `qp`, the command-line client for the REST API (separate repository
   `QueryProxy/qp`, ADR-030): `qp submit --wait` files a request, waits for
   approval and prints the result; `qp status`, `qp results`. Static binaries

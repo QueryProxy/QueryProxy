@@ -327,6 +327,74 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | External secret references (ADR-028)
+    |--------------------------------------------------------------------------
+    | A connection's password may be a reference instead of a value:
+    |   vault://<mount>/<path>#<key>
+    |   aws-sm://<secret-id>[#<json-key>]
+    |   azure-kv://<vault-name>/<secret-name>[/<version>]
+    | It is resolved when a connection is opened, right before the credentials
+    | go to the database driver, and never stored. Resolved values are cached in
+    | process memory only (not in Laravel's cache store) for `cache_ttl`
+    | seconds; 0 turns the cache off. Which references a connection may use is
+    | bounded per team (ADR-028 amendment): a system administrator sets the
+    | reference prefixes of a team (`php artisan queryproxy:team:secret-prefixes`),
+    | and a team without prefixes cannot use references. Run
+    | `php artisan queryproxy:doctor` to check the settings below.
+    */
+
+    'secrets' => [
+        'cache_ttl' => max(0, (int) env('QUERYPROXY_SECRET_CACHE_TTL', 300)),
+
+        // Seconds a secret store may take to connect and to answer.
+        'timeout' => max(1, (int) env('QUERYPROXY_SECRET_TIMEOUT', 5)),
+
+        'vault' => [
+            'address' => (string) env('QUERYPROXY_VAULT_ADDR', ''),
+            'namespace' => (string) env('QUERYPROXY_VAULT_NAMESPACE', ''),
+            'auth' => (string) env('QUERYPROXY_VAULT_AUTH', 'token'), // token | approle | kubernetes
+            'token' => (string) SecretFile::get('QUERYPROXY_VAULT_TOKEN', ''),
+            'role_id' => (string) env('QUERYPROXY_VAULT_ROLE_ID', ''),
+            'secret_id' => (string) SecretFile::get('QUERYPROXY_VAULT_SECRET_ID', ''),
+            'approle_mount' => (string) env('QUERYPROXY_VAULT_APPROLE_MOUNT', 'approle'),
+            'kubernetes_role' => (string) env('QUERYPROXY_VAULT_K8S_ROLE', ''),
+            'kubernetes_mount' => (string) env('QUERYPROXY_VAULT_K8S_MOUNT', 'kubernetes'),
+            'kubernetes_jwt_path' => (string) env('QUERYPROXY_VAULT_K8S_JWT_PATH', '/var/run/secrets/kubernetes.io/serviceaccount/token'),
+            'kv_version' => (string) env('QUERYPROXY_VAULT_KV_VERSION', '2'), // 2 | 1
+            // KV mount paths (comma-separated, may contain slashes: `kv/prod`).
+            // Required for KV v1, where nothing else tells a KV mount from any
+            // other API path. Optional for v2 (the first path segment is then
+            // the mount); when set it is an allowlist: only these mounts are read.
+            'mounts' => array_values(array_filter(array_map(
+                fn ($mount) => trim($mount, " \t\n\r\0\x0B/"),
+                explode(',', (string) env('QUERYPROXY_VAULT_MOUNTS', '')),
+            ))),
+            'ca_file' => (string) env('QUERYPROXY_VAULT_CA_FILE', ''),
+        ],
+
+        // The AWS credentials are the SDK's default chain (environment, shared
+        // files, IRSA web identity, ECS task role, instance profile).
+        'aws' => [
+            'region' => (string) env('QUERYPROXY_AWS_REGION', env('AWS_REGION', env('AWS_DEFAULT_REGION', ''))),
+            'endpoint' => (string) env('QUERYPROXY_AWS_ENDPOINT', ''),
+            // Whether the operator set AWS up for QueryProxy on purpose (a
+            // generic AWS_REGION is often present for S3 and says nothing).
+            'explicit' => env('QUERYPROXY_AWS_REGION') !== null || env('QUERYPROXY_AWS_ENDPOINT') !== null,
+        ],
+
+        'azure' => [
+            'auth' => (string) env('QUERYPROXY_AZURE_AUTH', 'auto'), // auto | client_secret | workload_identity | managed_identity
+            'tenant_id' => (string) env('QUERYPROXY_AZURE_TENANT_ID', env('AZURE_TENANT_ID', '')),
+            'client_id' => (string) env('QUERYPROXY_AZURE_CLIENT_ID', env('AZURE_CLIENT_ID', '')),
+            'client_secret' => (string) SecretFile::get('QUERYPROXY_AZURE_CLIENT_SECRET', ''),
+            'federated_token_file' => (string) env('QUERYPROXY_AZURE_FEDERATED_TOKEN_FILE', env('AZURE_FEDERATED_TOKEN_FILE', '')),
+            'authority_host' => (string) env('QUERYPROXY_AZURE_AUTHORITY_HOST', env('AZURE_AUTHORITY_HOST', '')),
+            'vault_dns_suffix' => (string) env('QUERYPROXY_AZURE_VAULT_DNS_SUFFIX', ''),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | SIEM sinks (ADR-021)
     |--------------------------------------------------------------------------
     | Every audit event can also be exported to external systems. All sinks are

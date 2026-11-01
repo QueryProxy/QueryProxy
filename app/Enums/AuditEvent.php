@@ -43,6 +43,7 @@ enum AuditEvent: string
     case TeamMemberAdded = 'team.member_added';
     case TeamMemberRemoved = 'team.member_removed';
     case TeamMemberRoleChanged = 'team.member_role_changed';
+    case TeamSecretPrefixesChanged = 'team.secret_prefixes_changed';
 
     // Connections
     case ConnectionCreated = 'connection.created';
@@ -51,6 +52,9 @@ enum AuditEvent: string
     case ConnectionTested = 'connection.tested';
     case ConnectionGrantAdded = 'connection.grant_added';
     case ConnectionGrantRevoked = 'connection.grant_revoked';
+
+    // External secret references (ADR-028)
+    case SecretResolveFailed = 'secret.resolve_failed';
 
     // Time-bound grants (ADR-025)
     case GrantRequested = 'grant.requested';
@@ -123,6 +127,7 @@ enum AuditEvent: string
             self::TeamMemberAdded => 'A user was added to a team.',
             self::TeamMemberRemoved => 'A user was removed from a team.',
             self::TeamMemberRoleChanged => 'The team role of a member was changed.',
+            self::TeamSecretPrefixesChanged => 'A system administrator changed the external secret reference prefixes a team may use for connection passwords (metadata.before and metadata.after are lists of prefixes). A team without prefixes cannot use references (ADR-028).',
 
             self::ConnectionCreated => 'A database connection was created.',
             self::ConnectionUpdated => 'A database connection was changed.',
@@ -130,6 +135,8 @@ enum AuditEvent: string
             self::ConnectionTested => 'A database connection was tested.',
             self::ConnectionGrantAdded => 'A DBA granted a developer access to a connection (metadata.developer, metadata.access_level = read|write, metadata.expires_at is null for a permanent grant, metadata.reason).',
             self::ConnectionGrantRevoked => 'A DBA removed a developer\'s access to a connection by hand (since v0.4.0 metadata.developer, metadata.access_level, metadata.expires_at, metadata.was_expired). Grants that end by time are recorded as grant.expired.',
+
+            self::SecretResolveFailed => 'A connection credential kept in an external secret store could not be resolved when the connection was opened or tested (metadata.field = password | read_password, metadata.scheme = vault | aws-sm | azure-kv, metadata.location is the path of the reference without its key, metadata.reason). The secret value, tokens and the store\'s answer are never recorded.',
 
             self::GrantRequested => 'A developer asked for time-bound access to a connection (metadata.grant_request_id, metadata.access_level, metadata.duration_minutes, metadata.reason).',
             self::GrantApproved => 'A DBA approved an access request; the grant starts now (metadata.grant_request_id, metadata.developer, metadata.access_level, metadata.expires_at, metadata.duration_minutes).',
