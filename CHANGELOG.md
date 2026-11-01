@@ -8,6 +8,13 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Added
 
+- Connection form: choose where a connection's password comes from —
+  stored password, HashiCorp Vault, AWS Secrets Manager or Azure Key Vault.
+  External sources take a secret reference with a format hint; the
+  connection list shows the source and the reference, never the password.
+- Admin > Teams: a system administrator sets the secret paths each team may
+  reference (audited, with an overlap warning). A team without paths cannot
+  choose an external source in the connection form.
 - External secret references for connection passwords (ADR-028): a
   connection's password can be `vault://<mount>/<path>#<key>`,
   `aws-sm://<secret-id>[#<json-key>]` or

@@ -75,23 +75,79 @@
                 </x-ui.field>
 
                 @if ($driver !== 'sqlite')
-                    <x-ui.field label="Username" :error="$errors->first('username')">
-                        <x-ui.input type="text" wire:model="username" autocomplete="off" />
+                    <x-ui.field label="Username" for="conn-username" :error="$errors->first('username')">
+                        <x-ui.input id="conn-username" type="text" wire:model="username" autocomplete="off" />
                     </x-ui.field>
 
-                    <x-ui.field label="Password" :hint="$editingId ? 'blank = keep current' : null" :error="$errors->first('password')">
-                        <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
-                    </x-ui.field>
+                    @php($externalOff = $secretPrefixes === [])
 
-                    <x-ui.field label="Read-only username" hint="optional" :error="$errors->first('readUsername')">
-                        <x-ui.input type="text" wire:model="readUsername" autocomplete="off" />
-                    </x-ui.field>
+                    @foreach ([
+                        ['password', 'credentialSource', 'conn-password', 'Password', 'Secret reference', null],
+                        ['readPassword', 'readCredentialSource', 'conn-read-password', 'Read-only password', 'Read-only secret reference', 'optional'],
+                    ] as [$model, $sourceModel, $inputId, $plainLabel, $refLabel, $newHint])
+                        @php($source = $this->{$sourceModel})
+                        @php($external = $source !== 'plain')
 
-                    <x-ui.field label="Read-only password" :hint="$editingId ? 'blank = keep current' : 'optional'" :error="$errors->first('readPassword')">
-                        <x-ui.input type="password" wire:model="readPassword" autocomplete="new-password" />
-                    </x-ui.field>
+                        @if ($model === 'readPassword')
+                            <x-ui.field label="Read-only username" for="conn-read-username" hint="optional" :error="$errors->first('readUsername')">
+                                <x-ui.input id="conn-read-username" type="text" wire:model="readUsername" autocomplete="off" />
+                            </x-ui.field>
+                        @endif
 
-                    <div></div>
+                        <x-ui.field :label="$model === 'readPassword' ? 'Read-only credential source' : 'Credential source'" :for="$inputId.'-source'" :error="$errors->first($sourceModel)">
+                            <x-ui.select :id="$inputId.'-source'" wire:model.live="{{ $sourceModel }}" aria-describedby="conn-credential-source-help">
+                                <option value="plain">Password stored in QueryProxy (encrypted)</option>
+                                @foreach ($sourceLabels as $scheme => $sourceLabel)
+                                    <option value="{{ $scheme }}" @disabled($externalOff && $source !== $scheme)>{{ $sourceLabel }} (reference){{ $externalOff && $source !== $scheme ? ' — not allowed for this team' : '' }}</option>
+                                @endforeach
+                            </x-ui.select>
+                        </x-ui.field>
+
+                        <x-ui.field :label="$external ? $refLabel : $plainLabel" :for="$inputId" :hint="$editingId ? 'blank = keep current' : $newHint" :error="$errors->first($model)" wire:key="credential-{{ $model }}-{{ $source }}">
+                            @if ($external)
+                                <div x-data="{ value: @js($this->{$model}), pattern: new RegExp(@js($sourcePatterns[$source] ?? '^$'), 'i') }">
+                                    <x-ui.input :id="$inputId" type="text" wire:model="{{ $model }}" class="font-mono" autocomplete="off" spellcheck="false"
+                                                :placeholder="$sourceFormats[$source][1] ?? ''"
+                                                aria-describedby="conn-credential-source-help {{ $inputId }}-warning"
+                                                x-on:input="value = $event.target.value.trim()" />
+                                    <p id="{{ $inputId }}-warning" x-show="value !== '' && ! pattern.test(value)" x-cloak aria-live="polite"
+                                       class="mt-1.5 text-[12px] text-pending">
+                                        This does not look like a {{ $sourceLabels[$source] ?? '' }} reference. Expected {{ $sourceFormats[$source][0] ?? '' }}. The server checks it again when you save.
+                                    </p>
+                                </div>
+                            @else
+                                <x-ui.input :id="$inputId" type="password" wire:model="{{ $model }}" autocomplete="new-password" />
+                            @endif
+                        </x-ui.field>
+                    @endforeach
+
+                    @php($usedSources = array_values(array_unique(array_filter([$credentialSource, $readCredentialSource], fn ($used) => $used !== 'plain'))))
+
+                    <div id="conn-credential-source-help" class="space-y-2 text-[12.5px] text-mute-4 sm:col-span-3">
+                        @if ($usedSources !== [])
+                            <p>The reference is stored instead of a password and is resolved when the connection is opened. The value it points to is never stored or shown.</p>
+                            @foreach ($usedSources as $used)
+                                <p>
+                                    {{ $sourceLabels[$used] ?? $used }}: <code class="font-mono">{{ $sourceFormats[$used][0] ?? '' }}</code>, for example <code class="font-mono break-all">{{ $sourceFormats[$used][1] ?? '' }}</code>.
+                                </p>
+                            @endforeach
+                        @else
+                            <p>The password is stored encrypted with the application key and is never sent back to the browser.</p>
+                        @endif
+
+                        @if ($externalOff)
+                            <x-ui.alert tone="pending" icon="alert">
+                                External secret stores are off for this team: a system administrator has to allow secret paths for it first (Admin, Teams, Secret paths). Until then only a stored password can be used.
+                            </x-ui.alert>
+                        @else
+                            <p>
+                                Paths this team may reference:
+                                @foreach ($secretPrefixes as $prefix)
+                                    <code class="font-mono break-all">{{ $prefix }}</code>@if (! $loop->last), @endif
+                                @endforeach
+                            </p>
+                        @endif
+                    </div>
 
                     <div class="sm:col-span-3 border-t border-line pt-3.5">
                         <p class="eyebrow mb-2.5">TLS</p>
@@ -193,6 +249,7 @@
                     <x-ui.th class="w-48">Name</x-ui.th>
                     <x-ui.th class="w-24">Driver</x-ui.th>
                     <x-ui.th>Database</x-ui.th>
+                    <x-ui.th class="w-56">Credentials</x-ui.th>
                     <x-ui.th class="w-44">TLS</x-ui.th>
                     <x-ui.th class="w-28">Developers</x-ui.th>
                     <x-ui.th class="w-52" align="right">Actions</x-ui.th>
@@ -204,6 +261,26 @@
                     <x-ui.td mono class="text-ink-2">{{ $connection->name }}</x-ui.td>
                     <x-ui.td><x-ui.badge>{{ $connection->driver->label() }}</x-ui.badge></x-ui.td>
                     <x-ui.td mono muted truncate>{{ $connection->database }}</x-ui.td>
+                    <x-ui.td>
+                        @php($passwordScheme = \App\Services\Secrets\SecretReference::schemeOf($connection->password))
+                        @php($readScheme = \App\Services\Secrets\SecretReference::schemeOf($connection->read_password))
+                        @if ($connection->driver === \App\Enums\DbDriver::Sqlite)
+                            <span class="text-mute-4">—</span>
+                        @else
+                            <div class="flex flex-col items-start gap-1">
+                                <x-ui.badge :tone="$passwordScheme ? 'accent' : 'neutral'">{{ $passwordScheme ? ($sourceLabels[$passwordScheme] ?? $passwordScheme) : 'Stored password' }}</x-ui.badge>
+                                @if ($passwordScheme)
+                                    <code class="max-w-[13rem] truncate font-mono text-[11px] text-mute-3" title="{{ $connection->password }}">{{ $connection->password }}</code>
+                                @endif
+                                @if ($readScheme)
+                                    <code class="max-w-[13rem] truncate font-mono text-[11px] text-mute-3" title="Read-only: {{ $connection->read_password }}">read-only: {{ $connection->read_password }}</code>
+                                @endif
+                                @if (in_array($connection->id, $blockedReferenceIds, true))
+                                    <x-ui.badge tone="danger">Outside team paths</x-ui.badge>
+                                @endif
+                            </div>
+                        @endif
+                    </x-ui.td>
                     <x-ui.td>
                         @switch($connection->tlsState())
                             @case('enforced') <x-ui.badge tone="ok">TLS required</x-ui.badge> @break
@@ -229,7 +306,7 @@
 
                 @if ($grantsForId === $connection->id)
                     <tr class="bg-canvas">
-                        <td colspan="6" class="border-b border-line px-3.5 py-3.5">
+                        <td colspan="7" class="border-b border-line px-3.5 py-3.5">
                             <p class="eyebrow mb-2.5">Developer access to “{{ $connection->name }}”</p>
 
                             <div class="mb-3.5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -339,7 +416,7 @@
                     </tr>
                 @endif
             @empty
-                <x-ui.empty :colspan="6">No connections yet.</x-ui.empty>
+                <x-ui.empty :colspan="7">No connections yet.</x-ui.empty>
             @endforelse
         </x-ui.table>
     </x-ui.panel>
