@@ -6,7 +6,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-31
+## [0.4.0] - 2026-11-01
 
 Step-by-step upgrade and rollback instructions, with the migration list, are
 on the [upgrading page](https://queryproxy.com/docs/upgrading/). Upgrade from
