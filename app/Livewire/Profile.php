@@ -57,8 +57,23 @@ class Profile extends Component
         session()->flash('status', 'Name updated.');
     }
 
+    /**
+     * A user without a local password (an SSO account) manages it at the
+     * identity provider; there is no password here to change.
+     */
+    private function hasLocalPassword(): bool
+    {
+        return auth()->user()->getAuthPassword() !== null;
+    }
+
     public function updatePassword(): void
     {
+        if (! $this->hasLocalPassword()) {
+            $this->addError('currentPassword', 'Your password is managed by your identity provider.');
+
+            return;
+        }
+
         $this->validate([
             'currentPassword' => ['required', 'current_password'],
             'password' => ['required', 'string', 'min:8', 'confirmed'],
@@ -151,6 +166,7 @@ class Profile extends Component
         $setupSecret = session('two_factor_setup_secret');
 
         return view('livewire.profile', [
+            'hasLocalPassword' => $this->hasLocalPassword(),
             'twoFactorEnabled' => $user->hasTwoFactorEnabled(),
             'twoFactorRequired' => $twoFactor->isRequiredFor($user),
             'mailEvents' => MailEvent::cases(),

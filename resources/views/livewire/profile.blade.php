@@ -15,21 +15,25 @@
     </x-ui.panel>
 
     <x-ui.panel title="Change password" padded>
-        <form wire:submit="updatePassword" class="flex flex-col gap-3.5">
-            <x-ui.field label="Current password" :error="$errors->first('currentPassword')">
-                <x-ui.input type="password" wire:model="currentPassword" autocomplete="current-password" />
-            </x-ui.field>
+        @if ($hasLocalPassword)
+            <form wire:submit="updatePassword" class="flex flex-col gap-3.5">
+                <x-ui.field label="Current password" :error="$errors->first('currentPassword')">
+                    <x-ui.input type="password" wire:model="currentPassword" autocomplete="current-password" />
+                </x-ui.field>
 
-            <x-ui.field label="New password" :error="$errors->first('password')">
-                <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
-            </x-ui.field>
+                <x-ui.field label="New password" :error="$errors->first('password')">
+                    <x-ui.input type="password" wire:model="password" autocomplete="new-password" />
+                </x-ui.field>
 
-            <x-ui.field label="New password (again)">
-                <x-ui.input type="password" wire:model="password_confirmation" autocomplete="new-password" />
-            </x-ui.field>
+                <x-ui.field label="New password (again)">
+                    <x-ui.input type="password" wire:model="password_confirmation" autocomplete="new-password" />
+                </x-ui.field>
 
-            <x-ui.btn type="submit" variant="primary" class="self-start">Change password</x-ui.btn>
-        </form>
+                <x-ui.btn type="submit" variant="primary" class="self-start">Change password</x-ui.btn>
+            </form>
+        @else
+            <p class="text-[12.5px] text-mute">Your password is managed by your identity provider.</p>
+        @endif
     </x-ui.panel>
 
     <x-ui.panel title="Two-factor authentication" padded class="mt-3.5">

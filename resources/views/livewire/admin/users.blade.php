@@ -17,6 +17,10 @@
         </x-ui.alert>
     @endif
 
+    @error('resetPassword')
+        <x-ui.alert tone="danger" icon="shield" class="mb-3.5">{{ $message }}</x-ui.alert>
+    @enderror
+
     <x-ui.panel padded class="mb-3.5">
         <form wire:submit="createUser" class="grid grid-cols-1 items-end gap-3 sm:grid-cols-5">
             <x-ui.field label="Name" :error="$errors->first('name')">
@@ -87,8 +91,10 @@
                                 <x-ui.action wire:click="toggleAdmin({{ $u->id }})" tone="accent">
                                     {{ $u->is_admin ? 'Revoke admin' : 'Make admin' }}
                                 </x-ui.action>
-                                <x-ui.action wire:click="resetPassword({{ $u->id }})"
-                                             wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                @unless ($u->isSsoUser())
+                                    <x-ui.action wire:click="resetPassword({{ $u->id }})"
+                                                 wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                @endunless
                                 @if ($u->hasTwoFactorEnabled())
                                     <x-ui.action wire:click="resetTwoFactor({{ $u->id }})"
                                                  wire:confirm="Reset two-factor authentication for {{ $u->email }}? They will log in with password only until they re-enroll.">Reset 2FA</x-ui.action>

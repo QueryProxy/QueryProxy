@@ -31,6 +31,12 @@ class OidcController extends Controller
     /** Session key of the time (Unix seconds) the session was last opened through SSO (ADR-024). */
     public const SESSION_AT_KEY = 'auth.via_oidc_at';
 
+    /**
+     * Session key of the raw ID token of the SSO sign-in, kept only as the
+     * `id_token_hint` of RP-initiated logout. Never logged, never audited.
+     */
+    public const SESSION_ID_TOKEN_KEY = 'auth.oidc_id_token';
+
     /** How far the provider's clock may trail ours when `auth_time` is compared with the start of a confirmation. */
     private const REAUTH_CLOCK_SKEW_SECONDS = 30;
 
@@ -108,8 +114,10 @@ class OidcController extends Controller
         // One attempt, one callback: whatever happens next, it cannot be replayed.
         $flow = $request->session()->pull(self::FLOW_KEY);
 
+        $idToken = null;
+
         try {
-            $claims = $this->completeFlow($request, $oidc, $flow);
+            $claims = $this->completeFlow($request, $oidc, $flow, $idToken);
 
             $issuer = (string) $claims['iss'];
 
@@ -150,6 +158,10 @@ class OidcController extends Controller
         $request->session()->regenerate();
         $request->session()->put(self::SESSION_FLAG, true);
         $request->session()->put(self::SESSION_AT_KEY, now()->getTimestamp());
+
+        if ($idToken !== null) {
+            $request->session()->put(self::SESSION_ID_TOKEN_KEY, $idToken);
+        }
 
         audit()->record(AuditEvent::AuthSsoLogin, metadata: [
             'issuer' => $issuer,
@@ -201,7 +213,7 @@ class OidcController extends Controller
      *
      * @throws OidcException
      */
-    private function completeFlow(Request $request, OidcClient $oidc, mixed $flow): array
+    private function completeFlow(Request $request, OidcClient $oidc, mixed $flow, ?string &$idToken): array
     {
         if (! is_array($flow) || ! isset($flow['state'], $flow['nonce'], $flow['verifier'], $flow['started_at'])) {
             throw new OidcException('The callback has no sign-in attempt in progress.');
@@ -232,6 +244,7 @@ class OidcController extends Controller
             $flow['nonce'],
             route('oidc.callback'),
             (string) config('queryproxy.oidc.group_claim'),
+            $idToken,
         );
     }
 

@@ -2,6 +2,7 @@
 
 use App\Livewire\Admin\Users;
 use App\Livewire\Profile;
+use App\Models\AuditLog;
 use App\Models\User;
 use Illuminate\Auth\Notifications\ResetPassword;
 use Illuminate\Support\Facades\Hash;
@@ -75,6 +76,64 @@ test('admins cannot reset their own password from the users page', function () {
         ->assertHasErrors('email');
 
     expect($admin->fresh()->password)->toBe($oldHash);
+});
+
+test('admins cannot reset the password of an SSO-linked user, whatever the local login setting', function (string $localLogin) {
+    config(['queryproxy.local_login' => $localLogin]);
+    $admin = User::factory()->create(['is_admin' => true]);
+    $sso = User::factory()->create(['auth_provider' => 'oidc', 'external_issuer' => 'https://idp.test', 'external_id' => 'sub-x', 'password' => null]);
+    $linked = User::factory()->create(['auth_provider' => 'oidc', 'external_issuer' => 'https://idp.test', 'external_id' => 'sub-y']);
+    $linkedHash = $linked->password;
+
+    Livewire::actingAs($admin)
+        ->test(Users::class)
+        ->call('resetPassword', $sso->id)
+        ->assertHasErrors('resetPassword')
+        ->assertSee('their password is managed at the identity provider')
+        ->assertHasNoErrors('email')
+        ->call('resetPassword', $linked->id)
+        ->assertHasErrors('resetPassword');
+
+    expect($sso->fresh()->password)->toBeNull()
+        ->and($linked->fresh()->password)->toBe($linkedHash)
+        ->and(AuditLog::where('action', 'user.password_reset')->count())->toBe(0);
+})->with(['all', 'admins_only', 'none']);
+
+test('the users page offers the reset button for local users only', function () {
+    $admin = User::factory()->create(['is_admin' => true]);
+    User::factory()->create(['email' => 'local@example.test']);
+    User::factory()->create(['email' => 'sso@example.test', 'auth_provider' => 'oidc', 'external_issuer' => 'https://idp.test', 'external_id' => 'sub-x', 'password' => null]);
+
+    Livewire::actingAs($admin)
+        ->test(Users::class)
+        ->assertSeeHtml('resetPassword(')
+        ->assertDontSeeHtml('Generate a new password for sso@example.test')
+        ->assertSeeHtml('Generate a new password for local@example.test');
+});
+
+test('the profile password form is hidden for a user without a local password and the action refuses', function () {
+    $sso = User::factory()->create(['auth_provider' => 'oidc', 'external_issuer' => 'https://idp.test', 'external_id' => 'sub-x', 'password' => null]);
+
+    Livewire::actingAs($sso)
+        ->test(Profile::class)
+        ->assertSee('Your password is managed by your identity provider.')
+        ->assertDontSee('New password (again)')
+        ->set('currentPassword', 'anything')
+        ->set('password', 'new-password-123')
+        ->set('password_confirmation', 'new-password-123')
+        ->call('updatePassword')
+        ->assertHasErrors('currentPassword');
+
+    expect($sso->fresh()->password)->toBeNull();
+});
+
+test('the profile password form is shown to a local user', function () {
+    $user = User::factory()->create();
+
+    Livewire::actingAs($user)
+        ->test(Profile::class)
+        ->assertSee('New password (again)')
+        ->assertDontSee('Your password is managed by your identity provider.');
 });
 
 test('a reset link is sent for known accounts and the response never enumerates', function () {

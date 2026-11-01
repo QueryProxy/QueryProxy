@@ -111,6 +111,15 @@ class Users extends Component
             return;
         }
 
+        // An account tied to the identity provider gets no local password,
+        // whatever QUERYPROXY_LOCAL_LOGIN says: it would outlive the
+        // deprovisioning there (ADR-016 Amendment 2026-10-26, ADR-023).
+        if ($user->isSsoUser()) {
+            $this->addError('resetPassword', 'This user signs in through single sign-on; their password is managed at the identity provider.');
+
+            return;
+        }
+
         $password = Str::password(16);
         $user->update([
             'password' => $password,

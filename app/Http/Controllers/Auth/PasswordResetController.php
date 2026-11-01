@@ -81,9 +81,10 @@ class PasswordResetController extends Controller
 
     /**
      * Whether a reset may be offered to this address. Under `admins_only` only
-     * system admins have a use for a password; an account that signs in
-     * through SSO and has no local password must not be handed one, or it
-     * would outlive its deprovisioning at the identity provider.
+     * system admins have a use for a password. An account tied to the
+     * identity provider must never be handed one (ADR-016 Amendment
+     * 2026-10-26, ADR-023): a local password would outlive its
+     * deprovisioning there. That holds under `all` too.
      */
     private function mayReset(string $email): bool
     {
@@ -94,7 +95,7 @@ class PasswordResetController extends Controller
             return true;
         }
 
-        if ($user->isSsoUser() && $user->getAuthPassword() === null) {
+        if ($user->isSsoUser()) {
             return false;
         }
 

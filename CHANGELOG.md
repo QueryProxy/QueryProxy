@@ -8,12 +8,27 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Added
 
+- Logging out of an SSO session now also ends the identity provider session
+  (RP-initiated logout) when the provider publishes an
+  `end_session_endpoint`; register `<APP_URL>/login` as a post-logout
+  redirect URI at the provider.
 - Helm chart is now published on every release tag as
   `oci://ghcr.io/queryproxy/charts/queryproxy:<version>`, signed keyless with
   cosign; the release fails before anything is pushed if the tag differs
   from `Chart.yaml` `version`/`appVersion`. Pull requests dry-run
   `helm package`. The chart README documents installing from the registry
   and verifying the signature.
+
+### Changed
+
+- The profile page hides the password form for users without a local
+  password.
+
+### Security
+
+- An SSO-linked user can no longer be given a local password through the
+  admin "Reset password" action or the e-mail reset flow, regardless of
+  `QUERYPROXY_LOCAL_LOGIN`.
 
 ## [0.4.0] - 2026-11-01
 

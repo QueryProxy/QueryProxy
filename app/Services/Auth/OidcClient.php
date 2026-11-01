@@ -81,11 +81,15 @@ class OidcClient
      * providers only release groups through the userinfo endpoint), the
      * userinfo response fills in what the token lacks.
      *
+     * The raw ID token is handed back through `$rawIdToken` (after it passed
+     * validation) for the caller to keep as the `id_token_hint` of a later
+     * RP-initiated logout; it must not be logged or audited.
+     *
      * @return array<string, mixed>
      *
      * @throws OidcException
      */
-    public function fetchClaims(string $code, string $codeVerifier, string $nonce, string $redirectUri, ?string $wantedClaim = null): array
+    public function fetchClaims(string $code, string $codeVerifier, string $nonce, string $redirectUri, ?string $wantedClaim = null, ?string &$rawIdToken = null): array
     {
         $metadata = $this->metadata();
         $tokens = $this->exchangeCode($metadata, $code, $codeVerifier, $redirectUri);
@@ -96,6 +100,7 @@ class OidcClient
         }
 
         $claims = $this->validatedClaims($idToken, $metadata, $nonce);
+        $rawIdToken = $idToken;
 
         $accessToken = $tokens['access_token'] ?? null;
         // The userinfo endpoint is asked only for what the token lacks: the
@@ -110,6 +115,44 @@ class OidcClient
         }
 
         return $claims;
+    }
+
+    /**
+     * The provider's `end_session_endpoint` (OIDC RP-Initiated Logout 1.0), or
+     * null when it publishes none, the document cannot be read, or the value
+     * is not an http(s) URL. Never throws: a logout must not fail on this.
+     */
+    public function endSessionEndpoint(): ?string
+    {
+        try {
+            $endpoint = $this->metadata()['end_session_endpoint'] ?? null;
+        } catch (OidcException) {
+            return null;
+        }
+
+        return is_string($endpoint) && preg_match('#^https?://#i', $endpoint) ? $endpoint : null;
+    }
+
+    /**
+     * The URL that ends the session at the provider, or null when it offers no
+     * `end_session_endpoint`. The caller passes a fixed, registered return
+     * address; it is never derived from a request.
+     */
+    public function logoutUrl(?string $idTokenHint, string $postLogoutRedirectUri): ?string
+    {
+        $endpoint = $this->endSessionEndpoint();
+
+        if ($endpoint === null) {
+            return null;
+        }
+
+        $query = http_build_query(array_filter([
+            'id_token_hint' => $idTokenHint,
+            'client_id' => $this->setting('client_id'),
+            'post_logout_redirect_uri' => $postLogoutRedirectUri,
+        ], fn ($value) => $value !== null && $value !== ''), '', '&', PHP_QUERY_RFC3986);
+
+        return $endpoint.(str_contains($endpoint, '?') ? '&' : '?').$query;
     }
 
     /** Reads a claim by its exact name first, then as a dotted path (realm_access.roles). */
