@@ -8,6 +8,12 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Added
 
+- `qp`, the command-line client for the REST API (separate repository
+  `QueryProxy/qp`, ADR-030): `qp submit --wait` files a request, waits for
+  approval and prints the result; `qp status`, `qp results`. Static binaries
+  for Linux, macOS and Windows (amd64, arm64), checksums signed keylessly
+  with cosign. CI gains an end-to-end job that runs `qp` against a live
+  server.
 - Logging out of an SSO session now also ends the identity provider session
   (RP-initiated logout) when the provider publishes an
   `end_session_endpoint`; register `<APP_URL>/login` as a post-logout
