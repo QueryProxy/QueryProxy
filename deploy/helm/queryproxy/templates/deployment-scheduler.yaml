@@ -1,0 +1,4 @@
+{{- if ne (include "queryproxy.isSqlite" .) "true" -}}
+{{- /* Exactly one replica, never two at once: Recreate. */ -}}
+{{- include "queryproxy.deployment" (dict "ctx" . "role" "scheduler" "cfg" .Values.scheduler "replicas" 1 "strategy" "Recreate") }}
+{{- end }}

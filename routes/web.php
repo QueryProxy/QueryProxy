@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\AuditExportController;
 use App\Http\Controllers\Auth\LoginController;
+use App\Http\Controllers\Auth\OidcController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\Auth\TwoFactorChallengeController;
 use App\Http\Controllers\ResultDownloadController;
@@ -49,11 +50,29 @@ Route::middleware('guest')->group(function () {
         ->middleware('throttle:5,1')
         ->name('password.update');
 
+    // Single sign-on (ADR-023). The limit is looser than the password routes: a
+    // whole office can sit behind one address and arrive at nine o'clock. The
+    // "oidc" prefix gives these routes a counter of their own; without it the
+    // key is shared with every other throttled guest route of the same address.
+    Route::get('/auth/oidc/redirect', [OidcController::class, 'redirect'])
+        ->middleware('throttle:30,1,oidc')
+        ->name('oidc.redirect');
+
     Route::get('/two-factor-challenge', [TwoFactorChallengeController::class, 'create'])->name('two-factor.challenge');
     Route::post('/two-factor-challenge', [TwoFactorChallengeController::class, 'store'])->middleware('throttle:5,1');
 });
 
+// The callback also serves a signed-in user who confirms an action through SSO
+// again (ADR-024); the controller turns away any other signed-in arrival.
+Route::get('/auth/oidc/callback', [OidcController::class, 'callback'])
+    ->middleware('throttle:30,1,oidc')
+    ->name('oidc.callback');
+
 Route::middleware(['auth', '2fa.required'])->group(function () {
+    Route::get('/auth/oidc/reauthenticate', [OidcController::class, 'reauthenticate'])
+        ->middleware('throttle:30,1,oidc')
+        ->name('oidc.reauthenticate');
+
     Route::post('/logout', [LoginController::class, 'destroy'])->name('logout');
     Route::post('/teams/{team}/switch', TeamSwitchController::class)->name('teams.switch');
 

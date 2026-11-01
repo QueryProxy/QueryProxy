@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Enums\DbDriver;
+use App\Enums\GrantAccessLevel;
 use App\Services\Connections\TlsPemStore;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
@@ -79,10 +80,27 @@ class Connection extends Model
         return $this->belongsTo(User::class, 'created_by');
     }
 
-    /** Developers explicitly granted access to this connection. */
+    /**
+     * Developers whose grant is in force: permanent, or not yet expired
+     * (ADR-025). A grant whose `expires_at` has passed is ignored here at once;
+     * the scheduled `connections:expire-grants` job only deletes the row later.
+     * The pivot (a ConnectionGrant) carries expires_at, granted_by, reason and
+     * access_level.
+     */
     public function grantedUsers(): BelongsToMany
     {
-        return $this->belongsToMany(User::class)->withTimestamps();
+        return $this->belongsToMany(User::class)
+            ->using(ConnectionGrant::class)
+            ->withPivot(['expires_at', 'granted_by', 'reason', 'access_level'])
+            ->withTimestamps()
+            ->where(fn (Builder $query) => $query
+                ->whereNull('connection_user.expires_at')
+                ->orWhere('connection_user.expires_at', '>', now()));
+    }
+
+    public function grantRequests(): HasMany
+    {
+        return $this->hasMany(ConnectionGrantRequest::class);
     }
 
     public function queryRequests(): HasMany
@@ -108,9 +126,25 @@ class Connection extends Model
         return is_string($this->read_username) && trim($this->read_username) !== '';
     }
 
+    /** Does the user hold a grant that is still in force? */
     public function isGrantedTo(User $user): bool
     {
         return $this->grantedUsers()->whereKey($user->id)->exists();
+    }
+
+    /** The user's grant that is still in force, or null. */
+    public function grantFor(User $user): ?ConnectionGrant
+    {
+        return $this->grantedUsers()->whereKey($user->id)->first()?->pivot;
+    }
+
+    /**
+     * What the user's grant allows; null without a grant in force. This looks
+     * at the grant only: a DBA needs none and is not covered here.
+     */
+    public function grantedAccessLevel(User $user): ?GrantAccessLevel
+    {
+        return $this->grantFor($user)?->access_level;
     }
 
     /**

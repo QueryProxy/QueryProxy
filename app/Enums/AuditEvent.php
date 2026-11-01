@@ -18,6 +18,8 @@ enum AuditEvent: string
     case AuthLogin = 'auth.login';
     case AuthLogout = 'auth.logout';
     case AuthPasswordReset = 'auth.password_reset';
+    case AuthSsoLogin = 'auth.sso_login';
+    case AuthSsoRefused = 'auth.sso_refused';
 
     // Users
     case UserCreated = 'user.created';
@@ -31,6 +33,9 @@ enum AuditEvent: string
     case UserTwoFactorEnabled = 'user.two_factor_enabled';
     case UserTwoFactorDisabled = 'user.two_factor_disabled';
     case UserTwoFactorReset = 'user.two_factor_reset';
+    case UserSsoProvisioned = 'user.sso_provisioned';
+    case UserSsoLinked = 'user.sso_linked';
+    case UserRoleSynced = 'user.role_synced';
 
     // Teams
     case TeamCreated = 'team.created';
@@ -46,6 +51,16 @@ enum AuditEvent: string
     case ConnectionTested = 'connection.tested';
     case ConnectionGrantAdded = 'connection.grant_added';
     case ConnectionGrantRevoked = 'connection.grant_revoked';
+
+    // Time-bound grants (ADR-025)
+    case GrantRequested = 'grant.requested';
+    case GrantApproved = 'grant.approved';
+    case GrantRejected = 'grant.rejected';
+    case GrantExpired = 'grant.expired';
+
+    // API tokens (ADR-024)
+    case TokenCreated = 'token.created';
+    case TokenRevoked = 'token.revoked';
 
     // Masking
     case MaskingRuleCreated = 'masking_rule.created';
@@ -85,6 +100,8 @@ enum AuditEvent: string
             self::AuthLogin => 'A user signed in (metadata.two_factor is set for the second factor).',
             self::AuthLogout => 'A user signed out.',
             self::AuthPasswordReset => 'A user reset their own password through the reset link.',
+            self::AuthSsoLogin => 'A user signed in through the OpenID Connect identity provider (metadata.issuer; metadata.groups_claim_present tells whether the provider sent the group claim).',
+            self::AuthSsoRefused => 'An SSO sign-in was refused because the provider does not assert the e-mail address as verified (metadata.reason = link_unverified_email | provision_unverified_email, metadata.user, metadata.issuer). No account was created or linked.',
 
             self::UserCreated => 'An administrator created a user.',
             self::UserDeleted => 'An administrator deleted (soft-deleted) a user; metadata.cancelled_requests lists the pending requests cancelled with it.',
@@ -97,6 +114,9 @@ enum AuditEvent: string
             self::UserTwoFactorEnabled => 'A user enabled two-factor authentication.',
             self::UserTwoFactorDisabled => 'A user disabled two-factor authentication.',
             self::UserTwoFactorReset => 'An administrator reset the two-factor authentication of a user.',
+            self::UserSsoProvisioned => 'A user account was created at the first SSO sign-in (just-in-time provisioning; metadata.user is the e-mail address, metadata.issuer the provider).',
+            self::UserSsoLinked => 'An existing local account was linked to an identity provider subject because the provider asserted the e-mail address as verified (metadata.user, metadata.issuer).',
+            self::UserRoleSynced => 'A team membership of an SSO user was added, changed or removed to match the identity provider groups (metadata.change = added|changed|removed, metadata.team, metadata.from, metadata.to).',
 
             self::TeamCreated => 'A team was created.',
             self::TeamDeleted => 'A team was deleted.',
@@ -108,8 +128,16 @@ enum AuditEvent: string
             self::ConnectionUpdated => 'A database connection was changed.',
             self::ConnectionDeleted => 'A database connection was deleted.',
             self::ConnectionTested => 'A database connection was tested.',
-            self::ConnectionGrantAdded => 'A developer was granted access to a connection.',
-            self::ConnectionGrantRevoked => 'A developer lost access to a connection.',
+            self::ConnectionGrantAdded => 'A DBA granted a developer access to a connection (metadata.developer, metadata.access_level = read|write, metadata.expires_at is null for a permanent grant, metadata.reason).',
+            self::ConnectionGrantRevoked => 'A DBA removed a developer\'s access to a connection by hand (since v0.4.0 metadata.developer, metadata.access_level, metadata.expires_at, metadata.was_expired). Grants that end by time are recorded as grant.expired.',
+
+            self::GrantRequested => 'A developer asked for time-bound access to a connection (metadata.grant_request_id, metadata.access_level, metadata.duration_minutes, metadata.reason).',
+            self::GrantApproved => 'A DBA approved an access request; the grant starts now (metadata.grant_request_id, metadata.developer, metadata.access_level, metadata.expires_at, metadata.duration_minutes).',
+            self::GrantRejected => 'A DBA rejected an access request (metadata.grant_request_id, metadata.developer, metadata.reason).',
+            self::GrantExpired => 'A time-bound grant ended and the scheduled job removed it (actor system; metadata.developer, metadata.access_level, metadata.expires_at). Access itself ended at expires_at; this record is written when the job runs.',
+
+            self::TokenCreated => 'A user created a personal access token for the REST API (metadata.token_id, metadata.name, metadata.scopes, metadata.expires_at). The token value is never recorded.',
+            self::TokenRevoked => 'A personal access token was revoked (metadata.token_id, metadata.name). When it was revoked because its owner was suspended or deleted, the actor is the administrator who did it and metadata.owner_id and metadata.reason (user_suspended | user_deleted) are set.',
 
             self::MaskingRuleCreated => 'A masking rule was created.',
             self::MaskingRuleUpdated => 'A masking rule was changed.',
@@ -126,17 +154,17 @@ enum AuditEvent: string
             self::ChatIdentityLinked => 'A chat identity was linked to a user.',
             self::ChatIdentityRemoved => 'A chat identity was unlinked from a user.',
 
-            self::RequestSubmitted => 'A query request was submitted for approval.',
+            self::RequestSubmitted => 'A query request was submitted for approval (metadata.channel = web | api).',
             self::RequestApproved => 'A query request was approved (metadata.override marks an admin override; an override always carries metadata.reason).',
             self::RequestRejected => 'A query request was rejected, with channel and reason.',
-            self::RequestCancelled => 'A pending query request was cancelled (by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
+            self::RequestCancelled => 'A pending query request was cancelled (metadata.channel = web | api when a user did it; by the requester, or by the system with metadata.actor = system and metadata.reason when its owner was deleted).',
             self::RequestExecutionStarted => 'Execution of an approved request started.',
             self::RequestExecutionCompleted => 'Execution of a request completed.',
             self::RequestExecutionFailed => 'Execution of a request failed (masked error message; metadata.refused_by = guard when a read request carried a write statement).',
             self::RequestExecutionDeferred => 'An approved request was put back on the queue because every slot of its connection was busy.',
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
             self::ExecutionCancelled => 'A user stopped a running request: the database was asked to cancel the statement (metadata.signalled tells whether it was reached; metadata.duration_ms is the run time so far).',
-            self::ResultDownloaded => 'The stored result of a request was downloaded.',
+            self::ResultDownloaded => 'The stored result of a request was downloaded (since v0.4.0 the REST API records metadata.channel = api and metadata.format).',
         };
     }
 

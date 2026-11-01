@@ -6,19 +6,276 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
-### Changed
+## [0.4.0] - 2026-11-01
+
+Step-by-step upgrade and rollback instructions, with the migration list, are
+on the [upgrading page](https://queryproxy.com/docs/upgrading/). Upgrade from
+0.3.3, the tested starting point: the container runs five new migrations on
+start (`2026_10_26_000001`, `2026_10_26_000010`, `2026_10_26_000011`,
+`2026_10_26_000020` and `2026_10_31_072351`), so back up the data volume and
+the application database first. Every new setting is optional and every
+feature is off or empty until you use it: `QUERYPROXY_OIDC_*` (single
+sign-on), `QUERYPROXY_LOCAL_LOGIN`, `QUERYPROXY_API_TOKEN_MAX_DAYS`,
+and `QUERYPROXY_API_RATE_LIMIT`. Keep the scheduler running: it now
+removes expired connection grants every minute.
+Three changes below are listed as **Breaking**; read them before you
+upgrade.
+
+### Breaking (0.4.0)
+
+- **`users.password` can be empty.** SSO-only accounts have no local password,
+  and `users` gains `auth_provider`, `external_issuer` and `external_id`. A
+  script or integration that reads the `users` table directly must expect an
+  empty password. Changing `QUERYPROXY_OIDC_ISSUER` later does not carry
+  existing SSO accounts over: they are tied to the old issuer and are refused
+  rather than taken over by e-mail. No password can be set for an account
+  without one through the reset link. Migration `2026_10_26_000001` adds the
+  columns; rolling it back stops while such accounts exist.
+- **`connection_user` has new columns:** `expires_at`, `granted_by`, `reason`
+  and `access_level`. Existing rows stay permanent and `write`. A script that
+  inserts grant rows without them gets the same defaults, and a row whose
+  `expires_at` has passed no longer gives access. Migration
+  `2026_10_26_000010` adds the columns; rolling it back stops while a timed or
+  `read` grant exists.
+- **`QUERYPROXY_LOCAL_LOGIN` is new.** The default `all` changes nothing, but
+  an unknown value (a typo, for example) is treated as `admins_only`, which
+  limits password login to system administrators.
+
+### Added (0.4.0)
+
+- **`php artisan queryproxy:migrate-appdb --to=<dsn>` moves the application
+  database to another server.** It is meant for installations that started on
+  the default SQLite file and now want PostgreSQL, MySQL, MariaDB or SQL Server
+  (`--to=pgsql://user:password@host:5432/queryproxy`; URL-encode special
+  characters in the password). It runs the migrations on the target, copies
+  every table in foreign key order in chunks (ids, audit hashes and the chain
+  head unchanged, PostgreSQL sequences reset), then compares the row count of
+  every table and runs `audit:verify` on the target. The audit triggers
+  (ADR-020) are never dropped: they are installed by the migrations before the
+  copy, which only inserts. The whole copy is one transaction, so a failure
+  leaves a migrated, empty target you can retry. The target must be empty (a
+  database that was only migrated is fine); `--dry-run` checks everything and
+  writes nothing; without `--force` the command asks you to confirm that
+  QueryProxy is stopped. The target password is never printed. The `cache`
+  tables are not copied. After the move, switch `DB_CONNECTION` and the
+  `DB_*` settings and start QueryProxy again.
+- **An image with SQL Server support: `queryproxy/queryproxy:<version>-mssql`
+  and `:mssql`.** It adds the Microsoft ODBC Driver 18 and the `pdo_sqlsrv`
+  extension (build it yourself with `--build-arg INSTALL_SQLSRV=1`). `:mssql`
+  moves only with stable releases and never takes `latest`; a pre-release
+  publishes its `-mssql` version tag only. The variant is built for `linux/amd64`
+  and `linux/arm64` (Microsoft ships the driver for Alpine on both), scanned,
+  signed and attested like the default image. The Microsoft driver is under
+  Microsoft's own licence (<https://aka.ms/odbc18eula>); using the variant
+  means accepting it. The default image is unchanged.
+- **SQL Server is now supported as the application database.** The
+  application schema could not be created there: SQL Server refuses foreign
+  keys that give a table more than one cascade path, and the schema had
+  several. On SQL Server only, eight foreign keys are created with
+  `ON DELETE NO ACTION` (`query_requests.team_id`, `masking_rules.team_id`,
+  `connection_grant_requests.team_id`, `connections.created_by`,
+  `connection_user.granted_by`, `connection_grant_requests.decided_by`, and
+  the two `query_requests` keys to users that are `RESTRICT` on every driver
+  since ADR-018), and the application does what the database would have done
+  on a delete: deleting a team removes its requests, masking rules and grant
+  requests first, and hard deleting a user who has no requests sets the keys
+  that referenced them to NULL. Raw SQL that deletes a team or user is
+  refused on SQL Server only while rows still point at it through one of
+  those eight keys (for a team: requests, masking rules or grant requests;
+  for a user: connections it created, grants it gave, grant requests it
+  decided, or requests it filed or reviewed). For the six keys that cascade
+  or set NULL elsewhere, the delete is refused there instead of cascading or
+  setting NULL; the two request keys to users are refused on every driver.
+  Nothing changes on PostgreSQL,
+  MySQL, MariaDB or SQLite: no new migration, no change to an existing
+  installation, same delete results. Use the `:mssql` image (the default image
+  has no `pdo_sqlsrv`); `php artisan queryproxy:migrate-appdb
+  --to="sqlsrv://user:password@host:1433/queryproxy?trust_server_certificate=true"`
+  moves an installation there.
+- **CI tests the upgrade from the previous release.** The new `upgrade` job in
+  the Integration workflow creates data on the 0.3.3 image, starts the image
+  built from the branch on the same data volume, and checks that the data is
+  still there, that `audit:verify` passes across the upgrade, and that `/up`
+  and the login page answer.
+- **Single sign-on through OpenID Connect, with team roles from IdP groups.**
+  Set `QUERYPROXY_OIDC_ISSUER` and `QUERYPROXY_OIDC_CLIENT_ID` (and
+  `QUERYPROXY_OIDC_CLIENT_SECRET`, or `QUERYPROXY_OIDC_CLIENT_SECRET_FILE`) and
+  the login page offers "Log in with SSO". It works with any provider that
+  publishes discovery (Keycloak, Entra ID, Okta, Google, Authentik): authorization
+  code flow with PKCE, `state` and `nonce`, and the ID token signature is checked
+  against the provider's keys. Register `{APP_URL}/auth/oidc/callback` as the
+  redirect URI. The first sign-in creates the user, and an existing local account
+  with the same e-mail address is linked, but only when the provider says the
+  address is verified (`email_verified`); otherwise the sign-in is refused and
+  the refusal is audited (`auth.sso_refused`).
+  Entra ID does not send `email_verified`; there the optional `xms_edov` claim
+  (add it to the app registration's token configuration) counts instead, but
+  only when `email_verified` is absent, and an explicit `email_verified: false`
+  always wins. A user is identified by issuer and
+  subject together. `QUERYPROXY_OIDC_ROLE_MAP` (`group:team:role`, comma-separated)
+  turns the groups in `QUERYPROXY_OIDC_GROUP_CLAIM` (default `groups`) into team
+  roles at every sign-in: memberships in the teams the map names are added,
+  changed and removed to match the IdP, and each change is audited
+  (`user.role_synced`). Memberships in other teams are not touched. While a role
+  map is set, a token without the group claim (including a "groups overage"
+  reference) is refused and nothing is changed; an empty group list is applied
+  as such. Suspended and deleted users cannot sign in through SSO either. `QUERYPROXY_OIDC_SCOPES`
+  changes the requested scopes (some providers need `groups`). New audit events:
+  `auth.sso_login`, `auth.sso_refused`, `user.sso_provisioned`, `user.sso_linked`,
+  `user.role_synced`.
+  Role changes at the IdP apply at the next sign-in.
+- **`QUERYPROXY_LOCAL_LOGIN` limits password login: `all` (default), `admins_only`
+  or `none`.** With `admins_only` only system admins sign in with a password
+  (break-glass access); with `none` password login and password reset are off, so
+  make sure SSO works first. An unknown value is treated as `admins_only`.
+- **CI signs in to a real Keycloak.** The new `oidc` job in the CI workflow
+  imports a test realm and checks the sign-in and the group-to-role sync end to
+  end.
+- **A Helm chart runs QueryProxy on Kubernetes, with an HA reference setup.**
+  `deploy/helm/queryproxy` starts the one image as separate `web`, `worker`
+  and `scheduler` Deployments (roles switched with `QUERYPROXY_RUN_WORKER` and
+  `QUERYPROXY_RUN_SCHEDULER`); the scheduler is always one replica with the
+  `Recreate` strategy. Migrations run as a `pre-install,pre-upgrade` hook Job.
+  `values-ha.yaml` sets up an external PostgreSQL, S3 result storage, several
+  web and worker pods, an Ingress, a PodDisruptionBudget and a NetworkPolicy.
+  The worker can scale on the `queryproxy_queue_depth` metric (HorizontalPodAutoscaler,
+  off by default; a prometheus-adapter example is in `values.yaml`). `APP_KEY`
+  and the database password come from a Secret (your own, for example from the
+  External Secrets Operator, or one the chart creates and keeps), optionally
+  mounted as files (`*_FILE`). With SQLite the chart renders one all-in-one
+  Deployment (web, worker and scheduler, one replica) and refuses more than one
+  web replica, because a SQLite file cannot be shared between pods; the role
+  split applies with an external database. The chart adds the Service's
+  in-cluster names to `TRUSTED_HOSTS`, so Prometheus can scrape `/metrics`
+  through the Service. The pods run as a non-root user with all capabilities
+  dropped; the root filesystem is still writable because the image's
+  entrypoint writes to it. The architecture and the options are in
+  `deploy/helm/queryproxy/README.md`. A new `Helm` workflow lints the chart on
+  Helm 3 and 4 and installs it into a kind cluster, where a sample request is
+  approved and run by the worker pod, and an upgrade and a rollback are
+  checked.
+- **The image can store result files on S3 and use Redis.** It now includes the
+  Flysystem S3 adapter (`QUERYPROXY_RESULT_DISK=s3` with the usual `AWS_*`
+  settings, including S3-compatible endpoints) and the `predis` Redis client
+  (`REDIS_CLIENT=predis`, for cache, queue and sessions). Both are optional;
+  the default setup is unchanged.
+- **Time-bound connection grants.** A DBA can give a developer access to a
+  connection for a period ("4 hours, read-only") instead of until someone
+  remembers to remove it, and a developer can ask for such access with a
+  reason; a DBA of the team approves or rejects the request. The grant starts
+  when it is approved. Nobody decides their own request, not even a DBA the
+  requester became while it was open. `connection_user` gains `expires_at`,
+  `granted_by`, `reason` and `access_level` (`read` or `write`); existing
+  grants stay permanent with full access. Access ends at `expires_at` (an
+  expired grant is ignored at once), and the new `connections:expire-grants`
+  command, scheduled every minute, removes the rows and records
+  `grant.expired`. A `read` grant cannot file a request the SQL guard
+  classifies as a write or DDL: the studio answers 403. Requests that were
+  already pending or approved when a grant ends are not cancelled.
+  A request must match the grant the developer already holds: a request for
+  another access level than the grant in force, or for any level while a
+  permanent grant of that level exists, is refused when it is filed and when
+  it is approved, so a time-bound approval never replaces or widens standing
+  access. An approval for the same level only extends a time-bound grant; it
+  never shortens it or makes it permanent. To change an existing grant, a DBA
+  edits it directly. DBAs are notified in the app and in the team's
+  Slack/Teams channels (without the free-text reason); the requester is told the decision and the grant that is
+  in force. New audit events: `grant.requested`, `grant.approved`,
+  `grant.rejected` and `grant.expired` (ADR-025). Removing a grant by hand
+  still records `connection.grant_revoked`, and `connection.grant_added` now
+  carries `access_level`, `expires_at` and `reason` in its metadata.
+- **Screens for time-bound access.** On the dashboard a developer can ask for
+  access to a connection of their team: pick the level (read or write), a
+  period (1 hour, 4 hours, 1 day, 7 days or a custom amount up to 30 days) and
+  give the reason, which is required. A developer who holds a timed grant sees
+  its level and the time left, and can ask to extend it at the same level; the
+  open requests and the decisions of the last seven days, with the DBA's
+  rejection reason, are listed on the same page. The Approvals page has a new
+  "Access requests" tab where a DBA of the team approves a request or rejects
+  it with a reason; nobody can decide their own request, and a request for
+  another level than the grant in force cannot be approved (change the
+  existing grant on the Connections page). On the Connections page the grants
+  panel now sets the level, the period (permanent by default) and an optional
+  reason for each grant, shows each developer's level and remaining time, and
+  replaces or revokes an existing grant. The dashboard now also shows the
+  confirmation after a DBA approves a request from it.
+- REST API under `/api/v1` (ADR-024): submit a query request, read its status
+  and its masked result (NDJSON, or CSV with `Accept: text/csv`), approve,
+  reject or cancel it, and list connections. Authentication uses Laravel
+  Sanctum personal access tokens (prefixed `qp_`) with the scopes
+  `requests:submit`, `requests:read`, `results:read` and `approvals:write`;
+  every token expires (`QUERYPROXY_API_TOKEN_MAX_DAYS`, default 90) and is
+  revoked when its owner is suspended or deleted. Requests still wait for
+  human approval, an approval that would be an override is refused with `403`
+  and a link to the web form, and a token can never approve its owner's own
+  request. Column names of a result are result data: an auditor does not get
+  them. A user the `QUERYPROXY_REQUIRE_2FA` policy covers cannot create a
+  token until they have enrolled, and an existing token of such a user is
+  answered with `401` until then; the token is kept and works again afterwards.
+  Each token is limited to `QUERYPROXY_API_RATE_LIMIT` calls per minute
+  (default 60), and failed authentications are limited per address to the same
+  number. Token creation and revocation are audited as `token.created` and
+  `token.revoked`; API submissions, approvals, rejections, cancellations and
+  result reads carry `channel = api` in the audit log.
+- OpenAPI 3.1 description of the API in `docs/openapi.yaml`, linted by
+  Spectral in CI and checked against the routes by a test.
+- **Users can get request and access-request events by e-mail.** On the
+  Profile page each user chooses which events also arrive by e-mail:
+  a request waiting for review, a decision on their request, a finished,
+  failed or stopped request, the pending-request reminder, an access request
+  waiting for a DBA, and the decision on an access request. Everything is
+  off by default, so nothing changes until a user turns it on. An e-mail
+  never carries query results, a reviewer's reason, a decision note or an
+  error message. The submission and reminder e-mails show the statement with
+  its values hidden (the same redaction as chat, ADR-017; none with
+  `QUERYPROXY_CHAT_INCLUDE_SQL=none`, and never the raw SQL, even with
+  `full`). Links open the request in QueryProxy and need a signed-in
+  session; nothing is approved from an e-mail. The e-mail is sent from the
+  queue (the `default` queue the worker already listens to); the in-app
+  notification is still written at once. A user who is suspended or deleted,
+  or who turned the event off, before the worker sends the e-mail gets none.
+  A mail failure never blocks the request: it is logged, and on a real queue
+  the job also lands in `failed_jobs` so `queue:retry` can resend it. With
+  `MAIL_MAILER=log` the Profile page says that nothing is delivered. The
+  migration adds `users.notification_preferences`.
+- **Create and revoke API tokens on the Profile page.** A new "API tokens"
+  section lets you name a personal access token, choose its scopes and set
+  how many days it lasts (required, up to `QUERYPROXY_API_TOKEN_MAX_DAYS`,
+  90 by default), and lists your tokens with their scopes, expiry and last
+  use. Creating a token asks you to confirm first: enter your password (or
+  a code from your authenticator app when two-factor authentication is on),
+  and wrong tries are rate limited. An account without a local password
+  must have signed in through SSO in the last 15 minutes; otherwise the page
+  sends you through SSO again (the provider is asked to sign you in anew)
+  and brings you back. The token value is shown once, right after you
+  create it, with a Copy button; it is never kept in the page state, so a
+  reload or any later action hides it for good, and only its hash is stored.
+  Revoking a token stops it at once. Only the scopes your roles can use are
+  offered: `approvals:write` needs the DBA role in a team, `requests:submit`
+  a DBA or developer role, and `results:read` is not offered to auditors.
+  Creating and revoking are audited as before.
+
+### Changed (0.4.0)
 
 - **A pre-release no longer moves `latest`.** A pre-release tag such as
   `v0.4.0-rc.1` now publishes only its version tag; `latest` stays on the
   most recently published stable release.
+- **SSO users are outside `QUERYPROXY_REQUIRE_2FA`.** Their second factor is the
+  identity provider's, so enforce MFA there. A local account that was linked to
+  the provider and still signs in with its password stays covered.
 
-### Security
+### Security (0.4.0)
 
 - **The release workflow refuses tags users could not verify.** A tag that
   matches the `v*.*.*` trigger but not the certificate identity in
   `SECURITY.md` (for example `v1.2.3.4` or `v1.2.3+build`) now stops the
   workflow before anything is built or pushed. Use `vX.Y.Z` or
   `vX.Y.Z-<pre-release>`.
+- **Updated `symfony/mime` to 7.4.22 (and `symfony/polyfill-mbstring` to
+  1.43.3).** It fixes CVE-2026-45070 (e-mail header injection through
+  non-token characters in MIME parameter names). QueryProxy does not build
+  e-mail headers or MIME parameter names from user input, so it was not
+  exploitable here; the update clears `composer audit`.
 
 ## [0.3.3] - 2026-10-25
 
@@ -1020,7 +1277,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.0...v0.3.1

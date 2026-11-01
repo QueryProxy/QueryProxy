@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Services\Connections\TlsPemStore;
+use App\Support\SqlServerReferentialActions;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -53,6 +54,12 @@ class Team extends Model
         // Teams::deleteTeam) never loses them. purgeById() is idempotent.
         static::deleting(function (Team $team) {
             $team->pemPurgeConnectionIds = $team->connections()->pluck('id')->map(fn ($id) => (int) $id)->all();
+
+            // SQL Server only: three keys to teams.id cannot cascade there (more
+            // than one cascade path), so what they would delete goes first.
+            if (SqlServerReferentialActions::isSqlServer($team->getConnection())) {
+                SqlServerReferentialActions::releaseTeamRows($team->getConnection(), $team->id);
+            }
         });
 
         static::deleted(function (Team $team) {

@@ -1,0 +1,6 @@
+{{- /*
+SQLite: web is the only Deployment and runs every role, so it must not overlap
+with its replacement (Recreate); the database file has one writer.
+*/ -}}
+{{- $sqlite := eq (include "queryproxy.isSqlite" .) "true" -}}
+{{- include "queryproxy.deployment" (dict "ctx" . "role" "web" "cfg" .Values.web "replicas" (.Values.web.replicas | int) "strategy" (ternary "Recreate" "RollingUpdate" $sqlite)) }}

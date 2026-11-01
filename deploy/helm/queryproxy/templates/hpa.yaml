@@ -1,0 +1,35 @@
+{{- if and (ne (include "queryproxy.isSqlite" .) "true") .Values.worker.autoscaling.enabled }}
+{{- $a := .Values.worker.autoscaling }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "queryproxy.fullname" . }}-worker
+  labels:
+    {{- include "queryproxy.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "queryproxy.fullname" . }}-worker
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+  metrics:
+    # ADR-022 queryproxy_queue_depth, served as an external metric by
+    # prometheus-adapter (example in values.yaml). AverageValue divides the
+    # backlog by the number of worker pods.
+    - type: External
+      external:
+        metric:
+          name: {{ $a.metricName }}
+          selector:
+            matchLabels:
+              queue: {{ $a.queue | quote }}
+        target:
+          type: AverageValue
+          averageValue: {{ $a.queueDepthPerPod | quote }}
+  {{- with $a.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

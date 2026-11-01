@@ -219,6 +219,45 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Local (password) login scope
+    |--------------------------------------------------------------------------
+    | all          Everyone with a password may sign in with it (default).
+    | admins_only  Only system admins may use a password (break-glass access);
+    |              everyone else signs in through SSO.
+    | none         Password login and password reset are disabled.
+    | An unknown value falls back to admins_only: a typo must not widen the
+    | scope, and system admins can still get in to fix the setting.
+    */
+
+    'local_login' => in_array($localLogin = strtolower(trim((string) env('QUERYPROXY_LOCAL_LOGIN', 'all'))), ['all', 'admins_only', 'none'], true)
+        ? $localLogin
+        : 'admins_only',
+
+    /*
+    |--------------------------------------------------------------------------
+    | OpenID Connect single sign-on (ADR-023)
+    |--------------------------------------------------------------------------
+    | SSO is on when both `issuer` and `client_id` are set. `issuer` is the
+    | URL whose /.well-known/openid-configuration describes the provider.
+    |
+    | `group_claim` names the claim that lists the user's groups (a dotted
+    | path such as realm_access.roles is followed when no claim has that exact
+    | name). `role_map` is a comma-separated list of group:team:role entries
+    | (team = slug or name; role = dba, developer or auditor). `scopes` is the
+    | space-separated scope list; some providers need "groups" added.
+    */
+
+    'oidc' => [
+        'issuer' => trim((string) env('QUERYPROXY_OIDC_ISSUER', '')),
+        'client_id' => trim((string) env('QUERYPROXY_OIDC_CLIENT_ID', '')),
+        'client_secret' => (string) SecretFile::get('QUERYPROXY_OIDC_CLIENT_SECRET', ''),
+        'group_claim' => trim((string) env('QUERYPROXY_OIDC_GROUP_CLAIM', 'groups')) ?: 'groups',
+        'role_map' => (string) env('QUERYPROXY_OIDC_ROLE_MAP', ''),
+        'scopes' => trim((string) env('QUERYPROXY_OIDC_SCOPES', 'openid email profile')) ?: 'openid email profile',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Network trust
     |--------------------------------------------------------------------------
     | Both lists live here rather than being read with env() at runtime: the
@@ -267,6 +306,23 @@ return [
             'trim',
             explode(',', (string) env('QUERYPROXY_METRICS_ALLOWED_IPS', '')),
         ))),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | REST API (ADR-024)
+    |--------------------------------------------------------------------------
+    | /api/v1 is authenticated with personal access tokens. A token always
+    | expires: `token_max_days` is the longest lifetime one can be given (and
+    | the age after which any token stops working, whatever its own expiry);
+    | App\Services\Api\TokenService refuses a longer one. `rate_limit_per_minute`
+    | is the request budget of each token.
+    */
+
+    'api' => [
+        'token_max_days' => max(1, (int) env('QUERYPROXY_API_TOKEN_MAX_DAYS', 90)),
+
+        'rate_limit_per_minute' => max(1, (int) env('QUERYPROXY_API_RATE_LIMIT', 60)),
     ],
 
     /*

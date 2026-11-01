@@ -1,0 +1,632 @@
+openapi: 3.1.0
+info:
+  title: QueryProxy REST API
+  version: 1.0.0
+  summary: Submit database query requests, follow them, read their results and decide on them.
+  description: |
+    The REST API gives automation (CI pipelines, scripts, a future CLI) the same
+    workflow the web UI has. A request submitted here goes through the same
+    SQL guard, the same approval flow and the same audit trail as one submitted
+    in the browser: nothing runs until a reviewer approves it.
+
+    ## Authentication
+
+    Every call carries a personal access token as a bearer token:
+
+    ```
+    Authorization: Bearer <id>|qp_<secret>
+    ```
+
+    A token belongs to one user, carries a set of scopes and always expires
+    (QUERYPROXY_API_TOKEN_MAX_DAYS, 90 days at most). A token never grants more
+    than its owner may do in the web UI; a scope only narrows that. It stops
+    working when its owner is suspended or deleted. Tokens are created and
+    revoked in the web UI (Profile) and each of those actions is audited.
+
+    | Scope | Allows |
+    | --- | --- |
+    | `requests:submit` | Submit a request, cancel your own pending request |
+    | `requests:read` | Read a request and list connections |
+    | `results:read` | Read the stored result of a completed request |
+    | `approvals:write` | Approve or reject requests you are allowed to review |
+
+    ## Approval rules
+
+    The role rules of the web UI apply (a DBA cannot review their own request).
+    An approval that would be an **override** (the reviewer is a system admin
+    who is not DBA of the request's team, or is the requester) needs a written
+    reason and is refused here with `403` and a link to the web form. A token
+    can therefore never approve its owner's own request.
+
+    ## Rate limit
+
+    Each token may make `QUERYPROXY_API_RATE_LIMIT` calls per minute (60 by
+    default). Above that the API answers `429` with a `Retry-After` header.
+
+    ## Errors
+
+    Errors are JSON with a `message`. Validation errors (`422`) add `errors`,
+    keyed by field. A submission refused by the SQL guard adds `violations`.
+  license:
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
+  contact:
+    name: QueryProxy
+    url: https://queryproxy.com
+servers:
+  - url: '{baseUrl}'
+    description: Your QueryProxy installation
+    variables:
+      baseUrl:
+        default: https://queryproxy.example.com
+        description: Base URL of the installation, without a trailing slash.
+tags:
+  - name: Connections
+    description: Find the connection to submit against.
+  - name: Requests
+    description: Submit, follow and withdraw query requests.
+  - name: Results
+    description: Read the stored result of a completed request.
+  - name: Approvals
+    description: Decide on pending requests.
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/connections:
+    get:
+      operationId: listConnections
+      tags: [Connections]
+      summary: List the connections you can see
+      description: |
+        Every connection for an admin; otherwise the connections of the teams you
+        are DBA or auditor in, plus those you hold a grant for that is still in
+        force. Hosts and credentials are never part of the answer.
+      x-scopes-any: [requests:read, requests:submit]
+      responses:
+        '200':
+          description: The connections, ordered by name.
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests:
+    post:
+      operationId: submitRequest
+      tags: [Requests]
+      summary: Submit a query request
+      description: |
+        Files a request for approval. The answer is the request in status
+        `pending`; poll `GET /api/v1/requests/{id}` to follow it. The SQL goes
+        through the same guard as in the web UI and may be refused with `422`.
+        A connection you cannot see is reported as `404`.
+      x-scopes-all: [requests:submit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitRequest'
+      responses:
+        '201':
+          description: The request was filed and waits for approval.
+          headers:
+            Location:
+              description: URL of the new request.
+              schema:
+                type: string
+                format: uri
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRequestEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: The body is invalid, or the SQL guard refused the statement.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ValidationError'
+                  - $ref: '#/components/schemas/GuardRefusal'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests/{id}:
+    get:
+      operationId: getRequest
+      tags: [Requests]
+      summary: Read a request
+      description: |
+        The requester, the DBA of the request's team, an auditor of that team and
+        an admin may read it. The SQL text as written is shown to the requester,
+        the team DBA and an admin; an auditor gets only `sql_redacted`, with the
+        literal values replaced.
+      x-scopes-all: [requests:read]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The request.
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRequestEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests/{id}/result:
+    get:
+      operationId: getRequestResult
+      tags: [Results]
+      summary: Read the result of a completed request
+      description: |
+        The stored result, already masked by the connection's masking rules, sent
+        as a stream. The default is NDJSON: one JSON array per row, values in
+        column order (the column names are `result.columns` of the request).
+        `Accept: text/csv` returns CSV with a header row instead. Only the
+        requester, the DBA of the request's team and an admin may read a result;
+        an auditor gets `403`. Each read is audited as `result.downloaded` with
+        channel `api`.
+      x-scopes-all: [results:read]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The rows.
+          headers:
+            X-QueryProxy-Row-Count:
+              description: Number of rows in the stored result.
+              schema:
+                type: integer
+            X-QueryProxy-Truncated:
+              description: '`true` when the result was cut at the row ceiling.'
+              schema:
+                type: string
+                enum: ['true', 'false']
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/x-ndjson:
+              schema:
+                type: array
+                description: One JSON array per line.
+                items:
+                  type: array
+                  items: {}
+            text/csv:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The request does not exist, or its stored result is no longer available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The request has no stored result (it is not completed, or it failed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests/{id}/approve:
+    post:
+      operationId: approveRequest
+      tags: [Approvals]
+      summary: Approve a pending request
+      description: |
+        Approves the request and queues it for execution. You cannot approve your
+        own request, and an approval that would be an override (see the
+        description of this API) is refused with `403` and `override_url`, the
+        web form where the reason is given.
+      x-scopes-all: [approvals:write]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The request, now `queued`.
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRequestEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Not allowed to review this request. When the approval would be an
+            override the answer carries `override_url`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/OverrideRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/AlreadyDecided'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests/{id}/reject:
+    post:
+      operationId: rejectRequest
+      tags: [Approvals]
+      summary: Reject a pending request
+      description: Rejects the request. A reason is required; the requester sees it.
+      x-scopes-all: [approvals:write]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejectRequest'
+      responses:
+        '200':
+          description: The request, now `rejected`.
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRequestEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/AlreadyDecided'
+        '422':
+          description: The reason is missing or too long.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+  /api/v1/requests/{id}/cancel:
+    post:
+      operationId: cancelRequest
+      tags: [Requests]
+      summary: Withdraw a pending request
+      description: |
+        Cancels a request that has not been decided yet. Its requester and an
+        admin may do this. It needs the scope that files requests.
+      x-scopes-all: [requests:submit]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The request, now `cancelled`.
+          headers:
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryRequestEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/AlreadyDecided'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        A personal access token (`<id>|qp_<secret>`), shown once when it is created.
+        The scopes a token must carry are listed per operation: `x-scopes-all`
+        (every one of them) or `x-scopes-any` (at least one).
+  parameters:
+    RequestId:
+      name: id
+      in: path
+      required: true
+      description: Id of the request.
+      schema:
+        type: integer
+        minimum: 1
+  headers:
+    RateLimitLimit:
+      description: Calls the token may make per minute.
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Calls left in the current minute.
+      schema:
+        type: integer
+  responses:
+    Unauthenticated:
+      description: The token is missing, unknown, expired or revoked, or its owner is suspended or deleted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The token lacks the scope, or its owner may not do this.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: No such request or connection, or one that is not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AlreadyDecided:
+      description: The request is no longer pending.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: The token used up its budget for this minute.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the next call.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    ValidationError:
+      type: object
+      required: [message, errors]
+      properties:
+        message:
+          type: string
+        errors:
+          type: object
+          description: Messages per field.
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    GuardRefusal:
+      type: object
+      required: [message, violations]
+      properties:
+        message:
+          type: string
+        violations:
+          type: array
+          description: Why the SQL guard refused the statement.
+          items:
+            type: string
+    OverrideRequired:
+      type: object
+      required: [message, override_url]
+      properties:
+        message:
+          type: string
+        override_url:
+          type: string
+          format: uri
+          description: The web form where the override is approved with a written reason.
+    Connection:
+      type: object
+      required: [id, name, driver, team_id]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        driver:
+          type: string
+          enum: [mysql, mariadb, pgsql, sqlite, sqlsrv]
+        team_id:
+          type: integer
+    SubmitRequest:
+      type: object
+      required: [connection_id, sql]
+      properties:
+        connection_id:
+          type: integer
+          description: A connection from `GET /api/v1/connections` that you may use.
+        sql:
+          type: string
+          maxLength: 65535
+          description: The statement or statements to run.
+        title:
+          type: [string, 'null']
+          maxLength: 150
+        reason:
+          type: [string, 'null']
+          maxLength: 1000
+          description: A note for the approver.
+    RejectRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 1000
+    QueryRequestEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/QueryRequest'
+    QueryRequest:
+      type: object
+      required:
+        - id
+        - status
+        - type
+        - connection_id
+        - team_id
+        - requested_by
+        - title
+        - note
+        - sql_original
+        - sql_prepared
+        - sql_redacted
+        - statement_count
+        - is_transaction
+        - is_ddl
+        - created_at
+        - reviewed_by
+        - reviewed_at
+        - review_channel
+        - rejection_reason
+        - executed_at
+        - duration_ms
+        - affected_rows
+        - error_message
+        - result
+        - web_url
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+          enum: [pending, approved, rejected, queued, running, completed, failed, cancelled]
+        type:
+          type: string
+          enum: [read, write]
+        connection_id:
+          type: integer
+        team_id:
+          type: integer
+        requested_by:
+          type: integer
+          description: Id of the requesting user.
+        title:
+          type: [string, 'null']
+        note:
+          type: [string, 'null']
+        sql_original:
+          type: [string, 'null']
+          description: The SQL as submitted. Null for a viewer who may not see literal values.
+        sql_prepared:
+          type: [string, 'null']
+          description: The SQL as it will run (limits injected). Null for a viewer who may not see literal values.
+        sql_redacted:
+          type: [string, 'null']
+          description: The SQL with literals replaced by `?`, for viewers who may not see the raw text.
+        statement_count:
+          type: integer
+        is_transaction:
+          type: boolean
+        is_ddl:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        reviewed_by:
+          type: [integer, 'null']
+        reviewed_at:
+          type: [string, 'null']
+          format: date-time
+        review_channel:
+          type: [string, 'null']
+          description: Where the decision was taken, for example `web`, `slack`, `teams` or `api`.
+        rejection_reason:
+          type: [string, 'null']
+        executed_at:
+          type: [string, 'null']
+          format: date-time
+        duration_ms:
+          type: [integer, 'null']
+        affected_rows:
+          type: [integer, 'null']
+        error_message:
+          type: [string, 'null']
+          description: Why the run failed, with masking applied.
+        result:
+          type: object
+          required: [available, row_count, truncated, columns]
+          properties:
+            available:
+              type: boolean
+              description: True when `GET /api/v1/requests/{id}/result` has rows to return.
+            row_count:
+              type: [integer, 'null']
+            truncated:
+              type: [boolean, 'null']
+              description: True when the result was cut at the row ceiling. Null for a viewer who may not read the result (an auditor).
+            columns:
+              description: |
+                Column names of the result, in the order of each row. Null when there is no result and for a
+                viewer who may not read the result data (an auditor): column names are result data,
+                as an expression's name can carry its literals.
+              type:
+                - array
+                - 'null'
+              items:
+                type: string
+        web_url:
+          type: string
+          format: uri
+          description: The request in the web UI.

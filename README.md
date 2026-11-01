@@ -44,6 +44,15 @@ It is a single Laravel monolith with no external dependencies by default.
   server-level code execution or file access are blocked outright.
 - **Approval workflow:** pending requests wait until a DBA decides; self-approval
   is blocked; every decision records who, when and through which channel.
+- **Time-bound access:** a DBA can grant a connection for a period and at a `read`
+  or `write` level; a developer can ask for such access with a reason, and the
+  grant ends by itself.
+- **Single sign-on:** OpenID Connect (Keycloak, Entra ID, Okta, Google and other
+  providers with discovery) with team roles taken from the provider's groups.
+  MFA for these users is enforced at the provider.
+- **REST API:** `/api/v1` with scoped personal access tokens that always expire,
+  for CI and scripts. Requests still wait for human approval; the API has no
+  override. The description is in [`docs/openapi.yaml`](docs/openapi.yaml).
 - **ChatOps:** Slack messages with interactive Approve / Reject buttons and
   Microsoft Teams cards with an HMAC-verified action endpoint.
 - **Async execution:** approved queries run on a queue worker; reads stream
@@ -55,6 +64,9 @@ It is a single Laravel monolith with no external dependencies by default.
   and download, hash-chained and protected by database triggers
   (`php artisan audit:verify`), with a filterable auditor UI, CSV export and
   optional SIEM sinks (stdout, syslog, signed webhook).
+- **Kubernetes:** a Helm chart (`deploy/helm/queryproxy`) with separate web,
+  worker and scheduler Deployments and a high-availability reference setup on
+  PostgreSQL and S3. With SQLite it renders one all-in-one pod.
 - **Defence in depth on the target:** reads run in a read-only session with
   statement and lock timeouts (SQL Server has no such session: give it a
   separate read credential), new connections require TLS, a running query can
@@ -90,6 +102,12 @@ GitHub Container Registry (`ghcr.io/queryproxy/queryproxy`), as `latest` and
 per-version tags, for `linux/amd64` and `linux/arm64`. `latest` is the most
 recently published stable release; pre-releases get their version tag only.
 
+**Kubernetes.** The Helm chart in [`deploy/helm/queryproxy`](deploy/helm/queryproxy)
+runs the same image; see the
+[Kubernetes guide](https://queryproxy.com/docs/kubernetes/) and the chart's README.
+With SQLite it runs one pod; the separate web, worker and scheduler Deployments
+need an external application database.
+
 **Docker Compose.** [`docker-compose.yml`](docker-compose.yml) in this repository
 is the same single service (`docker compose up -d`), with commented blocks for
 running the worker as its own container or using MySQL / PostgreSQL for the
@@ -97,8 +115,12 @@ application database.
 
 **Tested versions.** Target databases: PostgreSQL 17, MySQL 8.4, MariaDB 11.4
 and 11.8, SQL Server 2022 and SQLite. Application database: SQLite, MySQL 8.4,
-MariaDB 11.4 and 11.8, and PostgreSQL 17. Other versions may work but are not
-tested.
+MariaDB 11.4 and 11.8, PostgreSQL 17 and SQL Server 2022 (the `mssql` image
+variant; a raw SQL delete of a team or user is refused there only while a row
+references it through one of eight specific foreign keys (rows that cascade
+from it do not block it), see the [configuration
+guide](https://queryproxy.com/docs/configuration/#application-database)). Other
+versions may work but are not tested.
 
 **Without Docker.** You need PHP 8.3 or newer (with the pdo drivers for your target
 databases), Composer, and Node 20.19+ or 22.12+.
@@ -166,6 +188,9 @@ Settings live in `.env`; `.env.example` lists the full set.
 | `QUERYPROXY_RESULT_DISK` | `local` | Disk for result files (`s3` supported) |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
 | `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none`, `admins`, `dba` or `all` |
+| `QUERYPROXY_LOCAL_LOGIN` | `all` | Who may sign in with a password: `all`, `admins_only` or `none` |
+| `QUERYPROXY_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | none | Turn on OpenID Connect sign-in; also `_SCOPES`, `_GROUP_CLAIM` and `_ROLE_MAP`, see the [SSO guide](https://queryproxy.com/docs/sso-oidc/) |
+| `QUERYPROXY_API_TOKEN_MAX_DAYS` / `QUERYPROXY_API_RATE_LIMIT` | `90` / `60` | Longest API token lifetime in days, and calls per minute for each token |
 | `QUERYPROXY_CHAT_INCLUDE_SQL` | `literals_redacted` | SQL preview in chat: `literals_redacted`, `full` or `none` (`true` means `full`, `false` means `none`) |
 | `QUERYPROXY_PENDING_REMIND_AFTER` | `4` | Hours before one reminder for a `pending` request; `0` turns it off. Requests never expire |
 | `QUERYPROXY_METRICS_TOKEN` / `QUERYPROXY_METRICS_ALLOWED_IPS` | none | Turn on `GET /metrics` for Prometheus (bearer token and/or address allowlist); off until one is set |
@@ -201,15 +226,18 @@ The [production hardening guide](https://queryproxy.com/docs/production-hardenin
 has the full checklist; the
 [threat model](https://queryproxy.com/docs/threat-model/) says what QueryProxy
 defends against and what stays with you. The default image ships `pdo_pgsql`,
-`pdo_mysql` and `pdo_sqlite`; for SQL Server targets see the
+`pdo_mysql` and `pdo_sqlite`; for SQL Server targets use the `mssql` image
+variant (`queryproxy/queryproxy:<version>-mssql`), described in the
 [SQL Server section](https://queryproxy.com/docs/configuration/#sql-server-targets).
+To move the application database from SQLite to PostgreSQL, MySQL, MariaDB or
+SQL Server, see `php artisan queryproxy:migrate-appdb` in the [configuration
+guide](https://queryproxy.com/docs/configuration/#application-database).
 Backups, upgrades and rollbacks are covered in [Upgrading](#upgrading), the
-[upgrade guide](https://queryproxy.com/docs/upgrading/) and the
-[backup guide](https://queryproxy.com/docs/backup-restore/). Run
-`php artisan queryproxy:doctor` (in Docker:
-`docker exec queryproxy php artisan queryproxy:doctor`) after every deploy; the
-[troubleshooting guide](https://queryproxy.com/docs/troubleshooting/) explains
-each check.
+[upgrade guide](https://queryproxy.com/docs/upgrading/) and the [backup
+guide](https://queryproxy.com/docs/backup-restore/). Run `php artisan
+queryproxy:doctor` (in Docker: `docker exec queryproxy php artisan
+queryproxy:doctor`) after every deploy; the [troubleshooting
+guide](https://queryproxy.com/docs/troubleshooting/) explains each check.
 
 ## Upgrading
 
@@ -290,10 +318,10 @@ docker run --rm -v queryproxy-data:/data -v "$PWD":/backup alpine \
 docker run -d --name queryproxy -p 7432:7432 \
   --env-file queryproxy.env \
   -v queryproxy-data:/var/www/html/storage/app \
-  queryproxy/queryproxy:0.2.7
+  queryproxy/queryproxy:0.4.0
 ```
 
-## Verifying releases
+## Verifying Releases
 
 Release images are signed with cosign and carry an SBOM and a provenance
 attestation. The commands to verify them (cosign v3 or later) are in the
@@ -319,12 +347,15 @@ results are published weekly.
 - [Data masking](https://queryproxy.com/docs/data-masking/)
 - [Slack integration](https://queryproxy.com/docs/slack-integration/) and
   [Teams integration](https://queryproxy.com/docs/teams-integration/)
+- [Single sign-on with OpenID Connect](https://queryproxy.com/docs/sso-oidc/)
+- [REST API and personal access tokens](https://queryproxy.com/docs/api/)
+- [Kubernetes, Helm and high availability](https://queryproxy.com/docs/kubernetes/)
 
 All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
 ## Project Status
 
-**Beta.** QueryProxy is at version 0.3.3; breaking changes can land in any 0.y
+**Beta.** QueryProxy is at version 0.4.0; breaking changes can land in any 0.y
 release and are listed in the [changelog](CHANGELOG.md).
 
 ## Contributing

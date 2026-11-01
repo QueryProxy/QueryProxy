@@ -121,7 +121,7 @@ class ApprovalService
         ApprovalNotifier::requestDecided($request);
     }
 
-    public function cancel(QueryRequest $request, User $user): void
+    public function cancel(QueryRequest $request, User $user, string $channel = 'web'): void
     {
         Gate::forUser($user)->authorize('cancel', $request);
 
@@ -135,7 +135,9 @@ class ApprovalService
 
         $request->refresh();
 
-        audit()->record('request.cancelled', actor: $user, request: $request);
+        audit()->record('request.cancelled', actor: $user, request: $request, metadata: [
+            'channel' => $channel,
+        ]);
 
         app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
     }

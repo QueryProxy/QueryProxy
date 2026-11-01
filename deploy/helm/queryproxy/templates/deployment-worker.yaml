@@ -1,0 +1,5 @@
+{{- if ne (include "queryproxy.isSqlite" .) "true" -}}
+{{- $replicas := ternary "" (.Values.worker.replicas | int) .Values.worker.autoscaling.enabled -}}
+{{- /* A worker pod finishes its running query on shutdown; surge pods are fine. */ -}}
+{{- include "queryproxy.deployment" (dict "ctx" . "role" "worker" "cfg" .Values.worker "replicas" $replicas "strategy" "RollingUpdate") }}
+{{- end }}

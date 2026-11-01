@@ -25,33 +25,13 @@ class ResultDownloadController extends Controller
         return response()->streamDownload(function () use ($queryRequest) {
             $out = fopen('php://output', 'w');
 
-            // The header is as attacker-controlled as the data: column names
-            // come from the target schema or from the requester's own aliases
-            // (`SELECT id AS "=HYPERLINK(...)"`), and on the `SELECT *` path an
-            // approving DBA never sees the name at review time.
-            fputcsv($out, array_map(
-                fn ($column) => Csv::sanitize($column),
-                $queryRequest->result_columns ?? [],
-            ));
-
+            // A missing file still yields the header row, as it always did.
             $stream = Storage::disk($queryRequest->result_disk)
-                ->readStream($queryRequest->result_path);
+                ->readStream($queryRequest->result_path) ?? fopen('php://memory', 'r');
 
-            if ($stream !== null) {
-                while (($line = fgets($stream)) !== false) {
-                    $row = json_decode($line, true);
+            Csv::writeFromNdjson($stream, $out, $queryRequest->result_columns ?? []);
 
-                    if (is_array($row)) {
-                        fputcsv($out, array_map(
-                            fn ($v) => Csv::sanitize(is_scalar($v) || $v === null ? $v : json_encode($v)),
-                            $row,
-                        ));
-                    }
-                }
-
-                fclose($stream);
-            }
-
+            fclose($stream);
             fclose($out);
         }, $filename, ['Content-Type' => 'text/csv']);
     }

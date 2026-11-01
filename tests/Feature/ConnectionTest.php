@@ -82,13 +82,13 @@ test('grants can be toggled for team developers only', function () {
 
     $component = Livewire::actingAs($dba)->test(Index::class);
 
-    $component->call('toggleGrant', $connection->id, $developer->id);
+    $component->call('grantAccess', $connection->id, $developer->id);
     expect($connection->fresh()->isGrantedTo($developer))->toBeTrue();
 
-    $component->call('toggleGrant', $connection->id, $developer->id);
+    $component->call('revokeGrant', $connection->id, $developer->id);
     expect($connection->fresh()->isGrantedTo($developer))->toBeFalse();
 
-    $component->call('toggleGrant', $connection->id, $outsider->id)->assertNotFound();
+    $component->call('grantAccess', $connection->id, $outsider->id)->assertNotFound();
 });
 
 test('use policy honours grants', function () {

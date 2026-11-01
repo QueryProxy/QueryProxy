@@ -1,0 +1,120 @@
+name: Helm
+
+# The Helm chart in deploy/helm/queryproxy (work item 040-08). Two jobs:
+#
+#   lint   helm lint of both profiles on Helm 3 and Helm 4, plus the render
+#          rules the chart promises: one scheduler replica, and SQLite with more
+#          than one web replica refused.
+#   smoke  builds the image from this checkout, installs the chart into a kind
+#          cluster and runs tests/Integration/helm/smoke.sh: migration hook,
+#          /up answers 200, the sample request is approved and completed by the
+#          worker pod, an upgrade keeps the APP_KEY and a rollback restores the
+#          previous configuration.
+#
+# Actions are pinned to commit SHAs rather than mutable tags, as in ci.yml.
+# Dependabot (github-actions ecosystem) keeps the SHAs current; when bumping
+# one, re-resolve the SHA, never edit the version comment alone.
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    paths:
+      - 'deploy/helm/**'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'tests/Integration/helm/**'
+      - 'composer.json'
+      - 'composer.lock'
+      - '.github/workflows/helm.yml'
+  pull_request:
+    paths:
+      - 'deploy/helm/**'
+      - 'Dockerfile'
+      - 'docker/**'
+      - 'tests/Integration/helm/**'
+      - 'composer.json'
+      - 'composer.lock'
+      - '.github/workflows/helm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint (helm ${{ matrix.helm }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        helm: [v3.22.1, v4.3.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ matrix.helm }}
+
+      - name: helm lint (default values, SQLite)
+        run: helm lint deploy/helm/queryproxy
+
+      - name: helm lint (HA profile)
+        run: helm lint deploy/helm/queryproxy -f deploy/helm/queryproxy/values-ha.yaml
+
+      - name: Scheduler renders with one replica and Recreate
+        run: |
+          helm template qp deploy/helm/queryproxy -f deploy/helm/queryproxy/values-ha.yaml > ha.yaml
+          awk '/^kind: Deployment/{d=1} d&&/name: qp-queryproxy-scheduler/{s=1} s&&/replicas:/{print; exit}' ha.yaml | grep -qx '  replicas: 1'
+          awk '/name: qp-queryproxy-scheduler/{s=1} s&&/type:/{print; exit}' ha.yaml | grep -qx '    type: Recreate'
+
+      - name: SQLite with more than one web replica is refused
+        run: |
+          if helm template qp deploy/helm/queryproxy --set web.replicas=2 > /dev/null 2> err.txt; then
+            echo "helm template accepted SQLite with web.replicas=2" >&2
+            exit 1
+          fi
+          grep -q 'SQLite cannot be shared between pods' err.txt
+
+      - name: Secrets as files render the _FILE variables
+        run: |
+          helm template qp deploy/helm/queryproxy -f deploy/helm/queryproxy/values-ha.yaml \
+            --set secrets.mountAsFiles=true | grep -q 'name: APP_KEY_FILE'
+
+  smoke:
+    name: smoke (kind)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+
+      - name: Build the image from this checkout
+        run: docker build -t queryproxy:helm-smoke .
+
+      - name: Create a kind cluster
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: queryproxy-smoke
+          wait: 120s
+
+      - name: Load the image into the cluster
+        run: kind load docker-image queryproxy:helm-smoke --name queryproxy-smoke
+
+      - name: Install the chart and run the smoke test
+        env:
+          IMAGE: queryproxy:helm-smoke
+        run: tests/Integration/helm/smoke.sh

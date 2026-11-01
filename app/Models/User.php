@@ -2,7 +2,9 @@
 
 namespace App\Models;
 
+use App\Enums\MailEvent;
 use App\Enums\TeamRole;
+use App\Support\SqlServerReferentialActions;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
@@ -12,13 +14,30 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Sanctum\HasApiTokens;
 
 #[Fillable(['name', 'email', 'password', 'is_admin'])]
 #[Hidden(['password', 'remember_token', 'two_factor_secret', 'two_factor_recovery_codes'])]
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable, SoftDeletes;
+    use HasApiTokens, HasFactory, Notifiable, SoftDeletes;
+
+    public const PROVIDER_LOCAL = 'local';
+
+    public const PROVIDER_OIDC = 'oidc';
+
+    protected static function booted(): void
+    {
+        // SQL Server only: the keys that would SET NULL on a hard delete cannot
+        // do so there (more than one cascade path), so it is done here. Users
+        // are soft deleted in normal use (ADR-018); this is for forceDelete().
+        static::forceDeleting(function (User $user) {
+            if (SqlServerReferentialActions::isSqlServer($user->getConnection())) {
+                SqlServerReferentialActions::releaseUserReferences($user->getConnection(), $user->id);
+            }
+        });
+    }
 
     protected function casts(): array
     {
@@ -27,11 +46,18 @@ class User extends Authenticatable
             'password' => 'hashed',
             'is_admin' => 'boolean',
             'suspended_at' => 'datetime',
+            'notification_preferences' => 'array',
             'two_factor_secret' => 'encrypted',
             'two_factor_recovery_codes' => 'array',
             'two_factor_confirmed_at' => 'datetime',
             'two_factor_last_used_timestamp' => 'integer',
         ];
+    }
+
+    /** True when the account is identified by the OpenID Connect provider (users.auth_provider). */
+    public function isSsoUser(): bool
+    {
+        return $this->auth_provider === self::PROVIDER_OIDC;
     }
 
     public function isSuspended(): bool
@@ -43,6 +69,45 @@ class User extends Authenticatable
     public function scopeActive(Builder $query): Builder
     {
         return $query->whereNull($query->qualifyColumn('suspended_at'));
+    }
+
+    /** True when the user turned on e-mail for this event; off by default. */
+    public function wantsMail(MailEvent $event): bool
+    {
+        return ($this->notification_preferences[$event->value] ?? false) === true;
+    }
+
+    /**
+     * Every event with the user's choice, in catalog order.
+     *
+     * @return array<string, bool>
+     */
+    public function mailPreferences(): array
+    {
+        $preferences = [];
+
+        foreach (MailEvent::cases() as $event) {
+            $preferences[$event->value] = $this->wantsMail($event);
+        }
+
+        return $preferences;
+    }
+
+    /**
+     * Stores the choices; keys outside the catalog are dropped.
+     *
+     * @param  array<string, mixed>  $preferences
+     */
+    public function setMailPreferences(array $preferences): void
+    {
+        $stored = [];
+
+        foreach (MailEvent::cases() as $event) {
+            // The values the `boolean` validation rule accepts as true.
+            $stored[$event->value] = in_array($preferences[$event->value] ?? false, [true, 1, '1'], true);
+        }
+
+        $this->forceFill(['notification_preferences' => $stored])->save();
     }
 
     public function hasTwoFactorEnabled(): bool
@@ -63,9 +128,19 @@ class User extends Authenticatable
             ->withTimestamps();
     }
 
+    /**
+     * Connections the user holds a grant for that is still in force: permanent,
+     * or not yet expired (ADR-025), as Connection::grantedUsers() counts them.
+     */
     public function grantedConnections(): BelongsToMany
     {
-        return $this->belongsToMany(Connection::class)->withTimestamps();
+        return $this->belongsToMany(Connection::class)
+            ->using(ConnectionGrant::class)
+            ->withPivot(['expires_at', 'granted_by', 'reason', 'access_level'])
+            ->withTimestamps()
+            ->where(fn ($query) => $query
+                ->whereNull('connection_user.expires_at')
+                ->orWhere('connection_user.expires_at', '>', now()));
     }
 
     public function isAdmin(): bool

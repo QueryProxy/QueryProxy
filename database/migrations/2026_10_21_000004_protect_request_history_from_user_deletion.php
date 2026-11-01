@@ -1,5 +1,6 @@
 <?php
 
+use App\Support\SqlServerReferentialActions;
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
@@ -19,8 +20,8 @@ return new class extends Migration
         });
 
         Schema::table('query_requests', function (Blueprint $table) {
-            $table->foreign('user_id')->references('id')->on('users')->restrictOnDelete();
-            $table->foreign('reviewed_by')->references('id')->on('users')->restrictOnDelete();
+            SqlServerReferentialActions::restrictOnDelete($table->foreign('user_id')->references('id')->on('users'));
+            SqlServerReferentialActions::restrictOnDelete($table->foreign('reviewed_by')->references('id')->on('users'));
         });
     }
 
@@ -32,8 +33,8 @@ return new class extends Migration
         });
 
         Schema::table('query_requests', function (Blueprint $table) {
-            $table->foreign('user_id')->references('id')->on('users')->cascadeOnDelete();
-            $table->foreign('reviewed_by')->references('id')->on('users')->nullOnDelete();
+            SqlServerReferentialActions::cascadeOnDelete($table, $table->foreign('user_id')->references('id')->on('users'));
+            SqlServerReferentialActions::nullOnDelete($table, $table->foreign('reviewed_by')->references('id')->on('users'));
         });
     }
 };

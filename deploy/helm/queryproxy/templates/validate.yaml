@@ -1,0 +1,2 @@
+{{- /* Renders nothing; fails the install/template for settings that cannot work. */ -}}
+{{- include "queryproxy.validate" . -}}

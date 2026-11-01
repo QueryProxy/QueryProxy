@@ -91,4 +91,31 @@
             <x-ui.btn wire:click="startTwoFactorEnrollment" variant="primary">Enable 2FA</x-ui.btn>
         @endif
     </x-ui.panel>
+
+    <x-ui.panel title="E-mail notifications" padded class="mt-3.5">
+        @unless ($mailConfigured)
+            <x-ui.alert tone="pending" icon="shield" class="mb-3.5">
+                This instance is not set up to send e-mail (<code class="font-mono">MAIL_MAILER</code> is <code class="font-mono">log</code>, <code class="font-mono">array</code> or empty).
+                Your choices are saved, but nothing is sent until an administrator configures a mail server.
+            </x-ui.alert>
+        @endunless
+
+        <p class="mb-3.5 text-[12.5px] text-mute">
+            Choose what you also get by e-mail. Everything is off by default. E-mails never contain query results,
+            and the SQL, when shown, has its values hidden. Links open the request in QueryProxy and ask you to sign in.
+        </p>
+
+        <form wire:submit="saveNotificationPreferences" class="flex flex-col gap-2.5">
+            @foreach ($mailEvents as $event)
+                <label class="flex items-center gap-2 text-[13px] text-ink-3">
+                    <input type="checkbox" wire:model="mailPreferences.{{ $event->value }}" id="mail-{{ $event->value }}">
+                    {{ $event->label() }}
+                </label>
+            @endforeach
+
+            <x-ui.btn type="submit" variant="primary" class="mt-1 self-start">Save preferences</x-ui.btn>
+        </form>
+    </x-ui.panel>
+
+    <livewire:profile.api-tokens />
 </div>
