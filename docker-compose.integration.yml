@@ -95,7 +95,7 @@ services:
       retries: 40
 
   mysql:
-    image: mysql:8.4.13@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+    image: mysql:8.4.13@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
     # MySQL generates a self-signed certificate on first start and offers TLS
     # by default. Its default login plugin (caching_sha2_password) needs TLS
     # for the first login of an account, so the functional tests use it too.
@@ -113,7 +113,7 @@ services:
       retries: 40
 
   mysql-notls:
-    image: mysql:8.4.13@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+    image: mysql:8.4.13@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
     # An empty tls_version leaves the server without any TLS protocol, so it
     # starts with encrypted connections disabled (MySQL 8.4 manual, "Server-Side
     # Configuration for Encrypted Connections").
