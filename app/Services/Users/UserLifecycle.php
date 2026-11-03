@@ -25,34 +25,87 @@ class UserLifecycle
      * Block the user from signing in and acting. Live sessions end, chat
      * identity stops resolving. Their pending requests are NOT touched: they
      * stay pending and are decided under the normal rules.
+     *
+     * $byScim marks the suspension as SCIM's own (ADR-026), which SCIM may
+     * lift again. Suspending a user whom SCIM suspended already, by hand, takes
+     * the suspension over: from then on only an administrator lifts it.
+     *
+     * The decision is made on the row as it is under a write lock, never on the
+     * caller's copy: an administrator and SCIM suspending the same user at the
+     * same moment leave one suspension, and it belongs to whoever got there
+     * first (the administrator, if both).
+     *
+     * @return bool whether this call suspended the user (false: already suspended)
      */
-    public function suspend(User $user): void
+    public function suspend(User $user, bool $byScim = false): bool
     {
-        if ($user->isSuspended()) {
-            return;
-        }
+        return DB::transaction(function () use ($user, $byScim) {
+            $this->lockAndRefresh($user);
 
-        DB::transaction(function () use ($user) {
-            // A retried attempt starts from the database state: after a rolled
-            // back attempt the model would otherwise still carry (and consider
-            // saved) the suspension, and save() would write nothing.
-            $user->refresh();
+            if ($user->isSuspended()) {
+                if (! $byScim && $user->suspended_by_scim) {
+                    $user->forceFill(['suspended_by_scim' => false])->save();
+                }
 
-            $user->forceFill(['suspended_at' => now()])->save();
+                return false;
+            }
+
+            $user->forceFill(['suspended_at' => now(), 'suspended_by_scim' => $byScim])->save();
 
             $this->endSessions($user);
 
             audit()->record('user.suspended', metadata: ['user' => $user->email]);
+
+            return true;
         }, attempts: 3);
     }
 
     public function unsuspend(User $user): void
     {
-        if (! $user->isSuspended()) {
-            return;
-        }
+        DB::transaction(function () use ($user) {
+            $this->lockAndRefresh($user);
 
-        $user->forceFill(['suspended_at' => null])->save();
+            if ($user->isSuspended()) {
+                $this->lift($user);
+            }
+        }, attempts: 3);
+    }
+
+    /**
+     * Lifts the suspension only when SCIM set it (ADR-026), judged on the row
+     * under the write lock: an administrator who took the suspension over a
+     * moment ago keeps it. Returns whether it was lifted.
+     */
+    public function unsuspendIfByScim(User $user): bool
+    {
+        return DB::transaction(function () use ($user) {
+            $this->lockAndRefresh($user);
+
+            if (! $user->isSuspended() || ! $user->suspended_by_scim) {
+                return false;
+            }
+
+            $this->lift($user);
+
+            return true;
+        }, attempts: 3);
+    }
+
+    /**
+     * Takes the row's write lock and reads the user again. The lock comes
+     * first: a plain read before it could hand the transaction a snapshot that
+     * predates the other writer's commit. Retried attempts start over here too.
+     */
+    private function lockAndRefresh(User $user): void
+    {
+        User::withTrashed()->whereKey($user->id)->lockForUpdate()->first();
+
+        $user->refresh();
+    }
+
+    private function lift(User $user): void
+    {
+        $user->forceFill(['suspended_at' => null, 'suspended_by_scim' => false])->save();
 
         audit()->record('user.unsuspended', metadata: ['user' => $user->email]);
     }

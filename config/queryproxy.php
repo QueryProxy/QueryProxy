@@ -258,6 +258,26 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | SCIM 2.0 provisioning (ADR-026)
+    |--------------------------------------------------------------------------
+    | /scim/v2 lets an identity provider create, update and suspend users and
+    | sync groups. It is off by default: while `enabled` is false every SCIM
+    | path answers 404. Clients authenticate with a SCIM token (see
+    | `php artisan queryproxy:scim-token create`), which is not a personal access
+    | token. `rate_limit_per_minute` is the request budget of each token, and
+    | the number of failed authentications an address may make a minute before
+    | it is answered with 429. Groups are mapped to team roles with
+    | QUERYPROXY_OIDC_ROLE_MAP (see the OIDC section).
+    */
+
+    'scim' => [
+        'enabled' => filter_var(env('QUERYPROXY_SCIM_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+
+        'rate_limit_per_minute' => max(1, (int) env('QUERYPROXY_SCIM_RATE_LIMIT', 300)),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Network trust
     |--------------------------------------------------------------------------
     | Both lists live here rather than being read with env() at runtime: the

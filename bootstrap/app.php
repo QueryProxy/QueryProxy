@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\MetricsController;
+use App\Http\Middleware\AuthenticateScimToken;
 use App\Http\Middleware\EnsureAdmin;
 use App\Http\Middleware\EnsureTeamRole;
 use App\Http\Middleware\EnsureUserIsActive;
@@ -9,6 +10,7 @@ use App\Http\Middleware\SecurityHeaders;
 use App\Http\Middleware\ThrottleFailedApiAuthentication;
 use App\Http\Middleware\VerifySlackSignature;
 use App\Http\Middleware\VerifyTeamsHmac;
+use App\Services\Scim\ScimException;
 use Illuminate\Contracts\Auth\Middleware\AuthenticatesRequests;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -16,8 +18,11 @@ use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Http\Request;
 use Illuminate\Session\Middleware\AuthenticateSession;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Validation\ValidationException;
 use Laravel\Sanctum\Http\Middleware\CheckAbilities;
 use Laravel\Sanctum\Http\Middleware\CheckForAnyAbility;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
@@ -33,6 +38,14 @@ return Application::configure(basePath: dirname(__DIR__))
             Route::get('/metrics', MetricsController::class)
                 ->middleware('throttle:120,1')
                 ->name('metrics');
+
+            // SCIM 2.0 (ADR-026) is outside the web group too: a provisioning
+            // client has no session or CSRF token and authenticates with a SCIM
+            // token. The paths answer 404 until QUERYPROXY_SCIM_ENABLED is set.
+            Route::prefix('scim/v2')
+                ->name('scim.')
+                ->middleware(AuthenticateScimToken::class)
+                ->group(base_path('routes/scim.php'));
         },
     )
     ->withMiddleware(function (Middleware $middleware): void {
@@ -131,6 +144,33 @@ return Application::configure(basePath: dirname(__DIR__))
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
+        // A SCIM client expects its errors as SCIM Error messages (RFC 7644
+        // section 3.12), including the router's own 404 and 405.
+        $exceptions->render(function (HttpExceptionInterface $e, Request $request) {
+            if ($request->is('scim/*')) {
+                return ScimException::response(
+                    $e->getStatusCode(),
+                    Response::$statusTexts[$e->getStatusCode()] ?? 'Request failed.',
+                    null,
+                    $e->getHeaders(),
+                );
+            }
+        });
+
+        // Anything else that goes wrong under /scim answers in the same shape,
+        // without leaking the cause (it is still reported).
+        $exceptions->render(function (Throwable $e, Request $request) {
+            if (! $request->is('scim/*')) {
+                return null;
+            }
+
+            if ($e instanceof ValidationException) {
+                return ScimException::response(400, 'The request is not valid.', 'invalidValue');
+            }
+
+            return ScimException::response(500, 'The server could not process the request.');
+        });
+
         $exceptions->shouldRenderJsonWhen(
             fn (Request $request) => $request->is('api/*') || $request->expectsJson(),
         );

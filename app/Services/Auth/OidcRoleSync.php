@@ -87,12 +87,22 @@ class OidcRoleSync
     }
 
     /**
-     * Applies the map for one login.
+     * Applies the map for one login, or, for SCIM (ADR-026), for the groups
+     * the identity provider put the user in. $via names that other source: the
+     * audit records then carry metadata.via and no actor, since the user did
+     * not change their own roles.
+     *
+     * $onlyGroups narrows a SCIM sync to the teams that the listed groups map
+     * to (ADR-026): a membership change of one group must not recompute, and so
+     * remove, the roles other groups or an SSO login gave in other teams. The
+     * role in each of those teams is still the highest one over all the groups
+     * given.
      *
      * @param  list<string>  $groups
+     * @param  list<string>|null  $onlyGroups
      * @return list<array{change: string, team: string, from: ?string, to: ?string}> what changed
      */
-    public function sync(User $user, array $groups): array
+    public function sync(User $user, array $groups, ?string $via = null, ?array $onlyGroups = null): array
     {
         $map = $this->roleMap();
 
@@ -100,7 +110,7 @@ class OidcRoleSync
             return [];
         }
 
-        if (array_intersect(array_column($map, 'group'), $groups) === []) {
+        if ($via === null && array_intersect(array_column($map, 'group'), $groups) === []) {
             // Not an error: the user is simply in none of the mapped groups.
             // Their memberships in the mapped teams are removed below.
             Log::info('OIDC login with no group from the role map; no team role is granted.', ['user_id' => $user->id, 'groups_received' => count($groups)]);
@@ -111,12 +121,34 @@ class OidcRoleSync
         /** @var array<int, TeamRole> $desired */
         $desired = [];
 
+        $resolved = [];
+
         foreach ($map as $entry) {
             $team = $this->findTeam($entry['team']);
 
             if ($team === null) {
                 Log::warning('OIDC role map names a team that does not exist.', ['team' => $entry['team']]);
 
+                continue;
+            }
+
+            $resolved[] = [$team, $entry];
+        }
+
+        $scope = null;
+
+        if ($onlyGroups !== null) {
+            $scope = [];
+
+            foreach ($resolved as [$team, $entry]) {
+                if (in_array($entry['group'], $onlyGroups, true)) {
+                    $scope[$team->id] = true;
+                }
+            }
+        }
+
+        foreach ($resolved as [$team, $entry]) {
+            if ($scope !== null && ! isset($scope[$team->id])) {
                 continue;
             }
 
@@ -134,7 +166,7 @@ class OidcRoleSync
 
         $changes = [];
 
-        DB::transaction(function () use ($user, $teams, $desired, &$changes) {
+        DB::transaction(function () use ($user, $teams, $desired, $via, &$changes) {
             // A retried attempt starts over from the database state.
             $changes = [];
 
@@ -159,13 +191,13 @@ class OidcRoleSync
 
                 $changes[] = ['change' => $change, 'team' => $team->slug, 'from' => $existing, 'to' => $wanted];
 
-                audit()->record(AuditEvent::UserRoleSynced, team: $team, actor: $user, metadata: [
+                audit()->record(AuditEvent::UserRoleSynced, team: $team, actor: $via === null ? $user : null, metadata: [
                     'user' => $user->email,
                     'change' => $change,
                     'team' => $team->slug,
                     'from' => $existing,
                     'to' => $wanted,
-                ]);
+                ] + ($via === null ? [] : ['via' => $via]));
             }
         }, attempts: 3);
 

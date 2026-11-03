@@ -66,6 +66,15 @@ enum AuditEvent: string
     case TokenCreated = 'token.created';
     case TokenRevoked = 'token.revoked';
 
+    // SCIM provisioning (ADR-026)
+    case ScimUserProvisioned = 'scim.user_provisioned';
+    case ScimUserUpdated = 'scim.user_updated';
+    case ScimUserSuspended = 'scim.user_suspended';
+    case ScimUserUnsuspended = 'scim.user_unsuspended';
+    case ScimGroupSynced = 'scim.group_synced';
+    case ScimTokenCreated = 'scim.token_created';
+    case ScimTokenRevoked = 'scim.token_revoked';
+
     // Masking
     case MaskingRuleCreated = 'masking_rule.created';
     case MaskingRuleUpdated = 'masking_rule.updated';
@@ -120,7 +129,7 @@ enum AuditEvent: string
             self::UserTwoFactorReset => 'An administrator reset the two-factor authentication of a user.',
             self::UserSsoProvisioned => 'A user account was created at the first SSO sign-in (just-in-time provisioning; metadata.user is the e-mail address, metadata.issuer the provider).',
             self::UserSsoLinked => 'An existing local account was linked to an identity provider subject because the provider asserted the e-mail address as verified (metadata.user, metadata.issuer).',
-            self::UserRoleSynced => 'A team membership of an SSO user was added, changed or removed to match the identity provider groups (metadata.change = added|changed|removed, metadata.team, metadata.from, metadata.to).',
+            self::UserRoleSynced => 'A team membership of an SSO user was added, changed or removed to match the identity provider groups (metadata.change = added|changed|removed, metadata.team, metadata.from, metadata.to). When the identity provider pushed the change through SCIM, metadata.via = scim and the record has no actor.',
 
             self::TeamCreated => 'A team was created.',
             self::TeamDeleted => 'A team was deleted.',
@@ -145,6 +154,14 @@ enum AuditEvent: string
 
             self::TokenCreated => 'A user created a personal access token for the REST API (metadata.token_id, metadata.name, metadata.scopes, metadata.expires_at). The token value is never recorded.',
             self::TokenRevoked => 'A personal access token was revoked (metadata.token_id, metadata.name). When it was revoked because its owner was suspended or deleted, the actor is the administrator who did it and metadata.owner_id and metadata.reason (user_suspended | user_deleted) are set.',
+
+            self::ScimUserProvisioned => 'The identity provider created a user through SCIM, without a local password (metadata.user, metadata.token_id; metadata.via = scim).',
+            self::ScimUserUpdated => 'The identity provider changed a user through SCIM (metadata.user, metadata.changed lists the attributes: user_name, email, name, external_id).',
+            self::ScimUserSuspended => 'The identity provider suspended a user through SCIM, by active=false or DELETE (metadata.user, metadata.reason = active_false | delete). Sessions and tokens end; the user is never deleted.',
+            self::ScimUserUnsuspended => 'The identity provider lifted the suspension of a user through SCIM, by active=true (metadata.user).',
+            self::ScimGroupSynced => 'The identity provider created, changed or deleted a group through SCIM (metadata.operation = created | updated | deleted, metadata.group, metadata.members_added, metadata.members_removed). Role changes that follow are recorded as user.role_synced with metadata.via = scim.',
+            self::ScimTokenCreated => 'A SCIM token was created (metadata.token_id, metadata.name). The token value is never recorded.',
+            self::ScimTokenRevoked => 'A SCIM token was revoked (metadata.token_id, metadata.name).',
 
             self::MaskingRuleCreated => 'A masking rule was created.',
             self::MaskingRuleUpdated => 'A masking rule was changed.',

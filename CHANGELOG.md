@@ -51,11 +51,25 @@ All notable changes to QueryProxy are documented here. The format follows
 - CockroachDB and YugabyteDB are tested in CI as target databases through
   the PostgreSQL driver; `docs/compatibility.md` lists the status (Aurora
   PostgreSQL, Neon, Supabase: not tested) and the known differences.
+- SCIM 2.0 provisioning (ADR-026) under `/scim/v2`: Users and Groups with
+  filter (`userName`/`externalId` `eq`), pagination, PATCH and PUT;
+  `ServiceProviderConfig`, `Schemas`, `ResourceTypes`. Off by default
+  (`QUERYPROXY_SCIM_ENABLED`). Dedicated bearer tokens
+  (`php artisan queryproxy:scim-token create|revoke|list`), stored as
+  SHA-256 only. `active=false` and `DELETE` suspend the user, never delete;
+  `active=true` lifts only a suspension SCIM itself set, never one an
+  administrator set. SCIM sees only users it created or SSO-linked users,
+  never local accounts. Group membership applies `QUERYPROXY_OIDC_ROLE_MAP`.
+  New audit events `scim.*`.
 
 ### Changed
 
 - The profile page hides the password form for users without a local
   password.
+- `users` gets `scim_provisioned_at`, `scim_external_id`, `scim_user_name`
+  and `suspended_by_scim`; new tables `scim_tokens`, `scim_groups`,
+  `scim_group_user` (migrations are reversible). Accounts created by SCIM
+  count as SSO users: no local password through reset flows.
 
 ### Fixed
 
