@@ -28,6 +28,11 @@ use WeakMap;
  * The READ ONLY transaction is always opened through Laravel's
  * beginTransaction(): a connection inside a transaction is never silently
  * re-established and re-run (a fresh session would be writable).
+ *
+ * CockroachDB (reached through the pgsql driver) commits the open transaction
+ * before a DDL statement (autocommit_before_ddl), exactly like MySQL's
+ * implicit commit, so there the read-only setting is also made session-wide
+ * (default_transaction_read_only). YugabyteDB behaves like PostgreSQL here.
  */
 class TargetSession
 {
@@ -166,7 +171,25 @@ class TargetSession
     {
         switch ($driver) {
             case DbDriver::Pgsql:
+                // Before the transaction opens: the session-wide setting has to
+                // be there when a DDL statement commits the transaction away.
+                // If beginTransaction() had to reconnect, the new session never
+                // saw it: fail closed, as on MySQL below.
+                $cockroach = $this->isCockroach($db);
+                $pdo = $db->getPdo();
+
+                if ($cockroach) {
+                    $db->unprepared('SET default_transaction_read_only = on');
+                }
+
                 $db->beginTransaction();
+
+                if ($cockroach && $db->getPdo() !== $pdo) {
+                    $db->rollBack();
+
+                    throw new RuntimeException('The database connection was re-established while opening the read-only transaction; refusing to run the read on a writable session.');
+                }
+
                 $db->unprepared('SET TRANSACTION READ ONLY');
                 $this->applyLimits($db, $driver, true);
 
@@ -212,6 +235,23 @@ class TargetSession
 
                 break;
         }
+    }
+
+    /**
+     * Whether the server behind a pgsql connection is CockroachDB, asked of
+     * the server itself with version() (one round trip per read request, the
+     * same test BackendCanceller applies). The server_version the driver
+     * reports is deliberately not used as a shortcut: if its format ever
+     * changed, or a proxy rewrote it, CockroachDB would go unrecognised and
+     * the read-only guarantee would be dropped without notice.
+     */
+    private function isCockroach(DatabaseConnection $db): bool
+    {
+        if ($db->getPdo()->getAttribute(PDO::ATTR_DRIVER_NAME) !== 'pgsql') {
+            return false;
+        }
+
+        return str_starts_with((string) $db->scalar('SELECT version()'), 'CockroachDB');
     }
 
     public function endReadOnly(DatabaseConnection $db, bool $commit): void

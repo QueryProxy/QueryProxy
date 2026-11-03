@@ -184,3 +184,100 @@ test('ending a read-only transaction that is still open commits or rolls it back
     'commit' => [true],
     'rollback' => [false],
 ]);
+
+/**
+ * A pgsql connection that needs no server: the PDO only answers the driver
+ * name, version() answers $version, and beginTransaction() can swap the PDO the
+ * way Laravel does when it has to reconnect.
+ */
+function pgsqlSessionFake(string $version, bool $reconnectOnBegin = false): SQLiteConnection
+{
+    $pdo = static fn (): PDO => new class extends PDO
+    {
+        public function __construct() {}
+
+        public function getAttribute(int $attribute): mixed
+        {
+            return $attribute === PDO::ATTR_DRIVER_NAME ? 'pgsql' : null;
+        }
+    };
+
+    return new class($pdo(), $pdo, $version, $reconnectOnBegin) extends SQLiteConnection
+    {
+        public array $sent = [];
+
+        private PDO $current;
+
+        public function __construct(PDO $pdo, private readonly Closure $newPdo, private readonly string $version, private readonly bool $reconnectOnBegin)
+        {
+            parent::__construct(new PDO('sqlite::memory:'), ':memory:', '', ['name' => 'pgsql_fake']);
+
+            $this->current = $pdo;
+        }
+
+        public function getPdo()
+        {
+            return $this->current;
+        }
+
+        public function scalar($query, $bindings = [], $useReadPdo = true)
+        {
+            $this->sent[] = $query;
+
+            return $this->version;
+        }
+
+        public function unprepared($query)
+        {
+            $this->sent[] = $query;
+
+            return true;
+        }
+
+        public function beginTransaction()
+        {
+            $this->sent[] = 'BEGIN';
+
+            if ($this->reconnectOnBegin) {
+                $this->current = ($this->newPdo)();
+            }
+        }
+
+        public function rollBack($toLevel = null)
+        {
+            $this->sent[] = 'ROLLBACK';
+        }
+    };
+}
+
+test('CockroachDB read requests are made read-only for the whole session before the transaction opens', function () {
+    $db = pgsqlSessionFake('CockroachDB CCL v25.4.19 (x86_64-pc-linux-gnu)');
+
+    app(TargetSession::class)->beginReadOnly($db, DbDriver::Pgsql);
+
+    expect(array_slice($db->sent, 0, 4))->toBe([
+        'SELECT version()',
+        'SET default_transaction_read_only = on',
+        'BEGIN',
+        'SET TRANSACTION READ ONLY',
+    ]);
+});
+
+test('PostgreSQL read requests get no session-wide read-only statement', function () {
+    $db = pgsqlSessionFake('PostgreSQL 17.2 on x86_64-pc-linux-gnu');
+
+    app(TargetSession::class)->beginReadOnly($db, DbDriver::Pgsql);
+
+    expect($db->sent)->not->toContain('SET default_transaction_read_only = on')
+        ->and($db->sent)->toContain('BEGIN', 'SET TRANSACTION READ ONLY');
+});
+
+test('CockroachDB read-only fails closed when opening the transaction had to reconnect', function () {
+    $db = pgsqlSessionFake('CockroachDB CCL v25.4.19 (x86_64-pc-linux-gnu)', reconnectOnBegin: true);
+
+    expect(fn () => app(TargetSession::class)->beginReadOnly($db, DbDriver::Pgsql))
+        ->toThrow(RuntimeException::class, 'refusing to run the read on a writable session');
+
+    expect($db->sent)->toContain('ROLLBACK')
+        ->and($db->sent)->not->toContain('SET TRANSACTION READ ONLY');
+});

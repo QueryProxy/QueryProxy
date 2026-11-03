@@ -48,11 +48,21 @@ All notable changes to QueryProxy are documented here. The format follows
   from `Chart.yaml` `version`/`appVersion`. Pull requests dry-run
   `helm package`. The chart README documents installing from the registry
   and verifying the signature.
+- CockroachDB and YugabyteDB are tested in CI as target databases through
+  the PostgreSQL driver; `docs/compatibility.md` lists the status (Aurora
+  PostgreSQL, Neon, Supabase: not tested) and the known differences.
 
 ### Changed
 
 - The profile page hides the password form for users without a local
   password.
+
+### Fixed
+
+- On CockroachDB a read request's read-only transaction did not stop DDL
+  (the server commits before DDL); the read session is now also read-only
+  session-wide there. "Stop" now works for running statements on
+  CockroachDB (`CANCEL QUERIES`).
 
 ### Security
 

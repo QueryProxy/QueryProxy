@@ -13,6 +13,16 @@
 #   mariadb   mariadb       13316  no TLS           mariadb-tls   13317  TLS
 #   sqlsrv    mssql         11433  TLS (self-signed), no way to switch it off
 #
+# PostgreSQL-compatible systems, tested through the pgsql driver
+# (work item 040-11, docs/compatibility.md; QUERYPROXY_IT_FLAVOR names them):
+#
+#   flavor       main server (functional tests)         second server
+#   cockroachdb  cockroachdb       16257  TLS, passwords   cockroachdb-notls  16258  insecure, no TLS
+#   yugabytedb   yugabytedb        15434  no TLS, passwords  (none: see the service)
+#
+# The `cockroachdb` service needs the node and client certificates the same
+# script writes (a secure single node insists on CN=node).
+#
 # The `vault` service (dev-mode HashiCorp Vault, 18200) is not a database: it is
 # the secret store of tests/Integration/VaultSecretTest.php (ADR-028).
 #
@@ -216,3 +226,85 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  cockroachdb:
+    # Secure single node: TLS with the test CA, password logins. This is the
+    # main CockroachDB server because an insecure one accepts no passwords at
+    # all (no read-only login could be created on it) and offers no TLS.
+    image: cockroachdb/cockroach:v25.4.19@sha256:5f4ea15c81baedabf439ce53fc3fd0793c4d577e4abe295e9343d765112ce199
+    # The key files must not be readable by others, and a bind-mounted file keeps
+    # the mode of the host, so the certificates are copied first.
+    # --advertise-addr=localhost: with the default (0.0.0.0) the node cannot
+    # dial itself and SHOW CLUSTER SESSIONS / STATEMENTS come back empty,
+    # which is what the application reads to stop a statement.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        mkdir -p /crt &&
+        cp /certs/ca.crt /certs/node.crt /certs/node.key /certs/client.root.crt /certs/client.root.key /crt/ &&
+        chmod 600 /crt/*.key &&
+        exec cockroach start-single-node --certs-dir=/crt --advertise-addr=localhost
+        --http-addr=127.0.0.1:8080 --cache=.25 --max-sql-memory=.25
+    volumes:
+      - ./tests/Integration/docker/certs:/certs:ro
+    tmpfs:
+      - /cockroach/cockroach-data
+    ports:
+      - "127.0.0.1:16257:26257"
+    healthcheck:
+      # Creates the test database and the administrator login on the way (all
+      # idempotent), so "healthy" means the server is ready for the tests.
+      test:
+        - CMD-SHELL
+        - >-
+          cockroach sql --certs-dir=/crt --host=localhost -e
+          "CREATE DATABASE IF NOT EXISTS queryproxy_test;
+          CREATE USER IF NOT EXISTS queryproxy_test WITH PASSWORD 'queryproxy_test';
+          GRANT admin TO queryproxy_test"
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s
+
+  cockroachdb-notls:
+    # Insecure mode: no TLS, and any password is accepted (it is never checked).
+    image: cockroachdb/cockroach:v25.4.19@sha256:5f4ea15c81baedabf439ce53fc3fd0793c4d577e4abe295e9343d765112ce199
+    command: ["start-single-node", "--insecure", "--advertise-addr=localhost", "--http-addr=127.0.0.1:8080", "--cache=.25", "--max-sql-memory=.25"]
+    tmpfs:
+      - /cockroach/cockroach-data
+    ports:
+      - "127.0.0.1:16258:26257"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cockroach sql --insecure --host=localhost -e
+          "CREATE DATABASE IF NOT EXISTS queryproxy_test;
+          CREATE USER IF NOT EXISTS queryproxy_test;
+          GRANT admin TO queryproxy_test"
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s
+
+  yugabytedb:
+    # Single node (yugabyted), password logins switched on for YSQL: the
+    # built-in administrator is `yugabyte` with the password `yugabyte`, in the
+    # database `yugabyte`, so nothing has to be created first. YSQL listens on
+    # the container's address only, hence `hostname -i` in the health check.
+    # No TLS: client-to-server encryption needs a certificate directory laid
+    # out the way YugabyteDB wants it, which this file does not set up; the TLS
+    # tests are skipped for this flavor (docs/compatibility.md).
+    image: yugabytedb/yugabyte:2025.2.8.0-b60@sha256:c77dfcd5e840e019af1ba96f7129db5f6a5de8b80b13f6c1450cce5246daa382
+    command: ["bin/yugabyted", "start", "--background=false", "--tserver_flags=ysql_enable_auth=true"]
+    ports:
+      - "127.0.0.1:15434:5433"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - PGPASSWORD=yugabyte /home/yugabyte/bin/ysqlsh -h "$$(hostname -i)" -U yugabyte -d yugabyte -c "SELECT 1" >/dev/null
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s

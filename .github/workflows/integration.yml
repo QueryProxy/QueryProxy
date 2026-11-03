@@ -3,7 +3,9 @@ name: Integration
 # Runs the integration tests (tests/Integration, Pest group "integration") and
 # the audit chain and connection slot tests (tests/Live, group "live-appdb")
 # against real PostgreSQL, MySQL, MariaDB (11.4 and 11.8) and SQL Server
-# servers, one job per driver and version. The servers come from
+# servers, one job per driver and version, plus CockroachDB and YugabyteDB
+# (PostgreSQL-compatible systems, reached through the pgsql driver; the
+# `flavor` entry tells the tests which one, see docs/compatibility.md). The servers come from
 # docker-compose.integration.yml (MariaDB 11.8: tests/Integration/docker/
 # mariadb-11-8/docker-compose.yml), the same files the tests use locally, so
 # the credentials, ports and TLS setups are written once. Besides the main
@@ -89,6 +91,38 @@ jobs:
             password: queryproxy_test
             tls-on-port: 13319
             tls-off-port: 13318
+          # PostgreSQL-compatible systems (work item 040-11). They are target
+          # databases only, never the application database, so the live-appdb
+          # step is switched off for them (`live-appdb: 'no'`).
+          - driver: pgsql
+            flavor: cockroachdb
+            label: cockroachdb 25.4
+            live-appdb: 'no'
+            compose-file: docker-compose.integration.yml
+            php-extensions: pdo_pgsql
+            # Secure node (TLS, passwords) and an insecure one (no TLS).
+            services: cockroachdb cockroachdb-notls
+            port: 16257
+            database: queryproxy_test
+            username: queryproxy_test
+            password: queryproxy_test
+            tls-on-port: 16257
+            tls-off-port: 16258
+          - driver: pgsql
+            flavor: yugabytedb
+            label: yugabytedb 2025.2
+            live-appdb: 'no'
+            compose-file: docker-compose.integration.yml
+            php-extensions: pdo_pgsql
+            services: yugabytedb
+            port: 15434
+            # The built-in administrator of YugabyteDB (see the service).
+            database: yugabyte
+            username: yugabyte
+            password: yugabyte
+            # No TLS server for YugabyteDB: the TLS tests skip for this flavor.
+            tls-on-port: ''
+            tls-off-port: ''
           - driver: sqlsrv
             label: sqlsrv
             compose-file: docker-compose.integration.yml
@@ -109,6 +143,8 @@ jobs:
       QUERYPROXY_IT_REQUIRED: '1'
       QUERYPROXY_LIVE_APPDB_REQUIRED: '1'
       QUERYPROXY_IT_DRIVER: ${{ matrix.driver }}
+      # Empty except for the PostgreSQL-compatible systems.
+      QUERYPROXY_IT_FLAVOR: ${{ matrix.flavor }}
       QUERYPROXY_IT_HOST: 127.0.0.1
       QUERYPROXY_IT_PORT: ${{ matrix.port }}
       QUERYPROXY_IT_DATABASE: ${{ matrix.database }}
@@ -174,7 +210,8 @@ jobs:
         run: ./vendor/bin/pest --group=integration
 
       - name: Audit chain and connection slot tests
-        if: ${{ !cancelled() }}
+        # Not for CockroachDB / YugabyteDB: they are never the application database.
+        if: ${{ !cancelled() && matrix.live-appdb != 'no' }}
         run: ./vendor/bin/pest --group=live-appdb
 
       - name: Server logs
