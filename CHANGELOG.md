@@ -6,6 +6,8 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-04
+
 ### Added
 
 - External secret references for connection passwords (ADR-028): a
@@ -1392,7 +1394,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2

@@ -2,8 +2,8 @@ apiVersion: v2
 name: queryproxy
 description: Approval workflow, masking and audit trail in front of production databases (web, worker and scheduler Deployments from one image).
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.4.1
+appVersion: "0.4.1"
 kubeVersion: ">=1.27.0-0"
 home: https://queryproxy.com
 sources:
