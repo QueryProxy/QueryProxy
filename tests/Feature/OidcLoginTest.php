@@ -1150,3 +1150,51 @@ test('an SSO-linked user is never handed a reset link, even with a local passwor
 
     expect(Hash::check('secret-password', $user->fresh()->password))->toBeTrue();
 });
+
+/** Starts a confirmation as the signed-in user with the given query and returns the callback response. */
+function oidcReauthenticate(array $reauthQuery, array $claims): TestResponse
+{
+    $location = test()->get(route('oidc.reauthenticate', $reauthQuery))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    OidcFakeProvider::$claims = $claims;
+
+    return test()->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]));
+}
+
+test('an admin who confirms from the SCIM screen returns to it, on success and on failure', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    auth()->user()->forceFill(['is_admin' => true])->save();
+    session([OidcController::SESSION_AT_KEY => now()->subHour()->getTimestamp()]);
+
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time()])
+        ->assertRedirect(route('settings.scim'))
+        ->assertSessionHasNoErrors();
+
+    expect(now()->getTimestamp() - session(OidcController::SESSION_AT_KEY))->toBeLessThan(5);
+
+    // A confirmation the provider did not really renew is refused, and the error shows where the user came from.
+    $oldAt = now()->subHour()->getTimestamp();
+    session([OidcController::SESSION_AT_KEY => $oldAt]);
+
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time() - 3600])
+        ->assertRedirect(route('settings.scim'))
+        ->assertSessionHasErrors('sso');
+
+    expect(session(OidcController::SESSION_AT_KEY))->toBe($oldAt);
+});
+
+test('the return target is a fixed list: unknown keys, URLs and non-admins go back to the profile', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    // Not an admin: the SCIM screen is not theirs.
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
+
+    auth()->user()->forceFill(['is_admin' => true])->save();
+
+    foreach (['https://evil.test/', '//evil.test', 'settings.scim', '/settings/scim', ''] as $return) {
+        oidcReauthenticate(['return' => $return], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
+    }
+
+    oidcReauthenticate(['return' => ['scim']], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
+});

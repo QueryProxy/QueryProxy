@@ -3,15 +3,13 @@
 namespace App\Livewire\Profile;
 
 use App\Enums\TeamRole;
-use App\Http\Controllers\Auth\OidcController;
+use App\Livewire\Concerns\ConfirmsFreshIdentity;
 use App\Models\User;
 use App\Services\Api\TokenService;
 use App\Services\Auth\TwoFactorService;
 use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Validation\ValidationException;
 use Laravel\Sanctum\PersonalAccessToken;
 use Livewire\Component;
@@ -27,11 +25,7 @@ use Livewire\Component;
  */
 class ApiTokens extends Component
 {
-    /** How recent an SSO sign-in must be to create a token without a local password (ADR-024). */
-    public const SSO_FRESH_MINUTES = 15;
-
-    /** Wrong confirmations allowed per minute before the user must wait. */
-    private const CONFIRM_ATTEMPTS = 5;
+    use ConfirmsFreshIdentity;
 
     public string $name = '';
 
@@ -40,11 +34,6 @@ class ApiTokens extends Component
 
     /** @var list<string> */
     public array $scopes = [];
-
-    /** Fresh confirmation (ADR-024): the local password, or a code from the authenticator app. */
-    public string $confirmPassword = '';
-
-    public string $confirmCode = '';
 
     public ?string $notice = null;
 
@@ -86,67 +75,6 @@ class ApiTokens extends Component
     private function mustEnrol(User $user, TwoFactorService $twoFactor): bool
     {
         return $twoFactor->mustEnrol($user, null);
-    }
-
-    /** A user without a local password confirms through SSO instead of typing one. */
-    private function confirmsWithSso(User $user): bool
-    {
-        return $user->getAuthPassword() === null;
-    }
-
-    /** Was this session opened through SSO within the last SSO_FRESH_MINUTES? */
-    private function ssoIsFresh(): bool
-    {
-        $at = session(OidcController::SESSION_AT_KEY);
-
-        return session(OidcController::SESSION_FLAG) === true
-            && is_int($at)
-            && $at <= now()->getTimestamp()
-            && now()->getTimestamp() - $at <= self::SSO_FRESH_MINUTES * 60;
-    }
-
-    /**
-     * Is the confirmation good? Wrong tries are counted per user, so a stolen
-     * session cannot be used to guess the password.
-     */
-    private function confirmed(User $user, TwoFactorService $twoFactor): bool
-    {
-        if ($this->confirmsWithSso($user)) {
-            if ($this->ssoIsFresh()) {
-                return true;
-            }
-
-            $this->addError('confirmation', 'Confirm with single sign-on first: sign in through SSO again, then create the token.');
-
-            return false;
-        }
-
-        $key = 'api-token-confirm:'.$user->id;
-
-        if (RateLimiter::tooManyAttempts($key, self::CONFIRM_ATTEMPTS)) {
-            $this->addError('confirmation', 'Too many wrong attempts. Try again in '.RateLimiter::availableIn($key).' seconds.');
-
-            return false;
-        }
-
-        $password = $this->confirmPassword;
-        $code = trim($this->confirmCode);
-
-        $valid = ($password !== '' && Hash::check($password, $user->getAuthPassword()))
-            || ($code !== '' && $user->hasTwoFactorEnabled() && $twoFactor->verify($user, $code));
-
-        if (! $valid) {
-            RateLimiter::hit($key);
-            $this->addError('confirmation', $password === '' && $code === ''
-                ? 'Enter your password to create a token.'
-                : 'That password or code is not right.');
-
-            return false;
-        }
-
-        RateLimiter::clear($key);
-
-        return true;
     }
 
     public function create(TokenService $tokens, TwoFactorService $twoFactor): void

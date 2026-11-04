@@ -86,7 +86,7 @@
                         <x-ui.nav-item :href="route('masking.index')" :active="request()->routeIs('masking.*')" icon="mask">Masking</x-ui.nav-item>
                     @endif
                     @if (Route::has('settings.chatops'))
-                        <x-ui.nav-item :href="route('settings.chatops')" :active="request()->routeIs('settings.*')" icon="chat">ChatOps</x-ui.nav-item>
+                        <x-ui.nav-item :href="route('settings.chatops')" :active="request()->routeIs('settings.chatops')" icon="chat">ChatOps</x-ui.nav-item>
                     @endif
                 @endif
 
@@ -99,6 +99,9 @@
             @if (Route::has('admin.teams') && $user?->isAdmin())
                 <div class="eyebrow px-2 pt-3.5 pb-1.5">Administration</div>
                 <x-ui.nav-item :href="route('admin.teams')" :active="request()->routeIs('admin.*')" icon="users">Teams &amp; Users</x-ui.nav-item>
+                @if (Route::has('settings.scim'))
+                    <x-ui.nav-item :href="route('settings.scim')" :active="request()->routeIs('settings.scim')" icon="key">SCIM</x-ui.nav-item>
+                @endif
             @endif
         </nav>
 

@@ -25,6 +25,13 @@ class OidcController extends Controller
     /** Session key of the attempt in progress. */
     public const FLOW_KEY = 'oidc.flow';
 
+    /**
+     * Where a confirmation may send the user back to: a fixed list of screens
+     * by key, never a URL taken from the request (no open redirect). Without a
+     * key the user returns to the API tokens section of the profile.
+     */
+    public const REAUTH_RETURNS = ['scim' => 'settings.scim'];
+
     /** Session flag set when the session was opened through SSO (see RequireTwoFactor). */
     public const SESSION_FLAG = 'auth.via_oidc';
 
@@ -83,15 +90,32 @@ class OidcController extends Controller
             'reauth_user_id' => $request->user()->id,
         ];
 
+        // Only a system admin has the SCIM screen; anything else, or an unknown key, means the profile.
+        $returnKey = $request->query('return');
+
+        if (is_string($returnKey) && isset(self::REAUTH_RETURNS[$returnKey]) && $request->user()->isAdmin()) {
+            $flow['return'] = $returnKey;
+        }
+
         try {
             $url = $oidc->authorizationUrl($flow['state'], $flow['nonce'], $flow['verifier'], route('oidc.callback'), forceLogin: true);
         } catch (OidcException $e) {
-            return redirect()->route('profile')->withErrors(['sso' => $e->userMessage()]);
+            return redirect()->to($this->reauthTarget($flow))->withErrors(['sso' => $e->userMessage()]);
         }
 
         $request->session()->put(self::FLOW_KEY, $flow);
 
         return redirect()->away($url);
+    }
+
+    /** The screen a confirmation returns to, from the flow that started it. */
+    private function reauthTarget(mixed $flow): string
+    {
+        $key = is_array($flow) ? ($flow['return'] ?? null) : null;
+
+        return is_string($key) && isset(self::REAUTH_RETURNS[$key])
+            ? route(self::REAUTH_RETURNS[$key])
+            : route('profile').'#api-tokens';
     }
 
     public function callback(
@@ -151,7 +175,7 @@ class OidcController extends Controller
 
             $roleSync->sync($user, $groups);
         } catch (OidcException $e) {
-            return $this->refuse($e);
+            return $this->refuse($e, $this->reauthTarget($pending));
         }
 
         Auth::login($user);
@@ -169,7 +193,7 @@ class OidcController extends Controller
         ]);
 
         if ($reauthFor !== null) {
-            return redirect()->to(route('profile').'#api-tokens');
+            return redirect()->to($this->reauthTarget($pending));
         }
 
         return redirect()->intended(route('dashboard'));
@@ -248,13 +272,13 @@ class OidcController extends Controller
         );
     }
 
-    private function refuse(OidcException $e): RedirectResponse
+    private function refuse(OidcException $e, ?string $signedInTarget = null): RedirectResponse
     {
         Log::warning('OIDC sign-in refused: '.$e->getMessage());
 
         // A refused confirmation leaves the user signed in where they were.
         if (Auth::check()) {
-            return redirect()->to(route('profile').'#api-tokens')->withErrors(['sso' => $e->userMessage()]);
+            return redirect()->to($signedInTarget ?? route('profile').'#api-tokens')->withErrors(['sso' => $e->userMessage()]);
         }
 
         return redirect()->route('login')->withErrors(['sso' => $e->userMessage()]);

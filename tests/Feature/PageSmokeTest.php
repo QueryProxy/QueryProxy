@@ -33,4 +33,14 @@ test('admin pages render for admins', function () {
     $this->actingAs($admin)->get(route('admin.users'))->assertOk()
         ->assertSee('Create accounts, grant system-admin');
     $this->actingAs($admin)->get(route('admin.teams.members', $team))->assertOk()->assertSee($team->name);
+    $this->actingAs($admin)->get(route('settings.scim'))->assertOk()
+        ->assertSee('Let your identity provider create, update and suspend');
+});
+
+test('the SCIM settings page is refused to everyone but admins', function () {
+    $user = User::factory()->create();
+    $team = Team::factory()->create();
+    $team->users()->attach($user, ['role' => 'dba']);
+
+    $this->actingAs($user)->get(route('settings.scim'))->assertForbidden();
 });

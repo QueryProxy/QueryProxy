@@ -26,6 +26,7 @@ use App\Livewire\Profile;
 use App\Livewire\Requests\Index as RequestsIndex;
 use App\Livewire\Requests\Show as RequestsShow;
 use App\Livewire\Settings\ChatOps as ChatOpsSettings;
+use App\Livewire\Settings\Scim as ScimSettings;
 use App\Livewire\Studio\QueryStudio;
 use Illuminate\Support\Facades\Route;
 
@@ -134,6 +135,9 @@ Route::middleware(['auth', '2fa.required'])->group(function () {
         Route::get('/requests/{queryRequest}', RequestsShow::class)->name('requests.show');
         Route::get('/requests/{queryRequest}/download', ResultDownloadController::class)->name('requests.download');
     });
+
+    // SCIM endpoint URL and tokens (ADR-026): system admins only.
+    Route::get('/settings/scim', ScimSettings::class)->middleware('admin')->name('settings.scim');
 
     Route::middleware('admin')->prefix('admin')->name('admin.')->group(function () {
         Route::get('/teams', Teams::class)->name('teams');

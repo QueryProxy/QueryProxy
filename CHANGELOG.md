@@ -89,6 +89,12 @@ All notable changes to QueryProxy are documented here. The format follows
   per-workspace budget (default 300 per minute) after it (ADR-004
   amendment); Teams keeps `throttle:60,1`. Two migrations make
   `chat_integrations.webhook_url` and `signing_secret` nullable.
+- Settings > SCIM for system admins: shows the SCIM endpoint URL, lists
+  SCIM tokens (name, creator, last use, status), creates tokens (value
+  shown once, after a fresh password, TOTP or SSO confirmation as for API
+  tokens) and revokes them. While SCIM is switched off the page explains
+  how to enable it. After an SSO re-confirmation started there, the admin
+  comes back to the SCIM page.
 
 ### Changed
 
