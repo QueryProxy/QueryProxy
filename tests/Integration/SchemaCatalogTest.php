@@ -83,7 +83,8 @@ test('the system schemas are left out', function () {
 test('columns are listed in column order, not by name', function () {
     $wide = $this->it->table('wide');
     $this->it->track($wide);
-    $this->it->admin()->statement("CREATE TABLE {$wide} (c_b INT NOT NULL, c_a VARCHAR(10) NULL, c_c INT NULL)");
+    // With a primary key: CockroachDB adds a hidden "rowid" column to a table without one.
+    $this->it->admin()->statement("CREATE TABLE {$wide} (c_b INT NOT NULL PRIMARY KEY, c_a VARCHAR(10) NULL, c_c INT NULL)");
 
     $table = itSchemaTable(app(SchemaReader::class)->read($this->it->connection(), $this->it->owner), $wide);
 
@@ -101,14 +102,20 @@ test('a column matched by a column masking rule is flagged', function () {
 });
 
 test('the read has a default schema and is audited once', function () {
-    $tree = app(SchemaReader::class)->read($this->it->connection(), $this->it->owner);
+    // One stored connection for both reads: the cache is kept per connection,
+    // and connection() stores a new one (new id) on every call.
+    $connection = $this->it->connection();
 
-    expect($tree['default_schema'])->not->toBeNull()
+    $tree = app(SchemaReader::class)->read($connection, $this->it->owner);
+
+    expect($tree['source'])->toBe('live')
+        ->and($tree['default_schema'])->not->toBeNull()
         ->and(AuditLog::where('action', 'schema.read')->count())->toBe(1);
 
-    app(SchemaReader::class)->read($this->it->connection(), $this->it->owner);
+    $again = app(SchemaReader::class)->read($connection, $this->it->owner);
 
-    expect(AuditLog::where('action', 'schema.read')->count())->toBe(1);
+    expect($again['source'])->toBe('cache')
+        ->and(AuditLog::where('action', 'schema.read')->count())->toBe(1);
 });
 
 test('MySQL and MariaDB list the connection\'s own database only', function () {
