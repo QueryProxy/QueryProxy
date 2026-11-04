@@ -6,6 +6,7 @@ use App\Http\Controllers\Auth\OidcController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\Auth\TwoFactorChallengeController;
 use App\Http\Controllers\ResultDownloadController;
+use App\Http\Controllers\SchemaController;
 use App\Http\Controllers\TeamSwitchController;
 use App\Http\Controllers\Webhooks\SlackInteractionController;
 use App\Http\Controllers\Webhooks\TeamsActionController;
@@ -98,6 +99,12 @@ Route::middleware(['auth', '2fa.required'])->group(function () {
 
     Route::middleware('role:dba,developer')->group(function () {
         Route::get('/studio', QueryStudio::class)->name('studio');
+
+        // Table and column tree for the Studio (ADR-029); the controller checks the connection grant.
+        Route::get('/connections/{connection}/schema', SchemaController::class)
+            ->whereNumber('connection')
+            ->middleware('throttle:60,1')
+            ->name('connections.schema');
     });
 
     Route::middleware('role:dba,developer,auditor')->group(function () {

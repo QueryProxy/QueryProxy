@@ -61,6 +61,19 @@ All notable changes to QueryProxy are documented here. The format follows
   administrator set. SCIM sees only users it created or SSO-linked users,
   never local accounts. Group membership applies `QUERYPROXY_OIDC_ROLE_MAP`.
   New audit events `scim.*`.
+- Schema explorer backend (ADR-029): `GET /connections/{connection}/schema`
+  returns the tables, views and columns of a connection for the Studio,
+  read through fixed catalog queries in a read-only session with its own
+  short timeout (`QUERYPROXY_SCHEMA_TIMEOUT`, default 5 s) and without an
+  approval. Only users with access to the connection can read it; on
+  MySQL/MariaDB only the connection's own database is listed. Columns
+  matched by a column masking rule are flagged `masked`. Large catalogs are
+  cut at `QUERYPROXY_SCHEMA_MAX_COLUMNS` (default 20000) with the default
+  schema kept first. The result is cached per connection
+  (`QUERYPROXY_SCHEMA_CACHE_TTL`, default 3600 s); a rate-limited manual
+  refresh skips the cache (`QUERYPROXY_SCHEMA_REFRESH_LIMIT`, default 3 per
+  minute). Each live read is recorded as `schema.read` in the audit log;
+  reads served from the cache are not.
 
 ### Changed
 

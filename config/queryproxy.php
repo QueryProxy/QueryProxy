@@ -72,6 +72,30 @@ return [
 
     'connection_slot_retry_delay' => max(1, (int) env('QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY', 5)),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Schema explorer (ADR-029)
+    |--------------------------------------------------------------------------
+    |
+    | The Studio's table and column tree is read from the target database's
+    | catalog by fixed queries, without an approval. `schema_timeout` is the
+    | statement timeout of that read in seconds (not the query execution
+    | timeout); `schema_cache_ttl` is how long a connection's schema is kept in
+    | the application cache in seconds (0 turns the cache off); a manual refresh
+    | skips the cache and is limited to `schema_refresh_per_minute` per user and
+    | connection. `schema_max_columns` caps one read; a larger schema is cut at a
+    | table boundary, the default schema is listed first, and the answer says
+    | `truncated`.
+    */
+
+    'schema_timeout' => max(1, (int) env('QUERYPROXY_SCHEMA_TIMEOUT', 5)),
+
+    'schema_cache_ttl' => max(0, (int) env('QUERYPROXY_SCHEMA_CACHE_TTL', 3600)),
+
+    'schema_max_columns' => max(1, (int) env('QUERYPROXY_SCHEMA_MAX_COLUMNS', 20000)),
+
+    'schema_refresh_per_minute' => max(1, (int) env('QUERYPROXY_SCHEMA_REFRESH_LIMIT', 3)),
+
     'result_disk' => env('QUERYPROXY_RESULT_DISK', 'local'),
 
     'result_ttl_days' => (int) env('QUERYPROXY_RESULT_TTL_DAYS', 30),

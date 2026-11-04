@@ -105,6 +105,9 @@ enum AuditEvent: string
     case ExecutionCancelled = 'execution.cancelled';
     case ResultDownloaded = 'result.downloaded';
 
+    // Schema explorer (ADR-029)
+    case SchemaRead = 'schema.read';
+
     public function description(): string
     {
         return match ($this) {
@@ -189,6 +192,8 @@ enum AuditEvent: string
             self::ExecutionLateCompletion => 'A request finished after it had already timed out.',
             self::ExecutionCancelled => 'A user stopped a running request: the database was asked to cancel the statement (metadata.signalled tells whether it was reached; metadata.duration_ms is the run time so far).',
             self::ResultDownloaded => 'The stored result of a request was downloaded (since v0.4.0 the REST API records metadata.channel = api and metadata.format).',
+
+            self::SchemaRead => 'The table and column names of a connection were read from the target database for the schema explorer, through the fixed catalog queries and without an approval (ADR-029). Written for live reads only, not for answers served from the cache (metadata.source = live, metadata.objects = tables and views, metadata.columns, metadata.refreshed tells whether the user asked to bypass the cache, metadata.truncated is set when the size cap cut the listing).',
         };
     }
 

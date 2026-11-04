@@ -103,21 +103,27 @@ class TargetSession
      * per request and purged afterwards. Behind a transaction-pooling proxy
      * (pgbouncer) a session-level SET may not stay on the same backend.
      *
+     * $statementSeconds replaces the derived statement timeout for a session
+     * that must stay much shorter than a query run, such as the schema read.
+     *
      * @return list<string>
      */
-    public function limitStatements(DbDriver $driver, bool $transactional): array
+    public function limitStatements(DbDriver $driver, bool $transactional, ?int $statementSeconds = null): array
     {
-        $statementMs = $this->statementTimeoutSeconds() * 1000;
+        // An idle transaction may outlive a normal run's statements up to the
+        // execution timeout, but never a session with its own short limit.
+        $idleMs = ($statementSeconds !== null ? max(1, $statementSeconds) : $this->executionTimeoutSeconds()) * 1000;
+        $statementSeconds = $statementSeconds !== null ? max(1, $statementSeconds) : $this->statementTimeoutSeconds();
+        $statementMs = $statementSeconds * 1000;
         $lockMs = $this->lockTimeoutSeconds() * 1000;
         $lockSeconds = $this->lockTimeoutSeconds();
-        $statementSeconds = $this->statementTimeoutSeconds();
 
         return match ($driver) {
             DbDriver::Pgsql => $transactional
                 ? [
                     "SET LOCAL statement_timeout = {$statementMs}",
                     "SET LOCAL lock_timeout = {$lockMs}",
-                    'SET LOCAL idle_in_transaction_session_timeout = '.($this->executionTimeoutSeconds() * 1000),
+                    "SET LOCAL idle_in_transaction_session_timeout = {$idleMs}",
                 ]
                 : [
                     "SET statement_timeout = {$statementMs}",
@@ -138,9 +144,9 @@ class TargetSession
         };
     }
 
-    public function applyLimits(DatabaseConnection $db, DbDriver $driver, bool $transactional): void
+    public function applyLimits(DatabaseConnection $db, DbDriver $driver, bool $transactional, ?int $statementSeconds = null): void
     {
-        $statements = $this->limitStatements($driver, $transactional);
+        $statements = $this->limitStatements($driver, $transactional, $statementSeconds);
 
         // Outside a transaction Laravel re-runs only the statement that hit a
         // lost connection, on the new session; the ones before it stay on the
@@ -166,8 +172,11 @@ class TargetSession
     /**
      * Put the session into read-only mode and, where the engine has one, open
      * the READ ONLY transaction the read runs in. Pair with endReadOnly().
+     *
+     * $statementSeconds overrides the statement timeout for this session only
+     * (the schema read uses its own, shorter one).
      */
-    public function beginReadOnly(DatabaseConnection $db, DbDriver $driver): void
+    public function beginReadOnly(DatabaseConnection $db, DbDriver $driver, ?int $statementSeconds = null): void
     {
         switch ($driver) {
             case DbDriver::Pgsql:
@@ -191,13 +200,13 @@ class TargetSession
                 }
 
                 $db->unprepared('SET TRANSACTION READ ONLY');
-                $this->applyLimits($db, $driver, true);
+                $this->applyLimits($db, $driver, true, $statementSeconds);
 
                 break;
 
             case DbDriver::Mysql:
             case DbDriver::Mariadb:
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
 
                 // Session-wide, not "SET TRANSACTION READ ONLY": that form
                 // covers only the next transaction, and MySQL ends the open
@@ -224,14 +233,20 @@ class TargetSession
                 break;
 
             case DbDriver::Sqlite:
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
                 $db->unprepared('PRAGMA query_only = ON');
 
                 break;
 
             case DbDriver::Sqlsrv:
                 // No engine-level read-only mode; the read user is the protection.
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
+
+                // The query timeout is a driver attribute fixed when the
+                // connection opened, so a shorter one is set on the open PDO.
+                if ($statementSeconds !== null) {
+                    $db->getPdo()->setAttribute(self::sqlsrvQueryTimeoutAttribute(), max(1, $statementSeconds));
+                }
 
                 break;
         }
