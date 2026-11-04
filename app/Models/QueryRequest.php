@@ -17,7 +17,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
     'team_id', 'connection_id', 'user_id', 'title', 'sql_original', 'sql_prepared',
     'statement_count', 'is_transaction', 'is_ddl', 'type', 'status', 'note',
     'reviewed_by', 'reviewed_at', 'rejection_reason', 'review_channel',
-    'reminded_at', 'chat_renewed_at',
+    'reminded_at', 'chat_renewed_at', 'slack_channel', 'slack_ts',
     'executed_at', 'backend_pid', 'backend_session', 'duration_ms', 'affected_rows',
     'result_disk', 'result_path', 'result_row_count', 'result_truncated', 'result_columns',
     'error_message', 'sensitive_filter_columns',

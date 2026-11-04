@@ -128,3 +128,39 @@ test('developers only see their own requests in the list', function () {
         ->assertSee('#'.$mine->id)
         ->assertDontSee('SOMEBODY-ELSES-REQUEST');
 });
+
+test('the studio hands the schema explorer only the connections the user may use', function () {
+    [$team, $developer, $connection] = studioSetup();
+    $ungranted = Connection::factory()->create(['team_id' => $team->id]);
+
+    Livewire::actingAs($developer)
+        ->test(QueryStudio::class)
+        ->assertViewHas('schemaConnections', function (array $map) use ($connection, $ungranted) {
+            return array_keys($map) === [$connection->id]
+                && $map[$connection->id] === [
+                    'driver' => $connection->driver->value,
+                    'url' => '/connections/'.$connection->id.'/schema',
+                ]
+                && ! array_key_exists($ungranted->id, $map);
+        });
+});
+
+test('the studio renders the schema tree and format controls', function () {
+    [, $developer] = studioSetup();
+
+    Livewire::actingAs($developer)
+        ->test(QueryStudio::class)
+        ->assertSee('schemaExplorer', false)
+        ->assertSee('role="tree"', false)
+        ->assertSee('Filter tables and columns')
+        ->assertSee('Format')
+        ->assertSee('Choose a connection to browse its tables and columns.');
+});
+
+test('the connection picker syncs live so the explorer can follow it', function () {
+    [, $developer] = studioSetup();
+
+    Livewire::actingAs($developer)
+        ->test(QueryStudio::class)
+        ->assertSeeHtml('wire:model.live="connectionId"');
+});

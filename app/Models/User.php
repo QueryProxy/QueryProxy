@@ -46,6 +46,8 @@ class User extends Authenticatable
             'password' => 'hashed',
             'is_admin' => 'boolean',
             'suspended_at' => 'datetime',
+            'scim_provisioned_at' => 'datetime',
+            'suspended_by_scim' => 'boolean',
             'notification_preferences' => 'array',
             'two_factor_secret' => 'encrypted',
             'two_factor_recovery_codes' => 'array',
@@ -54,10 +56,21 @@ class User extends Authenticatable
         ];
     }
 
-    /** True when the account is identified by the OpenID Connect provider (users.auth_provider). */
+    /**
+     * True when the identity provider owns the account: it is tied to the
+     * OpenID Connect provider (users.auth_provider), or the provider created
+     * it through SCIM and it has not signed in yet (ADR-026). Such an account
+     * is never given a local password.
+     */
     public function isSsoUser(): bool
     {
-        return $this->auth_provider === self::PROVIDER_OIDC;
+        return $this->auth_provider === self::PROVIDER_OIDC || $this->isScimManaged();
+    }
+
+    /** True when the account was created through SCIM (users.scim_provisioned_at). */
+    public function isScimManaged(): bool
+    {
+        return $this->scim_provisioned_at !== null;
     }
 
     public function isSuspended(): bool

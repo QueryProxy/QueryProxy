@@ -98,14 +98,29 @@ class LoginController extends Controller
         return redirect()->intended(route('dashboard'));
     }
 
-    public function destroy(Request $request): RedirectResponse
+    public function destroy(Request $request, OidcClient $oidc): RedirectResponse
     {
         audit()->record('auth.logout');
+
+        // Read before the session is wiped. Only a session opened through SSO
+        // also ends the provider's session (RP-initiated logout); a password
+        // login of the same person does not touch it.
+        $viaSso = $request->session()->get(OidcController::SESSION_FLAG) === true;
+        $idToken = $request->session()->get(OidcController::SESSION_ID_TOKEN_KEY);
 
         Auth::guard('web')->logout();
 
         $request->session()->invalidate();
         $request->session()->regenerateToken();
+
+        if ($viaSso && $oidc->isConfigured()) {
+            // The return address is fixed, never taken from the request.
+            $url = $oidc->logoutUrl(is_string($idToken) ? $idToken : null, route('login'));
+
+            if ($url !== null) {
+                return redirect()->away($url);
+            }
+        }
 
         return redirect()->route('login');
     }

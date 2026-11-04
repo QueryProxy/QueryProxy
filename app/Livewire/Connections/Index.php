@@ -15,6 +15,8 @@ use App\Services\Connections\DynamicConnectionFactory;
 use App\Services\Connections\GrantException;
 use App\Services\Connections\GrantService;
 use App\Services\Connections\TlsPemStore;
+use App\Services\Secrets\SecretReference;
+use App\Services\Secrets\SecretResolver;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 use Livewire\Attributes\Title;
@@ -24,6 +26,33 @@ use Livewire\Component;
 class Index extends Component
 {
     use ChoosesGrantDuration;
+
+    public const SOURCE_PLAIN = 'plain';
+
+    /** Scheme => the name shown for that credential source. */
+    public const SOURCE_LABELS = [
+        SecretReference::VAULT => 'HashiCorp Vault',
+        SecretReference::AWS => 'AWS Secrets Manager',
+        SecretReference::AZURE => 'Azure Key Vault',
+    ];
+
+    /** Scheme => [format, example] shown under the reference input. */
+    public const SOURCE_FORMATS = [
+        SecretReference::VAULT => ['vault://<mount>/<path>#<key>', 'vault://secret/teams/payments/orders-db#password'],
+        SecretReference::AWS => ['aws-sm://<secret-id>[#<json-key>]', 'aws-sm://prod/orders-db#password'],
+        SecretReference::AZURE => ['azure-kv://<vault-name>/<secret-name>[/<version>]', 'azure-kv://payments-kv/orders-db-password'],
+    ];
+
+    /**
+     * Scheme => JavaScript regular expression for the client-side syntax hint.
+     * It only warns while typing; the server check (SecretReference::parse and
+     * the team prefixes) is the one that decides.
+     */
+    private const SOURCE_PATTERNS = [
+        SecretReference::VAULT => '^vault://[A-Za-z0-9._~@=+-]+(/[A-Za-z0-9._~@=+-]+)+#[A-Za-z0-9_.:@-]{1,255}$',
+        SecretReference::AWS => '^aws-sm://[A-Za-z0-9/_+=.@:-]{1,2048}(#[A-Za-z0-9_.:@-]{1,255})?$',
+        SecretReference::AZURE => '^azure-kv://[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]/[A-Za-z0-9-]{1,127}(/[A-Za-z0-9]{1,64})?$',
+    ];
 
     public bool $showForm = false;
 
@@ -63,6 +92,15 @@ class Index extends Component
     public string $readUsername = '';
 
     public string $readPassword = '';
+
+    /**
+     * Where the password comes from: "plain" (a value stored encrypted) or a
+     * secret reference scheme (`vault`, `aws-sm`, `azure-kv`; ADR-028).
+     */
+    public string $credentialSource = self::SOURCE_PLAIN;
+
+    /** Same for the read-only password; the two are chosen separately. */
+    public string $readCredentialSource = self::SOURCE_PLAIN;
 
     /**
      * TLS section. PostgreSQL: disable | prefer | require | verify-ca | verify-full.
@@ -120,6 +158,21 @@ class Index extends Component
         $this->password = '';
         $this->readUsername = (string) $connection->read_username;
         $this->readPassword = '';
+
+        // A reference is not a secret, so the form shows it for editing; a
+        // plain password is never sent back to the browser.
+        $this->credentialSource = SecretReference::schemeOf($connection->password) ?? self::SOURCE_PLAIN;
+
+        if ($this->credentialSource !== self::SOURCE_PLAIN) {
+            $this->password = trim((string) $connection->password);
+        }
+
+        $this->readCredentialSource = SecretReference::schemeOf($connection->read_password) ?? self::SOURCE_PLAIN;
+
+        if ($this->readCredentialSource !== self::SOURCE_PLAIN) {
+            $this->readPassword = trim((string) $connection->read_password);
+        }
+
         $this->tlsMode = $connection->driver === DbDriver::Pgsql
             ? (string) $connection->tlsMode()
             : ($connection->tlsMode() === Connection::TLS_MODE_REQUIRED ? Connection::TLS_MODE_REQUIRED : 'default');
@@ -128,10 +181,35 @@ class Index extends Component
         $this->showForm = true;
     }
 
-    /** Switching the driver resets the TLS mode to that driver's required-TLS default. */
+    /**
+     * Switching a source empties its password box: a plain password must not
+     * be left in a reference box, and the other way round.
+     */
+    public function updatedCredentialSource(): void
+    {
+        $this->reset('password');
+        $this->resetErrorBag(['password', 'credentialSource']);
+    }
+
+    public function updatedReadCredentialSource(): void
+    {
+        $this->reset('readPassword');
+        $this->resetErrorBag(['readPassword', 'readCredentialSource']);
+    }
+
+    /**
+     * Switching the driver resets the TLS mode to that driver's required-TLS
+     * default. A SQLite file has no credentials and the form hides those
+     * boxes, so what they held (a reference, say) is dropped with them.
+     */
     public function updatedDriver(): void
     {
         $this->tlsMode = $this->defaultTlsMode($this->driver);
+
+        if ($this->driver === DbDriver::Sqlite->value) {
+            $this->reset('password', 'readPassword', 'credentialSource', 'readCredentialSource');
+            $this->resetErrorBag(['password', 'readPassword', 'credentialSource', 'readCredentialSource']);
+        }
     }
 
     private function defaultTlsMode(string $driver): string
@@ -153,6 +231,8 @@ class Index extends Component
             'password' => ['nullable', 'string', 'max:1024'],
             'readUsername' => ['nullable', 'string', 'max:255'],
             'readPassword' => ['nullable', 'string', 'max:1024'],
+            'credentialSource' => ['required', 'string', Rule::in([self::SOURCE_PLAIN, ...SecretReference::schemes()])],
+            'readCredentialSource' => ['required', 'string', Rule::in([self::SOURCE_PLAIN, ...SecretReference::schemes()])],
             'tlsMode' => $this->driver === DbDriver::Sqlite->value
                 ? ['nullable', 'string']
                 : ['required', 'string', Rule::in($this->tlsModesFor($this->driver))],
@@ -185,6 +265,16 @@ class Index extends Component
         } else {
             $attributes['read_username'] = null;
             $attributes['read_password'] = null;
+        }
+
+        // A SQLite file has no credentials, so the sources do not apply.
+        if ($validated['driver'] !== DbDriver::Sqlite->value) {
+            if (! $this->validateCredentialSources($existing, $keepReadIdentity)) {
+                return;
+            }
+
+            $this->password = $this->credentialSource === self::SOURCE_PLAIN ? $this->password : trim($this->password);
+            $this->readPassword = $this->readCredentialSource === self::SOURCE_PLAIN ? $this->readPassword : trim($this->readPassword);
         }
 
         $violations = $factory->targetViolations(new Connection($attributes));
@@ -230,6 +320,56 @@ class Index extends Component
 
         $this->resetForm();
         $this->showForm = false;
+    }
+
+    /**
+     * Each password box must hold what its source expects, and a blank box
+     * ("keep the stored one") only works while the stored value comes from the
+     * same source. Returns false (with errors added) when the form must not be
+     * saved. Whether a reference is well formed and under the team's prefixes
+     * is the model's check, made when it is saved (ADR-028).
+     */
+    private function validateCredentialSources(?Connection $existing, bool $keepReadIdentity): bool
+    {
+        $fields = [['password', $this->credentialSource, $this->password, $existing?->password, 'password']];
+
+        if ($keepReadIdentity) {
+            $fields[] = ['readPassword', $this->readCredentialSource, $this->readPassword, $existing?->read_password, 'read-only password'];
+        }
+
+        $ok = true;
+
+        foreach ($fields as [$field, $source, $value, $stored, $noun]) {
+            $value = trim($value);
+            $storedSource = ($stored === null || $stored === '') ? null : (SecretReference::schemeOf($stored) ?? self::SOURCE_PLAIN);
+
+            if ($value !== '') {
+                $given = SecretReference::schemeOf($value);
+
+                if ($source === self::SOURCE_PLAIN && $given !== null) {
+                    $this->addError($field, 'This looks like a secret reference. Choose its credential source above; a password cannot start with '.$given.'://.');
+                    $ok = false;
+                } elseif ($source !== self::SOURCE_PLAIN && $given !== $source) {
+                    $this->addError($field, 'Enter a reference that starts with '.$source.'://.');
+                    $ok = false;
+                }
+
+                continue;
+            }
+
+            if ($source !== self::SOURCE_PLAIN && $field === 'password') {
+                $this->addError($field, 'Enter the secret reference.');
+                $ok = false;
+            } elseif ($source !== self::SOURCE_PLAIN && $storedSource !== $source) {
+                $this->addError($field, 'Enter the secret reference.');
+                $ok = false;
+            } elseif ($storedSource !== null && $storedSource !== $source) {
+                $this->addError($field, 'The stored '.$noun.' comes from another credential source. Enter the new password.');
+                $ok = false;
+            }
+        }
+
+        return $ok;
     }
 
     /** @return list<string> */
@@ -381,12 +521,44 @@ class Index extends Component
         $this->authorize('update', $connection);
 
         $this->testResult = $factory->test($connection);
+        $this->testResult['error'] = $this->safeTestError($connection, $this->testResult);
         $this->testedId = $connection->id;
 
         audit()->record('connection.tested', connection: $connection, metadata: [
             'ok' => $this->testResult['ok'],
             'error' => $this->testResult['error'],
         ]);
+    }
+
+    /**
+     * The error text to show for a failed test. A failure to read the secret
+     * is already a fixed, generic message. For any other failure on a
+     * connection whose credentials are references, the driver's message could
+     * hold the resolved password (the factory scrubs it only while the value
+     * is still cached, which it is not when the cache is off), so it is
+     * replaced instead of shown.
+     *
+     * @param  array{ok: bool, error: string|null}  $result
+     */
+    private function safeTestError(Connection $connection, array $result): ?string
+    {
+        $error = $result['error'];
+
+        // The fixed text of SecretResolutionException (Faz 05 returns no flag).
+        if ($result['ok'] || $error === null
+            || preg_match('/^(Read credentials: )?The credentials could not be resolved from the external secret store \(/', $error) === 1) {
+            return $error;
+        }
+
+        $resolver = app(SecretResolver::class);
+
+        foreach ([$connection->password, $connection->read_password] as $stored) {
+            if (SecretReference::looksLikeReference($stored) && $resolver->peek($stored) === null) {
+                return 'The database refused the connection. Its message is hidden because these credentials come from an external secret store.';
+            }
+        }
+
+        return $error;
     }
 
     public function toggleGrants(int $connectionId): void
@@ -482,6 +654,8 @@ class Index extends Component
             'tlsVerifyServerCert', 'tlsTrustServerCertificate', 'tlsCa', 'tlsCert', 'tlsKey', 'tlsClearCa', 'tlsClearCert', 'tlsClearKey',
         );
         $this->driver = 'pgsql';
+        $this->credentialSource = self::SOURCE_PLAIN;
+        $this->readCredentialSource = self::SOURCE_PLAIN;
         $this->tlsMode = $this->defaultTlsMode($this->driver);
         $this->resetErrorBag();
     }
@@ -489,7 +663,7 @@ class Index extends Component
     public function render()
     {
         $team = $this->team();
-        $connections = Connection::forTeam($team)->with('grantedUsers')->orderBy('name')->get();
+        $connections = Connection::forTeam($team)->with('grantedUsers', 'team')->orderBy('name')->get();
         $editing = $this->editingId ? $connections->firstWhere('id', $this->editingId) : null;
 
         return view('livewire.connections.index', [
@@ -508,6 +682,17 @@ class Index extends Component
             // point at any file the app can read; the form says so, but does
             // not refuse the save.
             'sqliteDirUnrestricted' => blank(config('queryproxy.sqlite_allowed_dir')),
+            // External secret references are bounded per team (ADR-028
+            // amendment): without prefixes the sources are off for the team.
+            'secretPrefixes' => $team->secretReferencePrefixes(),
+            'sourceLabels' => self::SOURCE_LABELS,
+            'sourceFormats' => self::SOURCE_FORMATS,
+            'sourcePatterns' => self::SOURCE_PATTERNS,
+            'blockedReferenceIds' => $connections
+                ->filter(fn (Connection $c) => ($c->hasSecretReferencePassword() && $c->secretReferenceError($c->password) !== null)
+                    || ($c->hasSecretReferenceReadPassword() && $c->secretReferenceError($c->read_password) !== null))
+                ->pluck('id')
+                ->all(),
         ]);
     }
 

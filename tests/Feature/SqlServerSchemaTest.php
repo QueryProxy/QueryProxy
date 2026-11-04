@@ -146,7 +146,9 @@ test('the application schema has no multiple cascade paths on SQL Server', funct
     $keys = sqlServerForeignKeys($statements);
 
     // The compile worked and found the keys (guards the parsing itself).
-    expect($keys)->toHaveCount(20)
+    // 20 before SCIM (ADR-026) added scim_tokens.created_by and the two keys of scim_group_user;
+    // 23 before the Slack app (ADR-027) added chat_integrations.installed_by and the two keys of slack_identity_suggestions.
+    expect($keys)->toHaveCount(26)
         ->and(cascadePathProblems(array_values($keys)))->toBe([]);
 });
 

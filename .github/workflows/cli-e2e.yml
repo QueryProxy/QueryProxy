@@ -1,0 +1,100 @@
+name: CLI end-to-end
+
+# Runs the `qp` command-line client (ADR-030, repository QueryProxy/qp) against
+# this server: the application is booted on a throw-away SQLite database with a
+# queue worker, and `qp submit --wait` is driven through approve, reject,
+# failure and timeout, with a second user deciding through the REST API
+# (ADR-024). See tests/Shell/cli-e2e.sh.
+#
+# It runs when the API, its specification or the script change - those are what
+# can break the client - and on demand. Needs the QueryProxy/qp repository to
+# exist; the workflow builds qp from its default branch.
+#
+# Actions are pinned to commit SHAs (see ci.yml); re-resolve the SHA when
+# bumping one.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'routes/api.php'
+      - 'app/Http/Controllers/Api/**'
+      - 'app/Http/Resources/Api/**'
+      - 'app/Services/Api/**'
+      - 'app/Services/Approvals/**'
+      - 'app/Services/Requests/**'
+      - 'app/Policies/**'
+      - 'app/Support/Csv.php'
+      - 'docs/openapi.yaml'
+      - 'tests/Shell/cli-e2e.sh'
+      - '.github/workflows/cli-e2e.yml'
+  pull_request:
+    paths:
+      - 'routes/api.php'
+      - 'app/Http/Controllers/Api/**'
+      - 'app/Http/Resources/Api/**'
+      - 'app/Services/Api/**'
+      - 'app/Services/Approvals/**'
+      - 'app/Services/Requests/**'
+      - 'app/Policies/**'
+      - 'app/Support/Csv.php'
+      - 'docs/openapi.yaml'
+      - 'tests/Shell/cli-e2e.sh'
+      - '.github/workflows/cli-e2e.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  cli-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: QueryProxy/qp
+          # Pinned to a qp release so a broken qp commit cannot turn an
+          # unrelated server pull request red. Bump it with each qp release.
+          ref: v0.4.1
+          path: qp
+          persist-credentials: false
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.5'
+          extensions: pdo_sqlite, intl, zip, bcmath
+          coverage: none
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: qp/go.mod
+          cache-dependency-path: qp/go.sum
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      # A warning, not a failure: a server change must not wait for a client
+      # release, but the drift should be visible.
+      - name: Compare the client's OpenAPI copy with this server's
+        run: |
+          cmp -s docs/openapi.yaml qp/api/openapi.yaml \
+            || echo "::warning::qp/api/openapi.yaml differs from docs/openapi.yaml; regenerate the client (go generate ./...)"
+
+      - name: Test the client's own suite
+        working-directory: qp
+        run: go test -race -count=1 ./...
+
+      - name: End-to-end (qp built from source)
+        env:
+          QP_SRC: ${{ github.workspace }}/qp
+        run: tests/Shell/cli-e2e.sh

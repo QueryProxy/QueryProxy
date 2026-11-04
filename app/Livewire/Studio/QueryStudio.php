@@ -7,6 +7,7 @@ use App\Models\Team;
 use App\Services\Requests\RequestSubmissionException;
 use App\Services\Requests\RequestSubmissionService;
 use App\Services\Sql\SqlInspector;
+use Illuminate\Support\Collection;
 use Livewire\Attributes\Title;
 use Livewire\Component;
 
@@ -101,10 +102,30 @@ class QueryStudio extends Component
         $this->redirectRoute('requests.show', ['queryRequest' => $request]);
     }
 
+    /**
+     * Driver and schema endpoint of every connection the user may pick, keyed by id.
+     * The explorer reads the dialect from here and never builds URLs from user input.
+     *
+     * @param  Collection<int, Connection>  $connections
+     * @return array<int, array{driver: string, url: string}>
+     */
+    private function schemaConnections(Collection $connections): array
+    {
+        return $connections
+            ->mapWithKeys(fn (Connection $c) => [$c->id => [
+                'driver' => $c->driver->value,
+                'url' => route('connections.schema', ['connection' => $c->id], false),
+            ]])
+            ->all();
+    }
+
     public function render()
     {
+        $connections = $this->usableConnections();
+
         return view('livewire.studio.query-studio', [
-            'connections' => $this->usableConnections(),
+            'connections' => $connections,
+            'schemaConnections' => $this->schemaConnections($connections),
             'hasNoEnabledMaskingRules' => ! $this->team()->hasEnabledMaskingRules(),
             'hasNoMaskingRules' => ! $this->team()->maskingRules()->exists(),
         ]);

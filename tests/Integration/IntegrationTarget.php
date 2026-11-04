@@ -20,13 +20,16 @@ use Symfony\Component\Process\Process;
 use Throwable;
 
 /**
- * One real target database (PostgreSQL, MySQL, MariaDB or SQL Server) for the
+ * One real target database (PostgreSQL, MySQL, MariaDB or SQL Server, or a
+ * PostgreSQL-compatible system reached through the pgsql driver) for the
  * integration tests, plus the QueryProxy objects that point at it.
  *
  * The server comes from the environment (docker-compose.integration.yml sets
  * it up, CI exports the variables). Without QUERYPROXY_IT_HOST the tests skip.
  *
  *   QUERYPROXY_IT_DRIVER      pgsql | mysql | mariadb | sqlsrv
+ *   QUERYPROXY_IT_FLAVOR      optional, with the pgsql driver: cockroachdb | yugabytedb
+ *                             (a PostgreSQL-compatible system, docs/compatibility.md)
  *   QUERYPROXY_IT_HOST        host of the main server
  *   QUERYPROXY_IT_PORT        its port
  *   QUERYPROXY_IT_DATABASE    database name (created here on SQL Server)
@@ -117,6 +120,28 @@ final class IntegrationTarget
     public static function driver(): DbDriver
     {
         return DbDriver::from(self::env('DRIVER'));
+    }
+
+    /** The PostgreSQL-compatible system behind the pgsql driver: 'cockroachdb', 'yugabytedb', or '' for PostgreSQL itself. */
+    public static function flavor(): string
+    {
+        $flavor = self::env('FLAVOR');
+
+        if ($flavor !== '' && ! in_array($flavor, ['cockroachdb', 'yugabytedb'], true)) {
+            throw new RuntimeException("Unknown QUERYPROXY_IT_FLAVOR '{$flavor}'.");
+        }
+
+        return $flavor;
+    }
+
+    public static function isCockroach(): bool
+    {
+        return self::flavor() === 'cockroachdb';
+    }
+
+    public static function isYugabyte(): bool
+    {
+        return self::flavor() === 'yugabytedb';
     }
 
     public static function isMysqlFamily(): bool
@@ -257,7 +282,7 @@ final class IntegrationTarget
         ];
 
         return match ($driver) {
-            DbDriver::Pgsql => $config + ['charset' => 'utf8', 'search_path' => 'public', 'sslmode' => 'prefer'],
+            DbDriver::Pgsql => $config + ['charset' => 'utf8', 'search_path' => 'public', 'sslmode' => self::isCockroach() ? 'require' : 'prefer'],
             DbDriver::Mysql => $config + [
                 'charset' => 'utf8mb4',
                 'collation' => 'utf8mb4_unicode_ci',
@@ -306,14 +331,16 @@ final class IntegrationTarget
     /**
      * TLS settings of the connections the functional tests use. The main
      * PostgreSQL and MariaDB servers have no TLS, MySQL insists on it for the
-     * first login of an account, SQL Server's certificate is self-signed.
+     * first login of an account, SQL Server's certificate is self-signed, and
+     * the main CockroachDB server is the secure one (it takes passwords only
+     * over TLS).
      *
      * @return array<string, mixed>
      */
     public static function functionalTls(): array
     {
         return match (self::driver()) {
-            DbDriver::Pgsql => ['mode' => 'disable'],
+            DbDriver::Pgsql => self::isCockroach() ? ['mode' => 'require'] : ['mode' => 'disable'],
             DbDriver::Mysql => ['mode' => Connection::TLS_MODE_REQUIRED, 'verify_server_cert' => false],
             DbDriver::Mariadb => ['mode' => 'disabled'],
             DbDriver::Sqlsrv => ['mode' => Connection::TLS_MODE_REQUIRED, 'trust_server_certificate' => true],
@@ -664,10 +691,18 @@ final class IntegrationTarget
         return preg_match('/^RssAnon:\s+(\d+)\s+kB$/m', $status, $match) === 1 ? (int) $match[1] * 1024 : 0;
     }
 
-    /** Whether the server still runs a statement on session $id. */
-    public function statementRunning(int $id): bool
+    /**
+     * Whether the server still runs a statement on session $id.
+     *
+     * @param  string|null  $token  the stamp recorded with the id (backend_session); CockroachDB names a session by it, not by the number
+     */
+    public function statementRunning(int $id, ?string $token = null): bool
     {
         $admin = $this->admin();
+
+        if (self::isCockroach()) {
+            return (int) $admin->selectOne('SELECT count(*) AS n FROM [SHOW CLUSTER STATEMENTS] WHERE session_id = ?', [$this->cockroachSessionId($token)])->n > 0;
+        }
 
         return match (self::driver()) {
             DbDriver::Pgsql => (int) $admin->selectOne("SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ? AND state <> 'idle'", [$id])->n > 0,
@@ -677,10 +712,14 @@ final class IntegrationTarget
         };
     }
 
-    /** Whether the server still has session $id at all. */
-    public function sessionExists(int $id): bool
+    /** Whether the server still has session $id at all (see statementRunning() for $token). */
+    public function sessionExists(int $id, ?string $token = null): bool
     {
         $admin = $this->admin();
+
+        if (self::isCockroach()) {
+            return (int) $admin->selectOne('SELECT count(*) AS n FROM [SHOW CLUSTER SESSIONS] WHERE session_id = ?', [$this->cockroachSessionId($token)])->n > 0;
+        }
 
         return match (self::driver()) {
             DbDriver::Pgsql => (int) $admin->selectOne('SELECT count(*) AS n FROM pg_stat_activity WHERE pid = ?', [$id])->n > 0,
@@ -688,6 +727,12 @@ final class IntegrationTarget
             DbDriver::Sqlsrv => (int) $admin->selectOne('SELECT COUNT(*) AS n FROM sys.dm_exec_sessions WHERE session_id = ?', [$id])->n > 0,
             default => false,
         };
+    }
+
+    /** The session_id inside a CockroachDB stamp ("crdb:<32 hex>"); a stamp that is not one never matches a session. */
+    private function cockroachSessionId(?string $token): string
+    {
+        return $token !== null && str_starts_with($token, 'crdb:') ? substr($token, 5) : 'no-such-session';
     }
 
     // ---- TLS helpers ------------------------------------------------------------

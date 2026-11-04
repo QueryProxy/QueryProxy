@@ -47,6 +47,9 @@ final class OidcFakeProvider
     /** When set, the token endpoint returns this instead of a properly signed token. */
     public static ?string $forcedIdToken = null;
 
+    /** @var string|null the end_session_endpoint the discovery document advertises, null = none */
+    public static ?string $endSession = null;
+
     /** The issuer the discovery document claims. */
     public static string $documentIssuer = self::ISSUER;
 
@@ -64,6 +67,7 @@ final class OidcFakeProvider
         self::$nonce = '';
         self::$published = ['key-1'];
         self::$forcedIdToken = null;
+        self::$endSession = null;
         self::$documentIssuer = self::ISSUER;
     }
 
@@ -125,6 +129,7 @@ final class OidcFakeProvider
             'authorization_endpoint' => 'https://idp.test/auth',
             'token_endpoint' => 'https://idp.test/token',
             'jwks_uri' => 'https://idp.test/jwks',
+            'end_session_endpoint' => self::$endSession,
             'userinfo_endpoint' => self::$userInfo !== null ? 'https://idp.test/userinfo' : null,
             'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
         ]);
@@ -1068,4 +1073,128 @@ test('the userinfo endpoint is not called when the token already speaks of verif
     oidcLogin()->assertRedirect(route('dashboard'));
 
     expect(oidcUserInfoRequests())->toBe(0);
+});
+
+test('logging out of an SSO session sends the browser to the provider with the id_token_hint', function () {
+    OidcFakeProvider::$endSession = 'https://idp.test/logout';
+
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $idToken = session(OidcController::SESSION_ID_TOKEN_KEY);
+    expect($idToken)->toBeString()->not->toBe('');
+
+    $location = $this->post('/logout')->assertRedirect()->headers->get('Location');
+
+    expect($location)->toStartWith('https://idp.test/logout?');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+
+    expect($query)->toBe([
+        'id_token_hint' => $idToken,
+        'client_id' => OidcFakeProvider::CLIENT_ID,
+        'post_logout_redirect_uri' => route('login'),
+    ])
+        ->and(auth()->check())->toBeFalse()
+        ->and(session(OidcController::SESSION_ID_TOKEN_KEY))->toBeNull()
+        ->and(oidcAuditActions())->toContain('auth.logout');
+});
+
+test('the id_token never reaches the audit log', function () {
+    OidcFakeProvider::$endSession = 'https://idp.test/logout';
+
+    oidcLogin()->assertRedirect(route('dashboard'));
+    $idToken = session(OidcController::SESSION_ID_TOKEN_KEY);
+    $this->post('/logout');
+
+    expect(json_encode(AuditLog::all()->toArray()))->not->toContain($idToken);
+});
+
+test('logging out of an SSO session without an end_session_endpoint only ends the local session', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    $this->post('/logout')->assertRedirect(route('login'));
+
+    expect(auth()->check())->toBeFalse();
+});
+
+test('an end_session_endpoint that is not an http(s) URL is ignored', function () {
+    OidcFakeProvider::$endSession = 'javascript:alert(1)';
+
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    $this->post('/logout')->assertRedirect(route('login'));
+});
+
+test('a password session of an SSO-linked user does not end the provider session', function () {
+    OidcFakeProvider::$endSession = 'https://idp.test/logout';
+    $user = User::factory()->create(['password' => 'secret-password', 'auth_provider' => 'oidc', 'external_issuer' => OidcFakeProvider::ISSUER, 'external_id' => 'sub-x']);
+
+    $this->actingAs($user)->post('/logout')->assertRedirect(route('login'));
+});
+
+test('a local user logs out locally even when the provider publishes an end_session_endpoint', function () {
+    OidcFakeProvider::$endSession = 'https://idp.test/logout';
+    $user = User::factory()->create();
+
+    $this->actingAs($user)->post('/logout')->assertRedirect(route('login'));
+});
+
+test('an SSO-linked user is never handed a reset link, even with a local password', function () {
+    Notification::fake();
+    $user = User::factory()->create(['password' => 'secret-password', 'auth_provider' => 'oidc', 'external_issuer' => OidcFakeProvider::ISSUER, 'external_id' => 'sub-x']);
+
+    $this->post('/forgot-password', ['email' => $user->email])->assertSessionHas('status');
+    Notification::assertNothingSent();
+
+    $token = Password::createToken($user);
+    $this->post('/reset-password', ['token' => $token, 'email' => $user->email, 'password' => 'new-password-1', 'password_confirmation' => 'new-password-1'])
+        ->assertSessionHasErrors('email');
+
+    expect(Hash::check('secret-password', $user->fresh()->password))->toBeTrue();
+});
+
+/** Starts a confirmation as the signed-in user with the given query and returns the callback response. */
+function oidcReauthenticate(array $reauthQuery, array $claims): TestResponse
+{
+    $location = test()->get(route('oidc.reauthenticate', $reauthQuery))->assertRedirect()->headers->get('Location');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    OidcFakeProvider::$nonce = $query['nonce'];
+    OidcFakeProvider::$claims = $claims;
+
+    return test()->get(route('oidc.callback', ['code' => 'auth-code', 'state' => $query['state']]));
+}
+
+test('an admin who confirms from the SCIM screen returns to it, on success and on failure', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+    auth()->user()->forceFill(['is_admin' => true])->save();
+    session([OidcController::SESSION_AT_KEY => now()->subHour()->getTimestamp()]);
+
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time()])
+        ->assertRedirect(route('settings.scim'))
+        ->assertSessionHasNoErrors();
+
+    expect(now()->getTimestamp() - session(OidcController::SESSION_AT_KEY))->toBeLessThan(5);
+
+    // A confirmation the provider did not really renew is refused, and the error shows where the user came from.
+    $oldAt = now()->subHour()->getTimestamp();
+    session([OidcController::SESSION_AT_KEY => $oldAt]);
+
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time() - 3600])
+        ->assertRedirect(route('settings.scim'))
+        ->assertSessionHasErrors('sso');
+
+    expect(session(OidcController::SESSION_AT_KEY))->toBe($oldAt);
+});
+
+test('the return target is a fixed list: unknown keys, URLs and non-admins go back to the profile', function () {
+    oidcLogin()->assertRedirect(route('dashboard'));
+
+    // Not an admin: the SCIM screen is not theirs.
+    oidcReauthenticate(['return' => 'scim'], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
+
+    auth()->user()->forceFill(['is_admin' => true])->save();
+
+    foreach (['https://evil.test/', '//evil.test', 'settings.scim', '/settings/scim', ''] as $return) {
+        oidcReauthenticate(['return' => $return], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
+    }
+
+    oidcReauthenticate(['return' => ['scim']], ['auth_time' => time()])->assertRedirect(route('profile').'#api-tokens');
 });

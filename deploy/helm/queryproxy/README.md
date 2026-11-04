@@ -46,6 +46,35 @@ docker-compose (`QUERYPROXY_RUN_WORKER` and `QUERYPROXY_RUN_SCHEDULER` are both 
 only with an external application database, which is the setup `values-ha.yaml` describes. In SQLite mode there is
 therefore no `worker` or `scheduler` Deployment in `helm template`.
 
+## Install from the OCI registry
+
+Every release tag publishes the chart to GitHub Container Registry as
+`oci://ghcr.io/queryproxy/charts/queryproxy`; the chart version equals the release version (the `v` prefix is
+dropped). Use these commands instead of the local path in the sections below:
+
+```bash
+helm upgrade --install queryproxy oci://ghcr.io/queryproxy/charts/queryproxy --version 0.4.1 \
+  --namespace queryproxy --create-namespace \
+  --set admin.email=admin@example.com --set secrets.adminPassword="$(openssl rand -hex 16)"
+
+# Or fetch it first, e.g. to read values-ha.yaml:
+helm pull oci://ghcr.io/queryproxy/charts/queryproxy --version 0.4.1 --untar
+```
+
+The chart is signed keyless with [cosign](https://github.com/sigstore/cosign) (Sigstore, GitHub OIDC identity) from
+the release workflow, the same way the images are. Verify it with cosign v3 or later before installing; the identity
+must be the release workflow of this repository at a version tag, issued by GitHub Actions:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/QueryProxy/QueryProxy/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/queryproxy/charts/queryproxy:0.4.1
+```
+
+Replace `0.4.1` with the version you are installing. The command is the one in `SECURITY.md`, with the chart
+repository in place of the image; the release workflow runs it against the pushed digest before it finishes.
+
 ## Quick start (SQLite, one pod)
 
 ```bash

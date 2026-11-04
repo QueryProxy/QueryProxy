@@ -9,6 +9,10 @@ use App\Models\QueryRequest;
 use App\Models\User;
 use App\Services\Api\TokenService;
 use App\Services\Auth\TwoFactorService;
+use App\Services\Secrets\Drivers\AwsSecretsManagerDriver;
+use App\Services\Secrets\Drivers\AzureKeyVaultDriver;
+use App\Services\Secrets\Drivers\VaultDriver;
+use App\Services\Secrets\SecretResolver;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Contracts\Database\LostConnectionDetector as LostConnectionDetectorContract;
@@ -46,6 +50,14 @@ class AppServiceProvider extends ServiceProvider
         $this->app->extend(LostConnectionDetectorContract::class, function (LostConnectionDetectorContract $detector) {
             return new ReadOnlyAwareLostConnectionDetector($detector);
         });
+
+        // External secret references (ADR-028). Singletons on purpose: the
+        // resolver keeps the resolved values and each driver its access token in
+        // process memory, which is the only cache the values may live in.
+        $this->app->singleton(SecretResolver::class);
+        $this->app->singleton(VaultDriver::class);
+        $this->app->singleton(AwsSecretsManagerDriver::class);
+        $this->app->singleton(AzureKeyVaultDriver::class);
     }
 
     public function boot(): void
@@ -96,6 +108,15 @@ class AppServiceProvider extends ServiceProvider
         RateLimiter::for('livewire', function (Request $request) {
             return Limit::perMinute(180)->by($request->user()?->id ?: $request->ip());
         });
+
+        // Slack (ADR-027) sends every workspace's traffic from the same few
+        // addresses, so one per-address bucket would be shared by all of them.
+        // The address limit only guards the signature check against a flood;
+        // the real budget is per workspace and is counted by
+        // VerifySlackSignature once the signature has been verified (the
+        // workspace id of an unverified body means nothing, and the router
+        // would run a throttle middleware ahead of the signature check).
+        RateLimiter::for('slack-ip', fn (Request $request) => Limit::perMinute(120)->by('slack-ip:'.$request->ip()));
 
         // REST API (ADR-024): the budget is per token. Laravel runs authentication
         // before throttling, so only authenticated calls get here; calls that fail

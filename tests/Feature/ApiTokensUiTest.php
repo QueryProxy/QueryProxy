@@ -75,7 +75,7 @@ test('the token value does not come back after the next interaction or a page re
 
     // Anything else the user does afterwards: the value is nowhere in the component state.
     $component->set('name', 'something else');
-    expect(json_encode($component->snapshot ?? []))->not->toContain($plain)
+    expect(json_encode($component->getData()))->not->toContain($plain)
         ->and($component->html())->not->toContain($plain);
 
     // A reload mounts the component afresh.

@@ -72,6 +72,30 @@ return [
 
     'connection_slot_retry_delay' => max(1, (int) env('QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY', 5)),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Schema explorer (ADR-029)
+    |--------------------------------------------------------------------------
+    |
+    | The Studio's table and column tree is read from the target database's
+    | catalog by fixed queries, without an approval. `schema_timeout` is the
+    | statement timeout of that read in seconds (not the query execution
+    | timeout); `schema_cache_ttl` is how long a connection's schema is kept in
+    | the application cache in seconds (0 turns the cache off); a manual refresh
+    | skips the cache and is limited to `schema_refresh_per_minute` per user and
+    | connection. `schema_max_columns` caps one read; a larger schema is cut at a
+    | table boundary, the default schema is listed first, and the answer says
+    | `truncated`.
+    */
+
+    'schema_timeout' => max(1, (int) env('QUERYPROXY_SCHEMA_TIMEOUT', 5)),
+
+    'schema_cache_ttl' => max(0, (int) env('QUERYPROXY_SCHEMA_CACHE_TTL', 3600)),
+
+    'schema_max_columns' => max(1, (int) env('QUERYPROXY_SCHEMA_MAX_COLUMNS', 20000)),
+
+    'schema_refresh_per_minute' => max(1, (int) env('QUERYPROXY_SCHEMA_REFRESH_LIMIT', 3)),
+
     'result_disk' => env('QUERYPROXY_RESULT_DISK', 'local'),
 
     'result_ttl_days' => (int) env('QUERYPROXY_RESULT_TTL_DAYS', 30),
@@ -194,6 +218,35 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Slack app (ADR-027)
+    |--------------------------------------------------------------------------
+    | `slack_api_url` is the Web API base (use https://slack-gov.com/api for
+    | GovSlack). `slack_oauth_scopes` are the bot scopes the install asks for:
+    | chat:write and chat:write.public post and update request cards,
+    | incoming-webhook lets the installer pick the channel, commands is the
+    | /queryproxy command, im:write the direct messages and users:read(.email)
+    | the e-mail lookup behind identity suggestions.
+    */
+
+    'slack_api_url' => rtrim((string) env('QUERYPROXY_SLACK_API_URL', 'https://slack.com/api'), '/'),
+
+    'slack_authorize_url' => (string) env('QUERYPROXY_SLACK_AUTHORIZE_URL', 'https://slack.com/oauth/v2/authorize'),
+
+    // Requests per minute and Slack workspace (interactions, commands, events).
+    'slack_rate_limit' => max(1, (int) env('QUERYPROXY_SLACK_RATE_LIMIT', 300)),
+
+    'slack_oauth_scopes' => [
+        'chat:write',
+        'chat:write.public',
+        'commands',
+        'im:write',
+        'incoming-webhook',
+        'users:read',
+        'users:read.email',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Pending request reminder
     |--------------------------------------------------------------------------
     | A request still pending after this many hours is reminded about once (the
@@ -254,6 +307,26 @@ return [
         'group_claim' => trim((string) env('QUERYPROXY_OIDC_GROUP_CLAIM', 'groups')) ?: 'groups',
         'role_map' => (string) env('QUERYPROXY_OIDC_ROLE_MAP', ''),
         'scopes' => trim((string) env('QUERYPROXY_OIDC_SCOPES', 'openid email profile')) ?: 'openid email profile',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | SCIM 2.0 provisioning (ADR-026)
+    |--------------------------------------------------------------------------
+    | /scim/v2 lets an identity provider create, update and suspend users and
+    | sync groups. It is off by default: while `enabled` is false every SCIM
+    | path answers 404. Clients authenticate with a SCIM token (see
+    | `php artisan queryproxy:scim-token create`), which is not a personal access
+    | token. `rate_limit_per_minute` is the request budget of each token, and
+    | the number of failed authentications an address may make a minute before
+    | it is answered with 429. Groups are mapped to team roles with
+    | QUERYPROXY_OIDC_ROLE_MAP (see the OIDC section).
+    */
+
+    'scim' => [
+        'enabled' => filter_var(env('QUERYPROXY_SCIM_ENABLED', false), FILTER_VALIDATE_BOOLEAN),
+
+        'rate_limit_per_minute' => max(1, (int) env('QUERYPROXY_SCIM_RATE_LIMIT', 300)),
     ],
 
     /*
@@ -323,6 +396,74 @@ return [
         'token_max_days' => max(1, (int) env('QUERYPROXY_API_TOKEN_MAX_DAYS', 90)),
 
         'rate_limit_per_minute' => max(1, (int) env('QUERYPROXY_API_RATE_LIMIT', 60)),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | External secret references (ADR-028)
+    |--------------------------------------------------------------------------
+    | A connection's password may be a reference instead of a value:
+    |   vault://<mount>/<path>#<key>
+    |   aws-sm://<secret-id>[#<json-key>]
+    |   azure-kv://<vault-name>/<secret-name>[/<version>]
+    | It is resolved when a connection is opened, right before the credentials
+    | go to the database driver, and never stored. Resolved values are cached in
+    | process memory only (not in Laravel's cache store) for `cache_ttl`
+    | seconds; 0 turns the cache off. Which references a connection may use is
+    | bounded per team (ADR-028 amendment): a system administrator sets the
+    | reference prefixes of a team (`php artisan queryproxy:team:secret-prefixes`),
+    | and a team without prefixes cannot use references. Run
+    | `php artisan queryproxy:doctor` to check the settings below.
+    */
+
+    'secrets' => [
+        'cache_ttl' => max(0, (int) env('QUERYPROXY_SECRET_CACHE_TTL', 300)),
+
+        // Seconds a secret store may take to connect and to answer.
+        'timeout' => max(1, (int) env('QUERYPROXY_SECRET_TIMEOUT', 5)),
+
+        'vault' => [
+            'address' => (string) env('QUERYPROXY_VAULT_ADDR', ''),
+            'namespace' => (string) env('QUERYPROXY_VAULT_NAMESPACE', ''),
+            'auth' => (string) env('QUERYPROXY_VAULT_AUTH', 'token'), // token | approle | kubernetes
+            'token' => (string) SecretFile::get('QUERYPROXY_VAULT_TOKEN', ''),
+            'role_id' => (string) env('QUERYPROXY_VAULT_ROLE_ID', ''),
+            'secret_id' => (string) SecretFile::get('QUERYPROXY_VAULT_SECRET_ID', ''),
+            'approle_mount' => (string) env('QUERYPROXY_VAULT_APPROLE_MOUNT', 'approle'),
+            'kubernetes_role' => (string) env('QUERYPROXY_VAULT_K8S_ROLE', ''),
+            'kubernetes_mount' => (string) env('QUERYPROXY_VAULT_K8S_MOUNT', 'kubernetes'),
+            'kubernetes_jwt_path' => (string) env('QUERYPROXY_VAULT_K8S_JWT_PATH', '/var/run/secrets/kubernetes.io/serviceaccount/token'),
+            'kv_version' => (string) env('QUERYPROXY_VAULT_KV_VERSION', '2'), // 2 | 1
+            // KV mount paths (comma-separated, may contain slashes: `kv/prod`).
+            // Required for KV v1, where nothing else tells a KV mount from any
+            // other API path. Optional for v2 (the first path segment is then
+            // the mount); when set it is an allowlist: only these mounts are read.
+            'mounts' => array_values(array_filter(array_map(
+                fn ($mount) => trim($mount, " \t\n\r\0\x0B/"),
+                explode(',', (string) env('QUERYPROXY_VAULT_MOUNTS', '')),
+            ))),
+            'ca_file' => (string) env('QUERYPROXY_VAULT_CA_FILE', ''),
+        ],
+
+        // The AWS credentials are the SDK's default chain (environment, shared
+        // files, IRSA web identity, ECS task role, instance profile).
+        'aws' => [
+            'region' => (string) env('QUERYPROXY_AWS_REGION', env('AWS_REGION', env('AWS_DEFAULT_REGION', ''))),
+            'endpoint' => (string) env('QUERYPROXY_AWS_ENDPOINT', ''),
+            // Whether the operator set AWS up for QueryProxy on purpose (a
+            // generic AWS_REGION is often present for S3 and says nothing).
+            'explicit' => env('QUERYPROXY_AWS_REGION') !== null || env('QUERYPROXY_AWS_ENDPOINT') !== null,
+        ],
+
+        'azure' => [
+            'auth' => (string) env('QUERYPROXY_AZURE_AUTH', 'auto'), // auto | client_secret | workload_identity | managed_identity
+            'tenant_id' => (string) env('QUERYPROXY_AZURE_TENANT_ID', env('AZURE_TENANT_ID', '')),
+            'client_id' => (string) env('QUERYPROXY_AZURE_CLIENT_ID', env('AZURE_CLIENT_ID', '')),
+            'client_secret' => (string) SecretFile::get('QUERYPROXY_AZURE_CLIENT_SECRET', ''),
+            'federated_token_file' => (string) env('QUERYPROXY_AZURE_FEDERATED_TOKEN_FILE', env('AZURE_FEDERATED_TOKEN_FILE', '')),
+            'authority_host' => (string) env('QUERYPROXY_AZURE_AUTHORITY_HOST', env('AZURE_AUTHORITY_HOST', '')),
+            'vault_dns_suffix' => (string) env('QUERYPROXY_AZURE_VAULT_DNS_SUFFIX', ''),
+        ],
     ],
 
     /*

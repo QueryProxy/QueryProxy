@@ -20,6 +20,12 @@ use Throwable;
  * anything).
  *
  *  - pgsql:          pg_cancel_backend(pid)  cancels the statement, the session stays
+ *  - pgsql on CockroachDB (detected through version()): it has no
+ *                    pg_cancel_backend; CANCEL QUERIES names the statements of
+ *                    the session by its session_id (kept in the stamp as
+ *                    "crdb:<32 hex>"), and the session stays. YugabyteDB
+ *                    speaks the PostgreSQL protocol and functions, so it takes
+ *                    the plain pgsql path.
  *  - mysql/mariadb:  KILL QUERY pid          aborts the statement, the session stays
  *  - sqlsrv:         KILL spid               ends the session; its open transaction rolls back
  *  - sqlite:         not supported (in-process, no second session to signal)
@@ -47,6 +53,9 @@ class BackendCanceller
     /** What a SQL Server login_time stamp looks like (CONVERT style 121 of a datetime: milliseconds at most); anything else is never put into SQL. */
     private const SQLSRV_STAMP = '/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,3})?$/';
 
+    /** The stamp identify() records for a CockroachDB session: its session_id, 32 hex digits, behind a marker no PostgreSQL timestamp can have. */
+    private const COCKROACH_STAMP = '/^crdb:([0-9a-f]{32})$/';
+
     public function __construct(private DynamicConnectionFactory $factory) {}
 
     public function supports(DbDriver $driver): bool
@@ -66,7 +75,7 @@ class BackendCanceller
     public function identify(DatabaseConnection $db, DbDriver $driver): ?array
     {
         $sql = match ($driver) {
-            DbDriver::Pgsql => 'SELECT pg_backend_pid(), (SELECT backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid())',
+            DbDriver::Pgsql => 'SELECT pg_backend_pid(), (SELECT backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()), version()',
             DbDriver::Mysql, DbDriver::Mariadb => 'SELECT CONNECTION_ID()',
             DbDriver::Sqlsrv => 'SELECT @@SPID, (SELECT CONVERT(varchar(30), login_time, 121) FROM sys.dm_exec_sessions WHERE session_id = @@SPID)',
             DbDriver::Sqlite => null,
@@ -93,10 +102,34 @@ class BackendCanceller
 
             $token = isset($row[1]) && is_string($row[1]) && $row[1] !== '' ? $row[1] : null;
 
+            if ($driver === DbDriver::Pgsql && is_string($row[2] ?? null) && str_starts_with($row[2], 'CockroachDB')) {
+                $token = $this->cockroachStamp($db);
+            }
+
             return ['pid' => (int) $row[0], 'token' => $token];
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /**
+     * The stamp of a CockroachDB session: its session_id. pg_backend_pid() is
+     * only a number derived from it and names nothing a CANCEL can take, and
+     * pg_stat_activity is empty there. Null when it cannot be read; the run is
+     * then simply not stoppable by the user.
+     */
+    private function cockroachStamp(DatabaseConnection $db): ?string
+    {
+        $statement = $db->getPdo()->query('SHOW session_id');
+
+        if ($statement === false) {
+            return null;
+        }
+
+        $id = $statement->fetchColumn();
+        $statement->closeCursor();
+
+        return is_string($id) && preg_match('/^[0-9a-f]{32}$/', $id) === 1 ? 'crdb:'.$id : null;
     }
 
     /**
@@ -149,6 +182,10 @@ class BackendCanceller
         // $pid is an int, so interpolating it into the statements that cannot take a parameter is safe.
         switch ($driver) {
             case DbDriver::Pgsql:
+                if ($token !== null && preg_match(self::COCKROACH_STAMP, $token, $session) === 1) {
+                    return $this->cancelCockroach($db, $session[1]);
+                }
+
                 // Another role's row shows no backend_start, so the stamp also
                 // keeps the wrong identity from "succeeding" on a foreign session.
                 return $token === null
@@ -184,5 +221,30 @@ class BackendCanceller
             default:
                 return false;
         }
+    }
+
+    /**
+     * CockroachDB: cancel the statements the session $sessionId is running.
+     * The session is looked up first because CANCEL QUERIES reports success
+     * whether it found a statement or not; a session that is gone (or one this
+     * login may not see) answers false, like pg_cancel_backend does for a
+     * process it cannot signal. $sessionId was matched against 32 hex digits
+     * by the caller and is bound anyway.
+     *
+     * "true" means the CANCEL was issued for a session that exists, not that a
+     * statement stopped. While a read runs inside a server-side cursor,
+     * CockroachDB ignores it until the cursor's query has been evaluated, so
+     * the statement runs on until the statement timeout cuts it (writes are
+     * interrupted at once). docs/compatibility.md, "Stopping a read".
+     */
+    private function cancelCockroach(DatabaseConnection $db, string $sessionId): bool
+    {
+        if ((int) $db->scalar('SELECT count(*) FROM [SHOW CLUSTER SESSIONS] WHERE session_id = ?', [$sessionId]) < 1) {
+            return false;
+        }
+
+        $db->statement('CANCEL QUERIES SELECT query_id FROM [SHOW CLUSTER STATEMENTS] WHERE session_id = ?', [$sessionId]);
+
+        return true;
     }
 }

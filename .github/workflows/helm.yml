@@ -5,6 +5,9 @@ name: Helm
 #   lint   helm lint of both profiles on Helm 3 and Helm 4, plus the render
 #          rules the chart promises: one scheduler replica, and SQLite with more
 #          than one web replica refused.
+#   package  pull requests only: a dry run of the `helm package` the release
+#          workflow does (release.yml, job `chart`), so a chart that cannot be
+#          packaged fails the PR, not the tag. Nothing is pushed or signed.
 #   smoke  builds the image from this checkout, installs the chart into a kind
 #          cluster and runs tests/Integration/helm/smoke.sh: migration hook,
 #          /up answers 200, the sample request is approved and completed by the
@@ -86,6 +89,30 @@ jobs:
         run: |
           helm template qp deploy/helm/queryproxy -f deploy/helm/queryproxy/values-ha.yaml \
             --set secrets.mountAsFiles=true | grep -q 'name: APP_KEY_FILE'
+
+  package:
+    name: package (dry run)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same Helm version as the release job.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.22.1
+
+      - name: helm package
+        run: helm package deploy/helm/queryproxy --destination "$RUNNER_TEMP/chart"
+
+      - name: The package is named after Chart.yaml and lints
+        run: |
+          version=$(awk '/^version:/ { gsub(/["\047]/, "", $2); print $2; exit }' deploy/helm/queryproxy/Chart.yaml)
+          test -f "$RUNNER_TEMP/chart/queryproxy-${version}.tgz"
+          helm lint "$RUNNER_TEMP/chart/queryproxy-${version}.tgz"
 
   smoke:
     name: smoke (kind)

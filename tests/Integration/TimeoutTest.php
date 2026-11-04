@@ -98,6 +98,16 @@ test('the statement timeout cuts a long write on the server and nothing is store
 });
 
 test('the lock timeout gives up on a row locked by another session', function () {
+    if (IntegrationTarget::isYugabyte()) {
+        // Checked by hand on 2025.2.8 (docs/compatibility.md): the update waits in
+        // YugabyteDB's wait queue and lock_timeout is not applied to that wait;
+        // statement_timeout ends it with an error, but an autocommit UPDATE
+        // cancelled that way is still applied once the lock holder lets go (inside
+        // a transaction it is rolled back). The lock wait is the one thing here
+        // that cannot be bounded safely on YugabyteDB.
+        $this->markTestSkipped('YugabyteDB ignores lock_timeout for a row lock wait, and an autocommit UPDATE cancelled by the statement timeout during that wait is still applied afterwards. docs/compatibility.md.');
+    }
+
     $holder = $this->it->session('holder');
     $holder->beginTransaction();
 

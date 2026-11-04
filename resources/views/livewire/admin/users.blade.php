@@ -17,6 +17,10 @@
         </x-ui.alert>
     @endif
 
+    @error('resetPassword')
+        <x-ui.alert tone="danger" icon="shield" class="mb-3.5">{{ $message }}</x-ui.alert>
+    @enderror
+
     <x-ui.panel padded class="mb-3.5">
         <form wire:submit="createUser" class="grid grid-cols-1 items-end gap-3 sm:grid-cols-5">
             <x-ui.field label="Name" :error="$errors->first('name')">
@@ -39,6 +43,73 @@
             <x-ui.btn type="submit" variant="primary" icon="plus">Create user</x-ui.btn>
         </form>
     </x-ui.panel>
+
+    @if (session('status'))
+        <x-ui.alert tone="ok" icon="check" class="mb-3.5">{{ session('status') }}</x-ui.alert>
+    @endif
+
+    @error('suggestions')
+        <x-ui.alert tone="danger" icon="shield" class="mb-3.5">{{ $message }}</x-ui.alert>
+    @enderror
+
+    @if ($suggestions->isNotEmpty())
+        <x-ui.panel class="mb-3.5" role="region" aria-labelledby="slack-suggestions-heading">
+            <x-slot:header>
+                <x-ui.icon name="slack" :size="15" class="text-ink-4" />
+                <h2 id="slack-suggestions-heading" class="font-display text-[12.5px] font-semibold text-ink">Slack matching suggestions</h2>
+                <x-ui.badge tone="pending" class="ml-auto">{{ $suggestionTotal }} pending</x-ui.badge>
+            </x-slot:header>
+
+            <p class="border-b border-line px-3.5 py-2.5 text-[12px] leading-[1.55] text-mute">
+                Found by looking each user's e-mail address up in the Slack workspace. An address match is a hint, not proof:
+                confirm only when you know the Slack member is that person. Nothing is linked until you approve it.
+            </p>
+
+            <x-ui.table>
+                <x-slot:head>
+                    <tr>
+                        <x-ui.th>User</x-ui.th>
+                        <x-ui.th class="w-36">Suggested Slack ID</x-ui.th>
+                        <x-ui.th class="w-64">Source</x-ui.th>
+                        <x-ui.th class="w-40" align="right"><span class="sr-only">Actions</span></x-ui.th>
+                    </tr>
+                </x-slot:head>
+
+                @foreach ($suggestions as $suggestion)
+                    <x-ui.tr wire:key="slack-suggestion-{{ $suggestion->id }}">
+                        <x-ui.td class="text-ink-2">
+                            {{ $suggestion->user->name }}
+                            <span class="block font-mono text-[11px] text-mute-3">{{ $suggestion->user->email }}</span>
+                        </x-ui.td>
+                        <x-ui.td class="font-mono text-[11.5px]">{{ $suggestion->slack_user_id }}</x-ui.td>
+                        <x-ui.td class="text-mute">
+                            E-mail match <span class="font-mono text-[11px]">{{ $suggestion->matched_email }}</span>
+                            <span class="block text-[11px] text-mute-3">
+                                {{ $workspaceNames[$suggestion->slack_team_id] ?? $suggestion->slack_team_id }}@if ($suggestion->team) · {{ $suggestion->team->name }}@endif
+                            </span>
+                        </x-ui.td>
+                        <x-ui.td align="right" class="whitespace-nowrap">
+                            <div class="flex items-center justify-end gap-2.5">
+                                <x-ui.action wire:click="approveSlackSuggestion({{ $suggestion->id }})"
+                                             wire:confirm="Link Slack ID {{ $suggestion->slack_user_id }} to {{ $suggestion->user->email }}? That Slack member will be able to act as this user in Slack."
+                                             tone="accent"
+                                             aria-label="Approve Slack ID {{ $suggestion->slack_user_id }} for {{ $suggestion->user->email }}">Approve</x-ui.action>
+                                <x-ui.action wire:click="rejectSlackSuggestion({{ $suggestion->id }})"
+                                             tone="danger"
+                                             aria-label="Reject Slack ID {{ $suggestion->slack_user_id }} for {{ $suggestion->user->email }}">Reject</x-ui.action>
+                            </div>
+                        </x-ui.td>
+                    </x-ui.tr>
+                @endforeach
+            </x-ui.table>
+
+            @if ($suggestionTotal > $suggestions->count())
+                <p class="border-t border-line px-3.5 py-2 text-[11.5px] text-mute-3">
+                    Showing the first {{ $suggestions->count() }}; the rest appear as these are handled.
+                </p>
+            @endif
+        </x-ui.panel>
+    @endif
 
     <x-ui.panel>
         <x-ui.table>
@@ -87,8 +158,10 @@
                                 <x-ui.action wire:click="toggleAdmin({{ $u->id }})" tone="accent">
                                     {{ $u->is_admin ? 'Revoke admin' : 'Make admin' }}
                                 </x-ui.action>
-                                <x-ui.action wire:click="resetPassword({{ $u->id }})"
-                                             wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                @unless ($u->isSsoUser())
+                                    <x-ui.action wire:click="resetPassword({{ $u->id }})"
+                                                 wire:confirm="Generate a new password for {{ $u->email }}? The old one stops working immediately.">Reset password</x-ui.action>
+                                @endunless
                                 @if ($u->hasTwoFactorEnabled())
                                     <x-ui.action wire:click="resetTwoFactor({{ $u->id }})"
                                                  wire:confirm="Reset two-factor authentication for {{ $u->email }}? They will log in with password only until they re-enroll.">Reset 2FA</x-ui.action>

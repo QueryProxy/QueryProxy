@@ -5,6 +5,9 @@ namespace App\Services\Connections;
 use App\Enums\DbDriver;
 use App\Models\Connection;
 use App\Services\Execution\TargetSession;
+use App\Services\Secrets\SecretReference;
+use App\Services\Secrets\SecretResolutionException;
+use App\Services\Secrets\SecretResolver;
 use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use PDO;
@@ -16,7 +19,11 @@ class DynamicConnectionFactory
     /** Seconds a control connection may take to connect. */
     private const CONTROL_CONNECT_TIMEOUT = 5;
 
-    public function __construct(private TargetSession $session, private TlsPemStore $pemStore = new TlsPemStore) {}
+    public function __construct(
+        private TargetSession $session,
+        private TlsPemStore $pemStore = new TlsPemStore,
+        private ?SecretResolver $secrets = null,
+    ) {}
 
     /**
      * Register a runtime Laravel database connection for the given target
@@ -191,6 +198,9 @@ class DynamicConnectionFactory
             $connection->username,
             $connection->read_password,
             $connection->read_username,
+            // Values resolved from an external secret store (ADR-028), if still cached.
+            $this->secrets()->peek($connection->password),
+            $this->secrets()->peek($connection->read_password),
             $connection->host,
             $connection->database,
         ], fn ($value) => is_string($value) && $value !== ''));
@@ -325,7 +335,7 @@ class DynamicConnectionFactory
             'port' => (int) ($connection->port ?: $driver->defaultPort()),
             'database' => $connection->database,
             'username' => $readIdentity ? $connection->read_username : $connection->username,
-            'password' => ($readIdentity ? $connection->read_password : $connection->password) ?? '',
+            'password' => $this->password($connection, $readIdentity),
             'prefix' => '',
         ];
 
@@ -348,6 +358,34 @@ class DynamicConnectionFactory
             ], $connection),
             default => $config,
         };
+    }
+
+    /**
+     * The password the driver logs in with. A stored external secret reference
+     * (ADR-028) is resolved here, right before the credentials go to the
+     * driver, so the value exists only in this runtime config and in the
+     * resolver's process-memory cache.
+     *
+     * @throws SecretResolutionException fail-closed; its message is generic and safe to show
+     */
+    private function password(Connection $connection, bool $readIdentity): string
+    {
+        $stored = $readIdentity ? $connection->read_password : $connection->password;
+
+        if ($stored === null || $stored === '') {
+            return '';
+        }
+
+        if (! SecretReference::looksLikeReference($stored)) {
+            return $stored;
+        }
+
+        return $this->secrets()->resolve($stored, $connection, $readIdentity ? 'read_password' : 'password');
+    }
+
+    private function secrets(): SecretResolver
+    {
+        return $this->secrets ??= app(SecretResolver::class);
     }
 
     /**

@@ -3,6 +3,8 @@
 namespace App\Models;
 
 use App\Services\Connections\TlsPemStore;
+use App\Services\Secrets\SecretReference;
+use App\Services\Secrets\SecretResolutionException;
 use App\Support\SqlServerReferentialActions;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
@@ -80,7 +82,37 @@ class Team extends Model
     {
         return [
             'masking_key' => 'encrypted',
+            'secret_reference_prefixes' => 'array',
         ];
+    }
+
+    /**
+     * The external secret reference prefixes this team may use (ADR-028
+     * amendment), normalized. A stored entry that does not normalize is ignored
+     * rather than trusted, so a hand-edited row can only narrow what is allowed.
+     * Empty means the team cannot use references.
+     *
+     * @return list<string>
+     */
+    public function secretReferencePrefixes(): array
+    {
+        $prefixes = [];
+
+        foreach ((array) $this->secret_reference_prefixes as $prefix) {
+            try {
+                $prefixes[] = SecretReference::normalizePrefix((string) $prefix);
+            } catch (SecretResolutionException) {
+                continue;
+            }
+        }
+
+        return array_values(array_unique($prefixes));
+    }
+
+    /** May a connection of this team use this (already parsed) reference? */
+    public function allowsSecretReference(SecretReference $reference): bool
+    {
+        return $reference->fallsUnder($this->secretReferencePrefixes());
     }
 
     /**

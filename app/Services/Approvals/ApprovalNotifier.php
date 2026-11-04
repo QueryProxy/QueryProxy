@@ -19,6 +19,32 @@ use Illuminate\Support\Facades\Notification;
  */
 class ApprovalNotifier
 {
+    /** Depth of deferringChat() scopes in progress. */
+    private static int $chatDeferrals = 0;
+
+    /**
+     * Run $work with the chat messages of a new request held back until the
+     * response has been sent. A Slack modal must be answered within three
+     * seconds, and posting the card and the direct messages takes longer than
+     * that when several are due; Slack would show an error and the user would
+     * submit again.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $work
+     * @return T
+     */
+    public static function deferringChat(callable $work): mixed
+    {
+        self::$chatDeferrals++;
+
+        try {
+            return $work();
+        } finally {
+            self::$chatDeferrals--;
+        }
+    }
+
     public static function requestSubmitted(QueryRequest $request): void
     {
         $dbas = $request->team->users()
@@ -29,7 +55,9 @@ class ApprovalNotifier
 
         Notification::send($dbas, new QueryRequestSubmitted($request));
 
-        if (class_exists(ChatNotifier::class)) {
+        if (self::$chatDeferrals > 0) {
+            defer(fn () => app(ChatNotifier::class)->requestSubmitted($request));
+        } elseif (class_exists(ChatNotifier::class)) {
             app(ChatNotifier::class)->requestSubmitted($request);
         }
     }
@@ -78,6 +106,27 @@ class ApprovalNotifier
         if (! $request->requester->trashed()) {
             $request->requester->notify(new QueryRequestFinished($request));
         }
+
+        // The Slack app updates the request's card and replies in its thread.
+        app(ChatNotifier::class)->requestFinished($request);
+    }
+
+    /**
+     * Chat only: a worker picked the approved request up. The Slack app
+     * updates the card to "running"; nothing is sent in-app.
+     */
+    public static function requestStarted(QueryRequest $request): void
+    {
+        app(ChatNotifier::class)->requestStarted($request);
+    }
+
+    /**
+     * Chat only: the request was cancelled, pending or running. Who did it is
+     * told in-app by requestStopped(); the chat card just states the status.
+     */
+    public static function requestCancelled(QueryRequest $request): void
+    {
+        app(ChatNotifier::class)->requestCancelled($request);
     }
 
     /**

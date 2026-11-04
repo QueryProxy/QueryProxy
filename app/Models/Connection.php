@@ -5,6 +5,7 @@ namespace App\Models;
 use App\Enums\DbDriver;
 use App\Enums\GrantAccessLevel;
 use App\Services\Connections\TlsPemStore;
+use App\Services\Secrets\SecretReference;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Builder;
@@ -14,6 +15,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Facades\Crypt;
+use Illuminate\Validation\ValidationException;
 use RuntimeException;
 
 #[Fillable([
@@ -53,6 +55,24 @@ class Connection extends Model
         });
 
         static::deleted(fn (self $connection) => app(TlsPemStore::class)->purge($connection));
+
+        // A password that starts like a secret reference (ADR-028) must be a
+        // well-formed one that falls under the team's allowed prefixes (ADR-028
+        // amendment): a typo would otherwise only show when the connection is
+        // first opened, and a reference outside the team's paths would let it
+        // read another team's secret. The error keys are the connection form's
+        // field names. Moving a connection to another team checks it again.
+        static::saving(function (self $connection) {
+            foreach (['password' => 'password', 'read_password' => 'readPassword'] as $attribute => $field) {
+                if (! $connection->isDirty([$attribute, 'team_id'])) {
+                    continue;
+                }
+
+                if (($message = $connection->secretReferenceError($connection->{$attribute})) !== null) {
+                    throw ValidationException::withMessages([$field => $message]);
+                }
+            }
+        });
     }
 
     protected function casts(): array
@@ -124,6 +144,58 @@ class Connection extends Model
     public function hasReadCredentials(): bool
     {
         return is_string($this->read_username) && trim($this->read_username) !== '';
+    }
+
+    /**
+     * Does the stored password point at an external secret store instead of
+     * holding the password itself (ADR-028)? The reference stays in the same
+     * encrypted field; it is resolved when the connection is opened.
+     */
+    public function hasSecretReferencePassword(): bool
+    {
+        return SecretReference::looksLikeReference($this->password);
+    }
+
+    /** Same for the read-only identity's password. */
+    public function hasSecretReferenceReadPassword(): bool
+    {
+        return SecretReference::looksLikeReference($this->read_password);
+    }
+
+    /**
+     * Why $value cannot be used as this connection's password, or null when it
+     * can: it is not a secret reference at all (an ordinary password), or it is
+     * a well-formed one under one of the team's prefixes. A malformed reference
+     * and one outside the team's prefixes get different messages.
+     */
+    public function secretReferenceError(?string $value): ?string
+    {
+        if (! SecretReference::looksLikeReference($value)) {
+            return null;
+        }
+
+        if (($syntax = SecretReference::validationError($value)) !== null) {
+            return $syntax;
+        }
+
+        $reference = SecretReference::parse((string) $value);
+
+        return $this->currentTeam()?->allowsSecretReference($reference)
+            ? null
+            : 'This secret reference is outside the paths allowed for this team. A system administrator sets them on the team.';
+    }
+
+    /**
+     * The connection's team, re-read when `team_id` was changed after the
+     * relation had been loaded (a stale team would apply the old prefixes).
+     */
+    public function currentTeam(): ?Team
+    {
+        if ($this->relationLoaded('team') && $this->team !== null && $this->team->getKey() !== $this->team_id) {
+            $this->unsetRelation('team');
+        }
+
+        return $this->team;
     }
 
     /** Does the user hold a grant that is still in force? */

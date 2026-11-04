@@ -2,16 +2,20 @@
 
 namespace App\Services\Chat;
 
+use App\Enums\AuditEvent;
 use App\Enums\ChatProvider;
 use App\Enums\ChatSqlMode;
 use App\Enums\GrantRequestStatus;
 use App\Enums\QueryRequestStatus;
+use App\Enums\TeamRole;
 use App\Models\ChatApprovalToken;
+use App\Models\ChatIdentity;
 use App\Models\ChatIntegration;
 use App\Models\ConnectionGrant;
 use App\Models\ConnectionGrantRequest;
 use App\Models\QueryRequest;
 use App\Services\Sql\SqlRedactor;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -20,6 +24,11 @@ use Throwable;
 /**
  * Posts request lifecycle messages to the team's configured chat channels.
  * Failures are logged, never thrown — chat being down must not break the flow.
+ *
+ * A Slack integration with an installed app (bot token and channel, ADR-027)
+ * posts through chat.postMessage, remembers the channel and `ts` of each
+ * request's card and updates that card as the request moves on. Every other
+ * integration keeps the incoming webhook, which cannot update a message.
  */
 class ChatNotifier
 {
@@ -30,9 +39,17 @@ class ChatNotifier
      */
     public const WORKFLOWS_HOSTS = ['*.powerplatform.com', '*.logic.azure.com'];
 
+    public function __construct(private readonly SlackClient $slack) {}
+
     public function requestSubmitted(QueryRequest $request): void
     {
         $this->postRequestCard($request);
+
+        foreach ($this->integrations($request) as $integration) {
+            if ($integration->usesSlackBot() && $integration->dm_approvers) {
+                $this->directMessageApprovers($integration, $request);
+            }
+        }
     }
 
     /**
@@ -73,6 +90,10 @@ class ChatNotifier
                 default => $this->teamsSubmittedCard($request, $token, $lead),
             };
 
+            if ($integration->usesSlackBot() && $this->postCardAsBot($integration, $request, $payload)) {
+                continue;
+            }
+
             $this->post($integration, $payload);
         }
     }
@@ -90,7 +111,41 @@ class ChatNotifier
             $request->reviewer?->name ?? 'a reviewer',
         );
 
-        $this->postText($request->team_id, $text);
+        foreach ($this->integrations($request) as $integration) {
+            // The card shows the decision itself; a follow-up message would
+            // only repeat it. Webhooks cannot update, so they get the text.
+            if (! $this->updateCard($integration, $request)) {
+                $this->postTextTo($integration, $text);
+            }
+        }
+    }
+
+    /** The approved request is picked up by a worker. Slack app only. */
+    public function requestStarted(QueryRequest $request): void
+    {
+        $this->updateCards($request, QueryRequestStatus::Running);
+    }
+
+    /** A pending or running request was cancelled. Slack app only. */
+    public function requestCancelled(QueryRequest $request): void
+    {
+        $this->updateCards($request);
+    }
+
+    /**
+     * The run ended (completed or failed): update the card and reply in its
+     * thread with the outcome. Slack app only; the webhook mode has no
+     * message to update.
+     */
+    public function requestFinished(QueryRequest $request): void
+    {
+        $this->updateCards($request);
+
+        $this->guarded('posting the Slack thread reply', $request, function () use ($request) {
+            foreach ($this->integrations($request) as $integration) {
+                $this->replyInThread($integration, $request);
+            }
+        });
     }
 
     /**
@@ -146,22 +201,43 @@ class ChatNotifier
             ->get();
 
         foreach ($integrations as $integration) {
-            $payload = match (true) {
-                $integration->provider === ChatProvider::Slack => ['text' => str_replace(['&', '<', '>'], ['&amp;', '&lt;', '&gt;'], $text)],
-                $this->usesAdaptiveCard($integration) => $this->adaptiveMessage([
-                    ['type' => 'TextBlock', 'text' => $text, 'wrap' => true],
-                ], $text),
-                default => ['type' => 'MessageCard', '@context' => 'https://schema.org/extensions', 'summary' => $text, 'text' => $text],
-            };
-
-            $this->post($integration, $payload);
+            $this->postTextTo($integration, $text);
         }
     }
 
+    /** One plain-text message to one integration, through the bot when it has one. */
+    private function postTextTo(ChatIntegration $integration, string $text): void
+    {
+        if ($integration->usesSlackBot()) {
+            try {
+                $this->slack->postMessage($integration->bot_token, $integration->slack_channel_id, ['text' => $this->slackEscape($text)]);
+
+                return;
+            } catch (SlackApiException $e) {
+                $this->botFailed($integration, $e);
+            }
+        }
+
+        $payload = match (true) {
+            $integration->provider === ChatProvider::Slack => ['text' => $this->slackEscape($text)],
+            $this->usesAdaptiveCard($integration) => $this->adaptiveMessage([
+                ['type' => 'TextBlock', 'text' => $text, 'wrap' => true],
+            ], $text),
+            default => ['type' => 'MessageCard', '@context' => 'https://schema.org/extensions', 'summary' => $text, 'text' => $text],
+        };
+
+        $this->post($integration, $payload);
+    }
+
+    private function slackEscape(string $text): string
+    {
+        return str_replace(['&', '<', '>'], ['&amp;', '&lt;', '&gt;'], $text);
+    }
+
     /**
-     * @return iterable<ChatIntegration>
+     * @return Collection<int, ChatIntegration>
      */
-    private function integrations(QueryRequest $request): iterable
+    private function integrations(QueryRequest $request): Collection
     {
         return ChatIntegration::query()
             ->where('team_id', $request->team_id)
@@ -183,6 +259,11 @@ class ChatNotifier
 
     private function post(ChatIntegration $integration, array $payload): void
     {
+        // An app-only Slack installation has no webhook to fall back to.
+        if (blank($integration->webhook_url)) {
+            return;
+        }
+
         try {
             // No redirects: an allowed host must not be able to bounce the
             // request to an internal target (SSRF via 30x).
@@ -458,5 +539,321 @@ class ChatNotifier
                 ],
             ],
         ];
+    }
+
+    /**
+     * Post the card through the bot and remember where it landed, so later
+     * status changes can update it. False when Slack refused: the caller then
+     * falls back to the webhook, if the integration has one.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    private function postCardAsBot(ChatIntegration $integration, QueryRequest $request, array $payload): bool
+    {
+        try {
+            $posted = $this->slack->postMessage($integration->bot_token, $integration->slack_channel_id, $payload);
+        } catch (SlackApiException $e) {
+            $this->botFailed($integration, $e);
+
+            return false;
+        }
+
+        if ($posted['ts'] !== '') {
+            $earlier = ['channel' => $request->slack_channel, 'ts' => $request->slack_ts];
+
+            // The newest card is the one that has working buttons: it is the
+            // one later status changes update.
+            $request->forceFill(['slack_channel' => $posted['channel'], 'slack_ts' => $posted['ts']])->saveQuietly();
+
+            $this->retireEarlierCard($integration, $request, $earlier);
+        }
+
+        return true;
+    }
+
+    /**
+     * A reminder or a renewed card is posted as a new message. The one before
+     * it would keep its buttons and a stale status for good, because only the
+     * newest message is updated from now on: take its buttons away and point
+     * to the new one. Best effort.
+     *
+     * @param  array{channel: string|null, ts: string|null}  $earlier
+     */
+    private function retireEarlierCard(ChatIntegration $integration, QueryRequest $request, array $earlier): void
+    {
+        if (blank($earlier['channel']) || blank($earlier['ts']) || $earlier['ts'] === $request->slack_ts) {
+            return;
+        }
+
+        try {
+            $this->slack->updateMessage(
+                $integration->bot_token,
+                $earlier['channel'],
+                $earlier['ts'],
+                $this->slackStatusMessage($request, QueryRequestStatus::Pending, '🔄', 'Moved: use the newer message for this request.'),
+            );
+        } catch (SlackApiException $e) {
+            $this->botFailed($integration, $e);
+        }
+    }
+
+    /** Update the card of the request on every Slack app integration of its team. */
+    private function updateCards(QueryRequest $request, ?QueryRequestStatus $as = null): void
+    {
+        $this->guarded('updating the Slack card', $request, function () use ($request, $as) {
+            foreach ($this->integrations($request) as $integration) {
+                $this->updateCard($integration, $request, $as);
+            }
+        });
+    }
+
+    /**
+     * chat.update on the stored message of the request. False when this
+     * integration cannot (webhook mode, no stored message) or Slack refused.
+     */
+    private function updateCard(ChatIntegration $integration, QueryRequest $request, ?QueryRequestStatus $as = null): bool
+    {
+        if (! $this->canUpdateCard($integration, $request)) {
+            return false;
+        }
+
+        try {
+            $this->slack->updateMessage(
+                $integration->bot_token,
+                $request->slack_channel,
+                $request->slack_ts,
+                $this->slackStatusMessage($request, $as ?? $request->status),
+            );
+
+            return true;
+        } catch (SlackApiException $e) {
+            $this->botFailed($integration, $e);
+
+            return false;
+        }
+    }
+
+    private function canUpdateCard(ChatIntegration $integration, QueryRequest $request): bool
+    {
+        return $integration->provider === ChatProvider::Slack
+            && filled($integration->bot_token)
+            && filled($request->slack_channel)
+            && filled($request->slack_ts);
+    }
+
+    /**
+     * The card after a status change: the buttons are gone, the status is
+     * stated. The SQL preview follows the same chat_include_sql mode as the
+     * original card.
+     *
+     * @return array<string, mixed>
+     */
+    private function slackStatusMessage(QueryRequest $request, QueryRequestStatus $status, ?string $emojiOverride = null, ?string $summaryOverride = null): array
+    {
+        [$emoji, $summary] = $this->statusSummary($request, $status);
+        $emoji = $emojiOverride ?? $emoji;
+        $summary = $summaryOverride ?? $summary;
+
+        return [
+            'text' => sprintf('Query request #%d: %s', $request->id, $summary),
+            'blocks' => [
+                [
+                    'type' => 'section',
+                    'text' => [
+                        'type' => 'mrkdwn',
+                        'text' => $this->slackEscape(sprintf(
+                            "*%s request #%d*%s\n*Requester:* %s\n*Connection:* %s%s",
+                            strtoupper($request->type->value),
+                            $request->id,
+                            $request->is_ddl ? ' · *DDL*' : '',
+                            $request->requester->name,
+                            $request->connection->name,
+                            $request->title ? "\n*Title:* {$request->title}" : '',
+                        )),
+                    ],
+                ],
+                [
+                    'type' => 'section',
+                    'text' => ['type' => 'mrkdwn', 'text' => '```'.$this->slackEscape($this->sqlPreview($request)).'```'],
+                ],
+                [
+                    'type' => 'context',
+                    'elements' => [['type' => 'mrkdwn', 'text' => $emoji.' '.$this->slackEscape($summary)]],
+                ],
+                [
+                    'type' => 'actions',
+                    'elements' => [[
+                        'type' => 'button',
+                        'text' => ['type' => 'plain_text', 'text' => 'Open in QueryProxy'],
+                        'action_id' => 'queryproxy_open',
+                        'url' => route('requests.show', $request),
+                    ]],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * @return array{0: string, 1: string} emoji and the status sentence
+     */
+    private function statusSummary(QueryRequest $request, QueryRequestStatus $status): array
+    {
+        $reviewer = $request->reviewer?->name ?? 'a reviewer';
+
+        return match ($status) {
+            QueryRequestStatus::Pending => ['⏳', 'Waiting for review.'],
+            QueryRequestStatus::Approved, QueryRequestStatus::Queued => ['✅', "Approved by {$reviewer} — queued for execution."],
+            QueryRequestStatus::Rejected => ['⛔', "Rejected by {$reviewer}."],
+            QueryRequestStatus::Cancelled => ['🚫', 'Cancelled.'],
+            QueryRequestStatus::Running => ['⚙️', 'Running.'],
+            QueryRequestStatus::Completed => ['✅', 'Completed.'],
+            QueryRequestStatus::Failed => ['❌', 'Execution failed.'],
+        };
+    }
+
+    /**
+     * The outcome in the thread of the card: status, row count, duration and
+     * the web link. Never SQL text, result data or the error message.
+     */
+    private function replyInThread(ChatIntegration $integration, QueryRequest $request): void
+    {
+        if (! $this->canUpdateCard($integration, $request)
+            || ! in_array($request->status, [QueryRequestStatus::Completed, QueryRequestStatus::Failed], true)) {
+            return;
+        }
+
+        $completed = $request->status === QueryRequestStatus::Completed;
+        $rows = $completed ? ($request->result_row_count ?? $request->affected_rows) : null;
+
+        $parts = [$completed ? '✅ Completed' : '❌ Failed'];
+
+        if ($rows !== null) {
+            $parts[] = number_format((int) $rows).' '.((int) $rows === 1 ? 'row' : 'rows');
+        }
+
+        if ($request->duration_ms !== null) {
+            $parts[] = $request->duration_ms < 1000
+                ? $request->duration_ms.' ms'
+                : number_format($request->duration_ms / 1000, 1).' s';
+        }
+
+        $parts[] = sprintf('<%s|Open in QueryProxy>', route('requests.show', $request));
+
+        $this->guarded('posting the Slack thread reply', $request, function () use ($integration, $request, $parts) {
+            try {
+                $this->slack->postMessage(
+                    $integration->bot_token,
+                    $request->slack_channel,
+                    ['text' => implode(' · ', $parts)],
+                    $request->slack_ts,
+                );
+            } catch (SlackApiException $e) {
+                $this->botFailed($integration, $e);
+            }
+        });
+    }
+
+    /**
+     * Direct message to the team's DBAs who have a Slack identity (the opt-in
+     * of the integration). Text and a link only: the decision is taken on the
+     * channel card or in the web UI.
+     */
+    private function directMessageApprovers(ChatIntegration $integration, QueryRequest $request): void
+    {
+        $this->guarded('sending Slack direct messages', $request, function () use ($integration, $request) {
+            $approverIds = $request->team->users()
+                ->wherePivot('role', TeamRole::Dba->value)
+                ->where('users.id', '!=', $request->user_id)
+                ->whereNull('users.suspended_at')
+                ->pluck('users.id');
+
+            $slackIds = ChatIdentity::query()
+                ->where('provider', ChatProvider::Slack->value)
+                ->whereIn('user_id', $approverIds)
+                ->pluck('external_id');
+
+            $text = sprintf(
+                '🔔 New %s request #%d%s from %s on %s needs your review.',
+                strtoupper($request->type->value),
+                $request->id,
+                $request->is_ddl ? ' (DDL)' : '',
+                $request->requester->name,
+                $request->connection->name,
+            );
+
+            $message = [
+                'text' => $this->slackEscape($text),
+                'blocks' => [
+                    ['type' => 'section', 'text' => ['type' => 'mrkdwn', 'text' => $this->slackEscape($text)]],
+                    [
+                        'type' => 'actions',
+                        'elements' => [[
+                            'type' => 'button',
+                            'text' => ['type' => 'plain_text', 'text' => 'Review in QueryProxy'],
+                            'action_id' => 'queryproxy_open',
+                            'url' => route('requests.show', $request),
+                        ]],
+                    ],
+                ],
+            ];
+
+            foreach ($slackIds as $slackId) {
+                try {
+                    // Posting to a member id opens (or reuses) the direct message.
+                    $this->slack->postMessage($integration->bot_token, $slackId, $message);
+                } catch (SlackApiException $e) {
+                    $this->botFailed($integration, $e);
+
+                    // One member outside this workspace must not stop the rest;
+                    // a dead token does.
+                    if ($e->isDeadToken()) {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * A Slack call failed. A token Slack no longer accepts ends the
+     * installation (the webhook mode, if any, goes on); everything else is
+     * logged and the notification is lost, as for the webhook.
+     */
+    private function botFailed(ChatIntegration $integration, SlackApiException $e): void
+    {
+        Log::warning('QueryProxy: Slack app call failed', [
+            'team_id' => $integration->team_id,
+            'method' => $e->method,
+            'error' => $e->slackError,
+        ]);
+
+        if (! $e->isDeadToken()) {
+            return;
+        }
+
+        $workspace = $integration->slack_team_id;
+
+        $integration->clearSlackInstallation();
+
+        audit()->record(AuditEvent::SlackUninstalled, team: $integration->team, metadata: [
+            'slack_team_id' => $workspace,
+            'reason' => 'token_rejected',
+        ], system: true);
+    }
+
+    /**
+     * Lifecycle notifications run inside the approval and execution paths:
+     * whatever goes wrong here is logged and goes no further.
+     */
+    private function guarded(string $what, QueryRequest $request, callable $work): void
+    {
+        try {
+            $work();
+        } catch (Throwable $e) {
+            Log::warning("QueryProxy: {$what} failed", [
+                'query_request_id' => $request->id,
+                'exception' => $e::class,
+            ]);
+        }
     }
 }

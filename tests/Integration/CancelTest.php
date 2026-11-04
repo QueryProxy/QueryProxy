@@ -44,15 +44,15 @@ afterEach(function () {
 });
 
 /** Wait until the server no longer has session $id, up to $seconds. */
-function itWaitForSessionGone(IntegrationTarget $it, int $id, float $seconds = 5): bool
+function itWaitForSessionGone(IntegrationTarget $it, int $id, float $seconds = 5, ?string $token = null): bool
 {
     $deadline = microtime(true) + $seconds;
 
-    while ($it->sessionExists($id) && microtime(true) < $deadline) {
+    while ($it->sessionExists($id, $token) && microtime(true) < $deadline) {
         usleep(100_000);
     }
 
-    return ! $it->sessionExists($id);
+    return ! $it->sessionExists($id, $token);
 }
 
 test('the session id and stamp read by the app are the ones the server reports', function () {
@@ -62,10 +62,13 @@ test('the session id and stamp read by the app are the ones the server reports',
     $session = app(BackendCanceller::class)->identify($db, IntegrationTarget::driver());
 
     $expected = match (IntegrationTarget::driver()) {
-        DbDriver::Pgsql => [
-            (int) $pdo->query('SELECT pg_backend_pid()')->fetchColumn(),
-            (string) $pdo->query('SELECT backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()')->fetchColumn(),
-        ],
+        // CockroachDB has no pg_stat_activity rows; the app keeps the session_id as the stamp.
+        DbDriver::Pgsql => IntegrationTarget::isCockroach()
+            ? [(int) $pdo->query('SELECT pg_backend_pid()')->fetchColumn(), 'crdb:'.$pdo->query('SHOW session_id')->fetchColumn()]
+            : [
+                (int) $pdo->query('SELECT pg_backend_pid()')->fetchColumn(),
+                (string) $pdo->query('SELECT backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()')->fetchColumn(),
+            ],
         DbDriver::Sqlsrv => [
             (int) $pdo->query('SELECT @@SPID')->fetchColumn(),
             (string) $pdo->query('SELECT CONVERT(varchar(30), login_time, 121) FROM sys.dm_exec_sessions WHERE session_id = @@SPID')->fetchColumn(),
@@ -90,10 +93,14 @@ test('a session id that now belongs to a different session is left alone, the ri
     $connection = $this->it->connection();
     $canceller = app(BackendCanceller::class);
 
-    $wrongStamp = $driver === DbDriver::Pgsql ? '2001-01-01 00:00:00.000000+00' : '2001-01-01 00:00:00.000';
+    $wrongStamp = match (true) {
+        IntegrationTarget::isCockroach() => 'crdb:'.str_repeat('0', 32),
+        $driver === DbDriver::Pgsql => '2001-01-01 00:00:00.000000+00',
+        default => '2001-01-01 00:00:00.000',
+    };
 
     expect($canceller->cancel($connection, $session['pid'], $wrongStamp))->toBeFalse()
-        ->and($this->it->sessionExists($session['pid']))->toBeTrue()
+        ->and($this->it->sessionExists($session['pid'], $session['token']))->toBeTrue()
         ->and($canceller->cancel($connection, $session['pid'], $session['token']))->toBeTrue();
 
     if ($driver === DbDriver::Sqlsrv) {
@@ -148,6 +155,10 @@ test('a login that reads dates day-first still matches the stamp and stops the s
 });
 
 test('Stop ends a long read within 5 seconds and the request ends cancelled', function () {
+    if (IntegrationTarget::isCockroach()) {
+        $this->markTestSkipped('CockroachDB runs the query of a DECLARE CURSOR to completion before the first FETCH and ignores CANCEL QUERIES / CANCEL SESSION meanwhile, so a long read is not interrupted by Stop; the statement timeout ends it (next test). docs/compatibility.md.');
+    }
+
     $request = $this->it->request($this->it->connection(), $this->it->heavyRead());
     $executor = $this->it->startExecutor($request);
 
@@ -158,6 +169,7 @@ test('Stop ends a long read within 5 seconds and the request ends cancelled', fu
 
         $running = QueryRequest::findOrFail($request->id);
         $pid = (int) $running->backend_pid;
+        $stamp = $running->backend_session;
         $started = microtime(true);
 
         expect(app(ApprovalService::class)->stop($running, $this->it->owner))->toBeTrue();
@@ -176,7 +188,48 @@ test('Stop ends a long read within 5 seconds and the request ends cancelled', fu
             ->and(AuditLog::where('query_request_id', $request->id)->whereIn('action', ['request.execution_failed', 'execution.late_completion'])->exists())->toBeFalse()
             ->and(AuditLog::where('query_request_id', $request->id)->where('action', 'execution.cancelled')->sole()->metadata['signalled'])->toBeTrue()
             // The statement is gone from the server.
-            ->and($this->it->statementRunning($pid))->toBeFalse();
+            ->and($this->it->statementRunning($pid, $stamp))->toBeFalse();
+    } finally {
+        if ($executor->isRunning()) {
+            $executor->stop(1);
+        }
+    }
+});
+
+// CockroachDB only: what Stop does for a read there. The request is cancelled
+// at once (that is the application's own state change), the statement itself
+// runs on until the statement timeout cuts it, and nothing is stored.
+test('CockroachDB: Stop marks a long read cancelled and the statement timeout ends the statement', function () {
+    if (! IntegrationTarget::isCockroach()) {
+        $this->markTestSkipped('CockroachDB only.');
+    }
+
+    $request = $this->it->request($this->it->connection(), $this->it->heavyRead());
+    // Statement timeout = 12 - 5 = 7 seconds.
+    $executor = $this->it->startExecutor($request, ['QUERYPROXY_EXECUTION_TIMEOUT' => '12']);
+
+    try {
+        expect($this->it->waitUntilRunning($request, $executor))->toBeTrue($executor->getOutput().$executor->getErrorOutput());
+
+        usleep(1_000_000);
+
+        $running = QueryRequest::findOrFail($request->id);
+        $stamp = $running->backend_session;
+
+        expect(app(ApprovalService::class)->stop($running, $this->it->owner))->toBeTrue();
+
+        // The request is cancelled before the server has stopped anything.
+        expect($request->fresh()->status)->toBe(QueryRequestStatus::Cancelled);
+
+        expect(IntegrationTarget::waitForExit($executor, 20))->toBeTrue('the statement timeout did not end the statement')
+            ->and($executor->getExitCode())->toBe(0, $executor->getOutput().$executor->getErrorOutput());
+
+        $request->refresh();
+
+        expect($request->status)->toBe(QueryRequestStatus::Cancelled)
+            ->and($request->error_message)->toBeNull()
+            ->and($request->result_path)->toBeNull()
+            ->and($this->it->statementRunning(0, $stamp))->toBeFalse();
     } finally {
         if ($executor->isRunning()) {
             $executor->stop(1);
@@ -207,6 +260,57 @@ test('Stop ends a long write within 5 seconds and nothing it was going to store 
         expect($request->status)->toBe(QueryRequestStatus::Cancelled)
             ->and($request->error_message)->toBeNull()
             ->and(AuditLog::where('query_request_id', $request->id)->whereIn('action', ['request.execution_failed', 'execution.late_completion'])->exists())->toBeFalse()
+            ->and($this->it->sinkCount())->toBe(0);
+    } finally {
+        if ($executor->isRunning()) {
+            $executor->stop(1);
+        }
+    }
+});
+
+// CockroachDB only: the Stop statements (SHOW CLUSTER SESSIONS, CANCEL QUERIES)
+// are looked at through the login's own privileges, and production logins are
+// not administrators. Every other CockroachDB test runs as the administrator,
+// so this one runs a write as a login that is not (CREATE ROLE ... LOGIN, with
+// SELECT on the fixtures and INSERT on the sink only).
+test('CockroachDB: Stop ends a long write run by a login without the admin role', function () {
+    if (! IntegrationTarget::isCockroach()) {
+        $this->markTestSkipped('CockroachDB only.');
+    }
+
+    $login = $this->it->reader();
+    $admin = $this->it->admin();
+    $admin->statement('GRANT INSERT ON '.$this->it->table('sink').' TO '.$login['username']);
+
+    expect((int) $admin->scalar("SELECT count(*) FROM system.role_members WHERE role = 'admin' AND member = ?", [$login['username']]))
+        ->toBe(0, 'the login must not be an administrator for this test to prove anything');
+
+    $request = $this->it->request(
+        $this->it->connection(['username' => $login['username'], 'password' => $login['password']]),
+        $this->it->heavyWrite(),
+        'write',
+    );
+    $executor = $this->it->startExecutor($request);
+
+    try {
+        expect($this->it->waitUntilRunning($request, $executor))->toBeTrue($executor->getOutput().$executor->getErrorOutput());
+
+        usleep(1_000_000);
+
+        $running = QueryRequest::findOrFail($request->id);
+        $started = microtime(true);
+
+        expect($running->backend_session)->toStartWith('crdb:')
+            ->and(app(ApprovalService::class)->stop($running, $this->it->owner))->toBeTrue();
+
+        expect(IntegrationTarget::waitForExit($executor, 5))->toBeTrue()
+            ->and(microtime(true) - $started)->toBeLessThan(5.0)
+            ->and($executor->getExitCode())->toBe(0, $executor->getOutput().$executor->getErrorOutput());
+
+        $request->refresh();
+
+        expect($request->status)->toBe(QueryRequestStatus::Cancelled)
+            ->and($request->error_message)->toBeNull()
             ->and($this->it->sinkCount())->toBe(0);
     } finally {
         if ($executor->isRunning()) {

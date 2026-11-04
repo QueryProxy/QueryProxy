@@ -25,11 +25,24 @@ class OidcController extends Controller
     /** Session key of the attempt in progress. */
     public const FLOW_KEY = 'oidc.flow';
 
+    /**
+     * Where a confirmation may send the user back to: a fixed list of screens
+     * by key, never a URL taken from the request (no open redirect). Without a
+     * key the user returns to the API tokens section of the profile.
+     */
+    public const REAUTH_RETURNS = ['scim' => 'settings.scim'];
+
     /** Session flag set when the session was opened through SSO (see RequireTwoFactor). */
     public const SESSION_FLAG = 'auth.via_oidc';
 
     /** Session key of the time (Unix seconds) the session was last opened through SSO (ADR-024). */
     public const SESSION_AT_KEY = 'auth.via_oidc_at';
+
+    /**
+     * Session key of the raw ID token of the SSO sign-in, kept only as the
+     * `id_token_hint` of RP-initiated logout. Never logged, never audited.
+     */
+    public const SESSION_ID_TOKEN_KEY = 'auth.oidc_id_token';
 
     /** How far the provider's clock may trail ours when `auth_time` is compared with the start of a confirmation. */
     private const REAUTH_CLOCK_SKEW_SECONDS = 30;
@@ -77,15 +90,32 @@ class OidcController extends Controller
             'reauth_user_id' => $request->user()->id,
         ];
 
+        // Only a system admin has the SCIM screen; anything else, or an unknown key, means the profile.
+        $returnKey = $request->query('return');
+
+        if (is_string($returnKey) && isset(self::REAUTH_RETURNS[$returnKey]) && $request->user()->isAdmin()) {
+            $flow['return'] = $returnKey;
+        }
+
         try {
             $url = $oidc->authorizationUrl($flow['state'], $flow['nonce'], $flow['verifier'], route('oidc.callback'), forceLogin: true);
         } catch (OidcException $e) {
-            return redirect()->route('profile')->withErrors(['sso' => $e->userMessage()]);
+            return redirect()->to($this->reauthTarget($flow))->withErrors(['sso' => $e->userMessage()]);
         }
 
         $request->session()->put(self::FLOW_KEY, $flow);
 
         return redirect()->away($url);
+    }
+
+    /** The screen a confirmation returns to, from the flow that started it. */
+    private function reauthTarget(mixed $flow): string
+    {
+        $key = is_array($flow) ? ($flow['return'] ?? null) : null;
+
+        return is_string($key) && isset(self::REAUTH_RETURNS[$key])
+            ? route(self::REAUTH_RETURNS[$key])
+            : route('profile').'#api-tokens';
     }
 
     public function callback(
@@ -108,8 +138,10 @@ class OidcController extends Controller
         // One attempt, one callback: whatever happens next, it cannot be replayed.
         $flow = $request->session()->pull(self::FLOW_KEY);
 
+        $idToken = null;
+
         try {
-            $claims = $this->completeFlow($request, $oidc, $flow);
+            $claims = $this->completeFlow($request, $oidc, $flow, $idToken);
 
             $issuer = (string) $claims['iss'];
 
@@ -143,7 +175,7 @@ class OidcController extends Controller
 
             $roleSync->sync($user, $groups);
         } catch (OidcException $e) {
-            return $this->refuse($e);
+            return $this->refuse($e, $this->reauthTarget($pending));
         }
 
         Auth::login($user);
@@ -151,13 +183,17 @@ class OidcController extends Controller
         $request->session()->put(self::SESSION_FLAG, true);
         $request->session()->put(self::SESSION_AT_KEY, now()->getTimestamp());
 
+        if ($idToken !== null) {
+            $request->session()->put(self::SESSION_ID_TOKEN_KEY, $idToken);
+        }
+
         audit()->record(AuditEvent::AuthSsoLogin, metadata: [
             'issuer' => $issuer,
             'groups_claim_present' => $claimPresent,
         ]);
 
         if ($reauthFor !== null) {
-            return redirect()->to(route('profile').'#api-tokens');
+            return redirect()->to($this->reauthTarget($pending));
         }
 
         return redirect()->intended(route('dashboard'));
@@ -201,7 +237,7 @@ class OidcController extends Controller
      *
      * @throws OidcException
      */
-    private function completeFlow(Request $request, OidcClient $oidc, mixed $flow): array
+    private function completeFlow(Request $request, OidcClient $oidc, mixed $flow, ?string &$idToken): array
     {
         if (! is_array($flow) || ! isset($flow['state'], $flow['nonce'], $flow['verifier'], $flow['started_at'])) {
             throw new OidcException('The callback has no sign-in attempt in progress.');
@@ -232,16 +268,17 @@ class OidcController extends Controller
             $flow['nonce'],
             route('oidc.callback'),
             (string) config('queryproxy.oidc.group_claim'),
+            $idToken,
         );
     }
 
-    private function refuse(OidcException $e): RedirectResponse
+    private function refuse(OidcException $e, ?string $signedInTarget = null): RedirectResponse
     {
         Log::warning('OIDC sign-in refused: '.$e->getMessage());
 
         // A refused confirmation leaves the user signed in where they were.
         if (Auth::check()) {
-            return redirect()->to(route('profile').'#api-tokens')->withErrors(['sso' => $e->userMessage()]);
+            return redirect()->to($signedInTarget ?? route('profile').'#api-tokens')->withErrors(['sso' => $e->userMessage()]);
         }
 
         return redirect()->route('login')->withErrors(['sso' => $e->userMessage()]);

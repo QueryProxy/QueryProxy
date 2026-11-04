@@ -23,6 +23,7 @@
  *   QUERYPROXY_IT_OIDC_REQUIRED       1 = fail instead of skip when Keycloak is not there
  */
 
+use App\Http\Controllers\Auth\OidcController;
 use App\Models\AuditLog;
 use App\Models\Team;
 use App\Models\User;
@@ -118,6 +119,20 @@ final class KeycloakBrowser
         return $this->send(fn ($request) => $request->asForm()->post($url, $form));
     }
 
+    /** @return array<string, string> the cookies held, to be replayed by another browser later */
+    public function cookies(): array
+    {
+        return $this->cookies;
+    }
+
+    /** @param array<string, string> $cookies */
+    public function withCookies(array $cookies): static
+    {
+        $this->cookies = $cookies;
+
+        return $this;
+    }
+
     /** What went wrong in a page that was not what we expected: no cookie values, no secrets. */
     public function describe(Response $response): string
     {
@@ -180,16 +195,16 @@ final class KeycloakBrowser
 /**
  * One complete browser sign-in as alice: the redirect the application gives,
  * Keycloak's login form, the credentials, and the callback back to the
- * application. A fresh browser every time, so Keycloak always shows its form.
+ * application. A fresh browser unless one is passed in, so Keycloak shows its form.
  */
-function keycloakSignIn(): TestResponse
+function keycloakSignIn(?KeycloakBrowser $browser = null): TestResponse
 {
     $redirect = test()->get(route('oidc.redirect'))->assertRedirect();
     $authorizationUrl = $redirect->headers->get('Location');
 
     expect($authorizationUrl)->toStartWith(keycloakIssuer().'/protocol/openid-connect/auth');
 
-    $browser = new KeycloakBrowser;
+    $browser ??= new KeycloakBrowser;
 
     $page = $browser->get($authorizationUrl);
     test()->assertSame(200, $page->status(), 'Keycloak did not show its login page. '.$browser->describe($page));
@@ -299,4 +314,89 @@ test('a move between groups changes the role instead of adding a second one', fu
 
     expect($alice->fresh()->roleIn($payments)?->value)->toBe('dba')
         ->and($payments->users()->count())->toBe(1);
+});
+
+/**
+ * Registers the application's login page as a post-logout redirect URI of the
+ * client through Keycloak's admin API, so the test does not lean on a default
+ * of the realm import. Returns the attributes to put back.
+ *
+ * @return array<string, string>
+ */
+function keycloakAllowPostLogoutRedirect(string $uri): array
+{
+    $admin = Http::withToken(keycloakAdminToken())->acceptJson();
+    $realm = keycloakBase().'/admin/realms/queryproxy';
+
+    $client = $admin->get($realm.'/clients', ['clientId' => 'queryproxy'])->json('0');
+    expect($client)->toBeArray();
+
+    $original = $client['attributes'] ?? [];
+    $response = $admin->put($realm.'/clients/'.$client['id'], ['attributes' => array_merge($original, ['post.logout.redirect.uris' => $uri])]);
+
+    test()->assertTrue($response->successful(), 'Changing the client failed (HTTP '.$response->status().').');
+
+    return $original;
+}
+
+function keycloakRestoreClientAttributes(array $original): void
+{
+    $admin = Http::withToken(keycloakAdminToken())->acceptJson();
+    $realm = keycloakBase().'/admin/realms/queryproxy';
+
+    $clientId = $admin->get($realm.'/clients', ['clientId' => 'queryproxy'])->json('0.id');
+
+    // The original value goes back as it was; when there was none, an empty value removes the attribute.
+    $response = $admin->put($realm.'/clients/'.$clientId, ['attributes' => array_merge($original, [
+        'post.logout.redirect.uris' => $original['post.logout.redirect.uris'] ?? '',
+    ])]);
+
+    test()->assertTrue($response->successful(), 'Restoring the client failed (HTTP '.$response->status().').');
+}
+
+test('logging out ends the Keycloak session: the id_token_hint is sent and a replayed session cookie no longer signs in', function () {
+    keycloakSetMembership('platform-dba', true);
+    Team::factory()->create(['name' => 'Payments', 'slug' => 'payments']);
+
+    $original = keycloakAllowPostLogoutRedirect(route('login'));
+
+    try {
+        $browser = new KeycloakBrowser;
+        keycloakSignIn($browser)->assertRedirect(route('dashboard'));
+
+        $idToken = session(OidcController::SESSION_ID_TOKEN_KEY);
+        expect($idToken)->toBeString()->not->toBe('');
+
+        // What the browser holds while the Keycloak session is alive.
+        $liveCookies = $browser->cookies();
+
+        $location = test()->post('/logout')->assertRedirect()->headers->get('Location');
+
+        expect($location)->toStartWith(keycloakIssuer().'/protocol/openid-connect/logout?')
+            ->and(Auth::check())->toBeFalse();
+
+        parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+        expect($query['id_token_hint'])->toBe($idToken)
+            ->and($query['client_id'])->toBe('queryproxy')
+            ->and($query['post_logout_redirect_uri'])->toBe(route('login'));
+
+        // A valid id_token_hint and a registered return address: Keycloak ends
+        // the session and redirects back without asking.
+        $response = $browser->get($location);
+        test()->assertSame(302, $response->status(), 'Keycloak did not redirect after logout. '.$browser->describe($response));
+        expect($response->header('Location'))->toBe(route('login'));
+
+        // Proof that the session at Keycloak is gone, not merely that its cookies
+        // were cleared in this browser: a new sign-in attempt that replays the
+        // cookies of the live session must be shown the login form. With the
+        // session alive, Keycloak would answer 302 to the callback with a code.
+        $replay = (new KeycloakBrowser)->withCookies($liveCookies);
+        $authorizationUrl = test()->get(route('oidc.redirect'))->assertRedirect()->headers->get('Location');
+        $page = $replay->get($authorizationUrl);
+
+        test()->assertSame(200, $page->status(), 'Keycloak did not ask for a login after logout; the session at the provider is still alive. '.$replay->describe($page));
+        test()->assertSame(1, preg_match('/\bid="kc-form-login"/', $page->body()), 'No login form after logout. '.$replay->describe($page));
+    } finally {
+        keycloakRestoreClientAttributes($original);
+    }
 });

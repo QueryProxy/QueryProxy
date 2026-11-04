@@ -28,6 +28,11 @@ use WeakMap;
  * The READ ONLY transaction is always opened through Laravel's
  * beginTransaction(): a connection inside a transaction is never silently
  * re-established and re-run (a fresh session would be writable).
+ *
+ * CockroachDB (reached through the pgsql driver) commits the open transaction
+ * before a DDL statement (autocommit_before_ddl), exactly like MySQL's
+ * implicit commit, so there the read-only setting is also made session-wide
+ * (default_transaction_read_only). YugabyteDB behaves like PostgreSQL here.
  */
 class TargetSession
 {
@@ -98,21 +103,27 @@ class TargetSession
      * per request and purged afterwards. Behind a transaction-pooling proxy
      * (pgbouncer) a session-level SET may not stay on the same backend.
      *
+     * $statementSeconds replaces the derived statement timeout for a session
+     * that must stay much shorter than a query run, such as the schema read.
+     *
      * @return list<string>
      */
-    public function limitStatements(DbDriver $driver, bool $transactional): array
+    public function limitStatements(DbDriver $driver, bool $transactional, ?int $statementSeconds = null): array
     {
-        $statementMs = $this->statementTimeoutSeconds() * 1000;
+        // An idle transaction may outlive a normal run's statements up to the
+        // execution timeout, but never a session with its own short limit.
+        $idleMs = ($statementSeconds !== null ? max(1, $statementSeconds) : $this->executionTimeoutSeconds()) * 1000;
+        $statementSeconds = $statementSeconds !== null ? max(1, $statementSeconds) : $this->statementTimeoutSeconds();
+        $statementMs = $statementSeconds * 1000;
         $lockMs = $this->lockTimeoutSeconds() * 1000;
         $lockSeconds = $this->lockTimeoutSeconds();
-        $statementSeconds = $this->statementTimeoutSeconds();
 
         return match ($driver) {
             DbDriver::Pgsql => $transactional
                 ? [
                     "SET LOCAL statement_timeout = {$statementMs}",
                     "SET LOCAL lock_timeout = {$lockMs}",
-                    'SET LOCAL idle_in_transaction_session_timeout = '.($this->executionTimeoutSeconds() * 1000),
+                    "SET LOCAL idle_in_transaction_session_timeout = {$idleMs}",
                 ]
                 : [
                     "SET statement_timeout = {$statementMs}",
@@ -133,9 +144,9 @@ class TargetSession
         };
     }
 
-    public function applyLimits(DatabaseConnection $db, DbDriver $driver, bool $transactional): void
+    public function applyLimits(DatabaseConnection $db, DbDriver $driver, bool $transactional, ?int $statementSeconds = null): void
     {
-        $statements = $this->limitStatements($driver, $transactional);
+        $statements = $this->limitStatements($driver, $transactional, $statementSeconds);
 
         // Outside a transaction Laravel re-runs only the statement that hit a
         // lost connection, on the new session; the ones before it stay on the
@@ -161,20 +172,41 @@ class TargetSession
     /**
      * Put the session into read-only mode and, where the engine has one, open
      * the READ ONLY transaction the read runs in. Pair with endReadOnly().
+     *
+     * $statementSeconds overrides the statement timeout for this session only
+     * (the schema read uses its own, shorter one).
      */
-    public function beginReadOnly(DatabaseConnection $db, DbDriver $driver): void
+    public function beginReadOnly(DatabaseConnection $db, DbDriver $driver, ?int $statementSeconds = null): void
     {
         switch ($driver) {
             case DbDriver::Pgsql:
+                // Before the transaction opens: the session-wide setting has to
+                // be there when a DDL statement commits the transaction away.
+                // If beginTransaction() had to reconnect, the new session never
+                // saw it: fail closed, as on MySQL below.
+                $cockroach = $this->isCockroach($db);
+                $pdo = $db->getPdo();
+
+                if ($cockroach) {
+                    $db->unprepared('SET default_transaction_read_only = on');
+                }
+
                 $db->beginTransaction();
+
+                if ($cockroach && $db->getPdo() !== $pdo) {
+                    $db->rollBack();
+
+                    throw new RuntimeException('The database connection was re-established while opening the read-only transaction; refusing to run the read on a writable session.');
+                }
+
                 $db->unprepared('SET TRANSACTION READ ONLY');
-                $this->applyLimits($db, $driver, true);
+                $this->applyLimits($db, $driver, true, $statementSeconds);
 
                 break;
 
             case DbDriver::Mysql:
             case DbDriver::Mariadb:
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
 
                 // Session-wide, not "SET TRANSACTION READ ONLY": that form
                 // covers only the next transaction, and MySQL ends the open
@@ -201,17 +233,40 @@ class TargetSession
                 break;
 
             case DbDriver::Sqlite:
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
                 $db->unprepared('PRAGMA query_only = ON');
 
                 break;
 
             case DbDriver::Sqlsrv:
                 // No engine-level read-only mode; the read user is the protection.
-                $this->applyLimits($db, $driver, false);
+                $this->applyLimits($db, $driver, false, $statementSeconds);
+
+                // The query timeout is a driver attribute fixed when the
+                // connection opened, so a shorter one is set on the open PDO.
+                if ($statementSeconds !== null) {
+                    $db->getPdo()->setAttribute(self::sqlsrvQueryTimeoutAttribute(), max(1, $statementSeconds));
+                }
 
                 break;
         }
+    }
+
+    /**
+     * Whether the server behind a pgsql connection is CockroachDB, asked of
+     * the server itself with version() (one round trip per read request, the
+     * same test BackendCanceller applies). The server_version the driver
+     * reports is deliberately not used as a shortcut: if its format ever
+     * changed, or a proxy rewrote it, CockroachDB would go unrecognised and
+     * the read-only guarantee would be dropped without notice.
+     */
+    private function isCockroach(DatabaseConnection $db): bool
+    {
+        if ($db->getPdo()->getAttribute(PDO::ATTR_DRIVER_NAME) !== 'pgsql') {
+            return false;
+        }
+
+        return str_starts_with((string) $db->scalar('SELECT version()'), 'CockroachDB');
     }
 
     public function endReadOnly(DatabaseConnection $db, bool $commit): void

@@ -4,9 +4,13 @@ namespace App\Livewire\Admin;
 
 use App\Models\QueryRequest;
 use App\Models\Team;
+use App\Services\Secrets\SecretReference;
+use App\Services\Secrets\TeamSecretPrefixes;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
 use Livewire\Attributes\Title;
 use Livewire\Component;
 
@@ -14,6 +18,11 @@ use Livewire\Component;
 class Teams extends Component
 {
     public string $name = '';
+
+    /** The team whose secret reference prefixes are open (ADR-028 amendment). */
+    public ?int $prefixesForId = null;
+
+    public string $newPrefix = '';
 
     /**
      * Route middleware only guards the initial page load; every action must
@@ -88,10 +97,93 @@ class Teams extends Component
         }, attempts: 3);
     }
 
+    public function togglePrefixes(int $teamId): void
+    {
+        $this->assertAdmin();
+
+        $this->prefixesForId = $this->prefixesForId === $teamId ? null : $teamId;
+        $this->reset('newPrefix');
+        $this->resetErrorBag();
+    }
+
+    /**
+     * Allow a team to reference secrets under a prefix. The prefix is
+     * validated and stored by TeamSecretPrefixes (which audits the change).
+     */
+    public function addPrefix(int $teamId, TeamSecretPrefixes $prefixes): void
+    {
+        $this->assertAdmin();
+
+        $team = Team::findOrFail($teamId);
+
+        $this->resetErrorBag();
+
+        if (trim($this->newPrefix) === '') {
+            $this->addError('newPrefix', 'Enter a prefix, for example vault://secret/teams/payments.');
+
+            return;
+        }
+
+        try {
+            $prefixes->set($team, [...$team->secretReferencePrefixes(), $this->newPrefix], auth()->user());
+        } catch (ValidationException $e) {
+            $this->addError('newPrefix', $e->errors()['secret_reference_prefixes'][0] ?? 'This prefix is not valid.');
+
+            return;
+        }
+
+        $this->reset('newPrefix');
+    }
+
+    public function removePrefix(int $teamId, string $prefix, TeamSecretPrefixes $prefixes): void
+    {
+        $this->assertAdmin();
+
+        $team = Team::findOrFail($teamId);
+
+        $prefixes->set($team, array_values(array_diff($team->secretReferencePrefixes(), [$prefix])), auth()->user());
+    }
+
+    /**
+     * Teams, other than $team, whose prefixes overlap with its own (equal, or
+     * one inside the other). A reference under the shared part is open to both
+     * teams, which an administrator rarely means.
+     *
+     * @param  Collection<int, Team>  $teams
+     * @return array<string, list<string>> prefix => names of the other teams
+     */
+    private function overlaps(Team $team, $teams): array
+    {
+        $overlaps = [];
+
+        foreach ($team->secretReferencePrefixes() as $prefix) {
+            foreach ($teams as $other) {
+                if ($other->is($team)) {
+                    continue;
+                }
+
+                foreach ($other->secretReferencePrefixes() as $theirs) {
+                    if ($prefix === $theirs || str_starts_with($prefix, $theirs.'/') || str_starts_with($theirs, $prefix.'/')) {
+                        $overlaps[$prefix][] = $other->name;
+                    }
+                }
+            }
+        }
+
+        return array_map(fn (array $names) => array_values(array_unique($names)), $overlaps);
+    }
+
     public function render()
     {
+        $teams = Team::withCount('users')->orderBy('name')->get();
+        $open = $this->prefixesForId ? $teams->firstWhere('id', $this->prefixesForId) : null;
+
         return view('livewire.admin.teams', [
-            'teams' => Team::withCount('users')->orderBy('name')->get(),
+            'teams' => $teams,
+            'openTeam' => $open,
+            'openPrefixes' => $open?->secretReferencePrefixes() ?? [],
+            'overlaps' => $open ? $this->overlaps($open, $teams) : [],
+            'prefixSchemes' => SecretReference::schemes(),
         ]);
     }
 }

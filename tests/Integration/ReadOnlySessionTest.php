@@ -11,7 +11,8 @@
  * the READ ONLY transaction, so "SET TRANSACTION READ ONLY" (next transaction
  * only) left the DDL statement running outside it. The session-wide setting
  * makes the server refuse it, and endReadOnly() fails closed when the
- * transaction was closed under it.
+ * transaction was closed under it. CockroachDB has the same trait (it commits
+ * before DDL) and gets the same kind of session-wide setting.
  *
  * Group "integration"; skipped without QUERYPROXY_IT_* (see IntegrationTarget).
  */
@@ -169,6 +170,10 @@ test('a read whose transaction was closed under it is refused, and the session s
 test('PostgreSQL refuses a sequence side effect and a switch out of read-only mode handed straight to a read session', function (string $sql) {
     if (IntegrationTarget::driver() !== DbDriver::Pgsql) {
         $this->markTestSkipped('PostgreSQL only.');
+    }
+
+    if (IntegrationTarget::isCockroach() && str_contains($sql, 'set_config')) {
+        $this->markTestSkipped('CockroachDB lets a statement switch its own transaction back to read-write (set_config / SET transaction_read_only), PostgreSQL refuses it. Only the guard (ReadOnlyTest) and a read-only login stop it there; see docs/compatibility.md.');
     }
 
     $sequence = $this->it->table('seq');

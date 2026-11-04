@@ -6,6 +6,123 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-04
+
+### Added
+
+- External secret references for connection passwords (ADR-028): a
+  connection's password can be `vault://<mount>/<path>#<key>`,
+  `aws-sm://<secret-id>[#<json-key>]` or
+  `azure-kv://<vault-name>/<secret-name>[/<version>]` instead of a value. It
+  is resolved when the connection is opened and never stored. HashiCorp
+  Vault (KV v2/v1; token, AppRole, Kubernetes auth), AWS Secrets Manager
+  (default credential chain, IRSA included) and Azure Key Vault (client
+  secret, workload identity, managed identity) are supported. Resolution is
+  fail-closed: the request fails with a generic message and the new
+  `secret.resolve_failed` audit event records the reference, never the
+  value. Values are cached in process memory only
+  (`QUERYPROXY_SECRET_CACHE_TTL`, default 300 s). A system admin sets the
+  reference prefixes each team may use in Admin > Teams (audited, with an
+  overlap warning) or with `queryproxy:team:secret-prefixes`; a team without
+  prefixes cannot use references. The connection form offers the credential
+  source (stored password, Vault, AWS Secrets Manager or Azure Key Vault)
+  with a format hint, and the connection list shows the source and the
+  reference, never the password. "Test connection" resolves the reference;
+  `queryproxy:doctor` checks the store settings.
+- `qp`, the command-line client for the REST API (separate repository
+  `QueryProxy/qp`, ADR-030): `qp submit --wait` files a request, waits for
+  approval and prints the result; `qp status`, `qp results`. Static binaries
+  for Linux, macOS and Windows (amd64, arm64), checksums signed keylessly
+  with cosign. CI gains an end-to-end job that runs `qp` against a live
+  server.
+- Logging out of an SSO session now also ends the identity provider session
+  (RP-initiated logout) when the provider publishes an
+  `end_session_endpoint`; register `<APP_URL>/login` as a post-logout
+  redirect URI at the provider.
+- Helm chart is now published on every release tag as
+  `oci://ghcr.io/queryproxy/charts/queryproxy:<version>`, signed keyless with
+  cosign; the release fails before anything is pushed if the tag differs
+  from `Chart.yaml` `version`/`appVersion`. Pull requests dry-run
+  `helm package`. The chart README documents installing from the registry
+  and verifying the signature.
+- CockroachDB and YugabyteDB are tested in CI as target databases through
+  the PostgreSQL driver; `docs/compatibility.md` lists the status (Aurora
+  PostgreSQL, Neon, Supabase: not tested) and the known differences.
+- SCIM 2.0 provisioning (ADR-026) under `/scim/v2`: Users and Groups with
+  filter (`userName`/`externalId` `eq`), pagination, PATCH and PUT;
+  `ServiceProviderConfig`, `Schemas`, `ResourceTypes`. Off by default
+  (`QUERYPROXY_SCIM_ENABLED`). Dedicated bearer tokens, stored as SHA-256
+  only, are managed in Settings > SCIM (system admins: the endpoint URL, the
+  token list with creator, last use and status; a new token's value is shown
+  once, after a fresh password, TOTP or SSO confirmation as for API tokens;
+  revoking) or with `php artisan queryproxy:scim-token create|revoke|list`.
+  `active=false` and `DELETE` suspend the user, never delete; `active=true`
+  lifts only a suspension SCIM itself set, never one an administrator set.
+  SCIM sees only users it created or SSO-linked users, never local accounts.
+  Group membership applies `QUERYPROXY_OIDC_ROLE_MAP`. New audit events
+  `scim.*`.
+- Schema explorer and smart editor in the Query Studio (ADR-029): a
+  collapsible side panel lists schemas, tables, views and columns of the
+  selected connection with search and refresh; columns covered by a masking
+  rule show a lock, and clicking a name inserts it into the editor. The SQL
+  editor completes table and column names in the dialect of the connection's
+  driver (PostgreSQL, MySQL, MariaDB, SQL Server, SQLite), and a "Format"
+  button (Ctrl/Cmd+Shift+F) reformats the statement. On narrow screens the
+  panel opens as a drawer. `GET /connections/{connection}/schema` reads the
+  catalog through fixed queries in a read-only session with its own short
+  timeout (`QUERYPROXY_SCHEMA_TIMEOUT`, default 5 s) and without an approval.
+  Only users with access to the connection can read it; on MySQL/MariaDB only
+  the connection's own database is listed. Large catalogs are cut at
+  `QUERYPROXY_SCHEMA_MAX_COLUMNS` (default 20000) with the default schema kept
+  first. The result is cached per connection (`QUERYPROXY_SCHEMA_CACHE_TTL`,
+  default 3600 s); a rate-limited manual refresh skips the cache
+  (`QUERYPROXY_SCHEMA_REFRESH_LIMIT`, default 3 per minute). Each live read is
+  recorded as `schema.read` in the audit log; reads served from the cache are
+  not. New dependency: `sql-formatter`, loaded only when formatting.
+- Slack app: OAuth v2 install (`/integrations/slack/install`), bot-token
+  messages that update in place (approved, rejected, cancelled, running,
+  completed, failed), a thread summary with status, row count, duration and
+  link (no SQL), opt-in direct messages to approvers, the `/queryproxy`
+  slash command with a request modal, Events API handling for
+  `app_uninstalled` and `tokens_revoked`, and a weekly e-mail based identity
+  suggestion scan. The incoming-webhook mode is unchanged. The ChatOps page
+  gains an Add to Slack button, the installed workspace and channel, an
+  opt-in switch for direct messages to approvers and a Remove app action;
+  admins confirm or dismiss the Slack ID suggestions on the Users page. New
+  audit events `slack.installed` and `slack.uninstalled` (the latter also
+  records `removed_by_user`). New settings: `QUERYPROXY_SLACK_CLIENT_ID`,
+  `QUERYPROXY_SLACK_CLIENT_SECRET`, `QUERYPROXY_SLACK_SIGNING_SECRET`,
+  `QUERYPROXY_SLACK_RATE_LIMIT`. Slack endpoints are limited to 120
+  requests per minute per address before signature verification and to a
+  per-workspace budget (default 300 per minute) after it (ADR-004
+  amendment); Teams keeps `throttle:60,1`. Two migrations make
+  `chat_integrations.webhook_url` and `signing_secret` nullable.
+
+### Changed
+
+- The profile page hides the password form for users without a local
+  password.
+- `users` gets `scim_provisioned_at`, `scim_external_id`, `scim_user_name`
+  and `suspended_by_scim`; new tables `scim_tokens`, `scim_groups`,
+  `scim_group_user` (migrations are reversible). Accounts created by SCIM
+  count as SSO users: no local password through reset flows.
+
+### Fixed
+
+- On CockroachDB a read request's read-only transaction did not stop DDL
+  (the server commits before DDL); the read session is now also read-only
+  session-wide there. "Stop" now works for running statements on
+  CockroachDB (`CANCEL QUERIES`).
+- Saving a Slack signing secret on a row that has none (an app-only
+  install) no longer asks for a current secret, and a webhook URL can no
+  longer be saved without a signing secret.
+
+### Security
+
+- An SSO-linked user can no longer be given a local password through the
+  admin "Reset password" action or the e-mail reset flow, regardless of
+  `QUERYPROXY_LOCAL_LOGIN`.
+
 ## [0.4.0] - 2026-11-01
 
 Step-by-step upgrade and rollback instructions, with the migration list, are
@@ -1277,7 +1394,8 @@ The first public release.
 - **Deployment** — zero-config `docker compose up` (app + worker + scheduler,
   SQLite default), published container image `ghcr.io/queryproxy/queryproxy`.
 
-[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/QueryProxy/QueryProxy/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/QueryProxy/QueryProxy/compare/v0.3.1...v0.3.2

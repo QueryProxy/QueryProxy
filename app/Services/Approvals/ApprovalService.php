@@ -140,6 +140,8 @@ class ApprovalService
         ]);
 
         app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
+
+        ApprovalNotifier::requestCancelled($request);
     }
 
     /**
@@ -197,6 +199,7 @@ class ApprovalService
 
         app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
 
+        ApprovalNotifier::requestCancelled($request);
         ApprovalNotifier::requestStopped($request, $user);
 
         return $signalled;
@@ -226,6 +229,8 @@ class ApprovalService
         audit()->record('request.cancelled', request: $request, metadata: ['reason' => $reason], system: true);
 
         app(MetricsRecorder::class)->requestEntered(QueryRequestStatus::Cancelled, $request->type);
+
+        ApprovalNotifier::requestCancelled($request);
 
         return true;
     }
