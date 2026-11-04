@@ -142,11 +142,29 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,mode=max,scope=${{ matrix.cache-scope }}
 
+      # Trivy comes straight from its GitHub release, checked against the
+      # release checksums: the action's own installer downloads from
+      # get.trivy.dev, which stopped resolving on 2026-11-03.
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.70.0
+        run: |
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          checksums="trivy_${TRIVY_VERSION}_checksums.txt"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" "$base/$tarball"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$checksums" "$base/$checksums"
+          (cd "$RUNNER_TEMP" && grep "  ${tarball}\$" "$checksums" | sha256sum -c -)
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" trivy
+          sudo install -m 0755 "$RUNNER_TEMP/trivy" /usr/local/bin/trivy
+          trivy --version
+
       - name: Scan image for vulnerabilities
         # Pinned to the commit behind v0.36.0: the unprefixed tags (0.28.0)
         # were removed upstream and no longer resolve.
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          skip-setup-trivy: true
           image-ref: queryproxy-scan:candidate
           format: table
           exit-code: '1'
