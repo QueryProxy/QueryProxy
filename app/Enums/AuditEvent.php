@@ -92,6 +92,10 @@ enum AuditEvent: string
     case ChatIdentityLinked = 'chat_identity.linked';
     case ChatIdentityRemoved = 'chat_identity.removed';
 
+    // Slack app (ADR-027)
+    case SlackInstalled = 'slack.installed';
+    case SlackUninstalled = 'slack.uninstalled';
+
     // Query requests
     case RequestSubmitted = 'request.submitted';
     case RequestApproved = 'request.approved';
@@ -180,6 +184,9 @@ enum AuditEvent: string
             self::ChatIntegrationRemoved => 'A ChatOps integration was removed.',
             self::ChatIdentityLinked => 'A chat identity was linked to a user.',
             self::ChatIdentityRemoved => 'A chat identity was unlinked from a user.',
+
+            self::SlackInstalled => 'The QueryProxy Slack app was installed for a team through OAuth v2 (metadata.slack_team_id, metadata.slack_team_name, metadata.channel_id, metadata.scopes). The bot token is never recorded.',
+            self::SlackUninstalled => 'The Slack app installation of a team ended and its bot token was deleted (metadata.slack_team_id, metadata.reason = app_uninstalled | tokens_revoked | token_rejected). Written without an actor: Slack reported it.',
 
             self::RequestSubmitted => 'A query request was submitted for approval (metadata.channel = web | api).',
             self::RequestApproved => 'A query request was approved (metadata.override marks an admin override; an override always carries metadata.reason).',

@@ -31,7 +31,15 @@ class ExecuteQueryRequest implements ShouldQueue
 
     public function handle(QueryExecutor $executor): void
     {
-        $executor->execute($this->request->fresh());
+        $request = $this->request->fresh();
+
+        // Chat shows "running" only for a request this job is about to claim;
+        // a duplicate copy of an already settled request stays silent.
+        if (in_array($request->status, [QueryRequestStatus::Queued, QueryRequestStatus::Approved], true)) {
+            ApprovalNotifier::requestStarted($request);
+        }
+
+        $executor->execute($request);
     }
 
     /**

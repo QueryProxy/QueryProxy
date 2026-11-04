@@ -74,6 +74,21 @@ All notable changes to QueryProxy are documented here. The format follows
   refresh skips the cache (`QUERYPROXY_SCHEMA_REFRESH_LIMIT`, default 3 per
   minute). Each live read is recorded as `schema.read` in the audit log;
   reads served from the cache are not.
+- Slack app: OAuth v2 install (`/integrations/slack/install`), bot-token
+  messages that update in place (approved, rejected, cancelled, running,
+  completed, failed), a thread summary with status, row count, duration and
+  link (no SQL), opt-in direct messages to approvers, the `/queryproxy`
+  slash command with a request modal, Events API handling for
+  `app_uninstalled` and `tokens_revoked`, and a weekly e-mail based identity
+  suggestion scan whose suggestions an administrator confirms on the web.
+  The incoming-webhook mode is unchanged. New audit events `slack.installed`
+  and `slack.uninstalled`. New settings: `QUERYPROXY_SLACK_CLIENT_ID`,
+  `QUERYPROXY_SLACK_CLIENT_SECRET`, `QUERYPROXY_SLACK_SIGNING_SECRET`,
+  `QUERYPROXY_SLACK_RATE_LIMIT`. Slack endpoints are limited to 120
+  requests per minute per address before signature verification and to a
+  per-workspace budget (default 300 per minute) after it (ADR-004
+  amendment); Teams keeps `throttle:60,1`. Two migrations make
+  `chat_integrations.webhook_url` and `signing_secret` nullable.
 
 ### Changed
 

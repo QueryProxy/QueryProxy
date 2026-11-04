@@ -218,6 +218,35 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Slack app (ADR-027)
+    |--------------------------------------------------------------------------
+    | `slack_api_url` is the Web API base (use https://slack-gov.com/api for
+    | GovSlack). `slack_oauth_scopes` are the bot scopes the install asks for:
+    | chat:write and chat:write.public post and update request cards,
+    | incoming-webhook lets the installer pick the channel, commands is the
+    | /queryproxy command, im:write the direct messages and users:read(.email)
+    | the e-mail lookup behind identity suggestions.
+    */
+
+    'slack_api_url' => rtrim((string) env('QUERYPROXY_SLACK_API_URL', 'https://slack.com/api'), '/'),
+
+    'slack_authorize_url' => (string) env('QUERYPROXY_SLACK_AUTHORIZE_URL', 'https://slack.com/oauth/v2/authorize'),
+
+    // Requests per minute and Slack workspace (interactions, commands, events).
+    'slack_rate_limit' => max(1, (int) env('QUERYPROXY_SLACK_RATE_LIMIT', 300)),
+
+    'slack_oauth_scopes' => [
+        'chat:write',
+        'chat:write.public',
+        'commands',
+        'im:write',
+        'incoming-webhook',
+        'users:read',
+        'users:read.email',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Pending request reminder
     |--------------------------------------------------------------------------
     | A request still pending after this many hours is reminded about once (the

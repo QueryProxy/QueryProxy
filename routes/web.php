@@ -5,9 +5,12 @@ use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\Auth\OidcController;
 use App\Http\Controllers\Auth\PasswordResetController;
 use App\Http\Controllers\Auth\TwoFactorChallengeController;
+use App\Http\Controllers\Integrations\SlackInstallController;
 use App\Http\Controllers\ResultDownloadController;
 use App\Http\Controllers\SchemaController;
 use App\Http\Controllers\TeamSwitchController;
+use App\Http\Controllers\Webhooks\SlackCommandController;
+use App\Http\Controllers\Webhooks\SlackEventsController;
 use App\Http\Controllers\Webhooks\SlackInteractionController;
 use App\Http\Controllers\Webhooks\TeamsActionController;
 use App\Livewire\Admin\TeamMembers;
@@ -28,11 +31,26 @@ use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/dashboard');
 
-Route::prefix('webhooks')->middleware('throttle:60,1')->group(function () {
-    Route::post('/slack/interactions', SlackInteractionController::class)
+// Slack: interactions, and for the Slack app (ADR-027) the slash command and
+// the Events API (signed with the app's signing secret). Slack calls from a
+// few shared addresses, so the budget is per workspace, counted by the
+// signature middleware once a request is verified; the address limit here is
+// only a flood guard (AppServiceProvider).
+Route::prefix('webhooks/slack')->middleware('throttle:slack-ip')->group(function () {
+    Route::post('/interactions', SlackInteractionController::class)
         ->middleware('slack.signature')
         ->name('webhooks.slack');
 
+    Route::post('/commands', SlackCommandController::class)
+        ->middleware('slack.signature')
+        ->name('webhooks.slack.commands');
+
+    Route::post('/events', SlackEventsController::class)
+        ->middleware('slack.signature')
+        ->name('webhooks.slack.events');
+});
+
+Route::prefix('webhooks')->middleware('throttle:60,1')->group(function () {
     Route::post('/teams/actions', TeamsActionController::class)
         ->middleware('teams.hmac')
         ->name('webhooks.teams');
@@ -85,6 +103,10 @@ Route::middleware(['auth', '2fa.required'])->group(function () {
         Route::get('/approvals', ApprovalsIndex::class)->name('approvals.index');
         Route::get('/masking', MaskingIndex::class)->name('masking.index');
         Route::get('/settings/chatops', ChatOpsSettings::class)->name('settings.chatops');
+
+        // Slack app install (ADR-027): OAuth v2, protected by a single-use state in the session.
+        Route::get('/integrations/slack/install', [SlackInstallController::class, 'install'])->name('integrations.slack.install');
+        Route::get('/integrations/slack/callback', [SlackInstallController::class, 'callback'])->name('integrations.slack.callback');
     });
 
     // Outside the role groups on purpose: a Slack Approve press that would be an

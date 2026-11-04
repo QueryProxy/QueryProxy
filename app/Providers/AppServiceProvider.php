@@ -109,6 +109,15 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute(180)->by($request->user()?->id ?: $request->ip());
         });
 
+        // Slack (ADR-027) sends every workspace's traffic from the same few
+        // addresses, so one per-address bucket would be shared by all of them.
+        // The address limit only guards the signature check against a flood;
+        // the real budget is per workspace and is counted by
+        // VerifySlackSignature once the signature has been verified (the
+        // workspace id of an unverified body means nothing, and the router
+        // would run a throttle middleware ahead of the signature check).
+        RateLimiter::for('slack-ip', fn (Request $request) => Limit::perMinute(120)->by('slack-ip:'.$request->ip()));
+
         // REST API (ADR-024): the budget is per token. Laravel runs authentication
         // before throttling, so only authenticated calls get here; calls that fail
         // to authenticate are counted per address by ThrottleFailedApiAuthentication.
