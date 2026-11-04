@@ -100,6 +100,15 @@ All notable changes to QueryProxy are documented here. The format follows
   app action on the ChatOps page; admins confirm or dismiss e-mail based
   Slack ID suggestions on the Users page. `slack.uninstalled` now also
   records `removed_by_user`.
+- Schema explorer and smart editor in the Query Studio (ADR-029): a
+  collapsible side panel lists schemas, tables, views and columns of the
+  selected connection with search and refresh; columns covered by a
+  masking rule show a lock. Clicking a name inserts it into the editor. The
+  SQL editor completes table and column names from the connection's schema
+  in the dialect of its driver (PostgreSQL, MySQL, MariaDB, SQL Server,
+  SQLite), and a "Format" button (Ctrl/Cmd+Shift+F) reformats the
+  statement. On narrow screens the panel opens as a drawer. New
+  dependency: `sql-formatter`, loaded only when formatting.
 
 ### Changed
 
