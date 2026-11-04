@@ -63,11 +63,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: QueryProxy/qp
-          # Not pinned yet: until qp has a first release, main is the only ref
-          # there is, so a broken qp commit can turn an unrelated server pull
-          # request red. After the first release, pin a tag or commit SHA here
-          # and bump it with each qp release.
-          ref: main
+          # Pinned to a qp release so a broken qp commit cannot turn an
+          # unrelated server pull request red. Bump it with each qp release.
+          ref: v0.4.1
           path: qp
           persist-credentials: false
 
