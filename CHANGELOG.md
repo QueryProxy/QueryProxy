@@ -8,13 +8,6 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Added
 
-- Connection form: choose where a connection's password comes from —
-  stored password, HashiCorp Vault, AWS Secrets Manager or Azure Key Vault.
-  External sources take a secret reference with a format hint; the
-  connection list shows the source and the reference, never the password.
-- Admin > Teams: a system administrator sets the secret paths each team may
-  reference (audited, with an overlap warning). A team without paths cannot
-  choose an external source in the connection form.
 - External secret references for connection passwords (ADR-028): a
   connection's password can be `vault://<mount>/<path>#<key>`,
   `aws-sm://<secret-id>[#<json-key>]` or
@@ -27,11 +20,13 @@ All notable changes to QueryProxy are documented here. The format follows
   `secret.resolve_failed` audit event records the reference, never the
   value. Values are cached in process memory only
   (`QUERYPROXY_SECRET_CACHE_TTL`, default 300 s). A system admin sets the
-  reference prefixes each team may use (`queryproxy:team:secret-prefixes`);
-  a team without prefixes cannot use references. Optional
-  `QUERYPROXY_SECRET_ALLOWED_REFERENCES` limits references instance-wide.
-  "Test connection" resolves the reference; `queryproxy:doctor` checks the
-  store settings.
+  reference prefixes each team may use in Admin > Teams (audited, with an
+  overlap warning) or with `queryproxy:team:secret-prefixes`; a team without
+  prefixes cannot use references. The connection form offers the credential
+  source (stored password, Vault, AWS Secrets Manager or Azure Key Vault)
+  with a format hint, and the connection list shows the source and the
+  reference, never the password. "Test connection" resolves the reference;
+  `queryproxy:doctor` checks the store settings.
 - `qp`, the command-line client for the REST API (separate repository
   `QueryProxy/qp`, ADR-030): `qp submit --wait` files a request, waits for
   approval and prints the result; `qp status`, `qp results`. Static binaries
@@ -54,61 +49,52 @@ All notable changes to QueryProxy are documented here. The format follows
 - SCIM 2.0 provisioning (ADR-026) under `/scim/v2`: Users and Groups with
   filter (`userName`/`externalId` `eq`), pagination, PATCH and PUT;
   `ServiceProviderConfig`, `Schemas`, `ResourceTypes`. Off by default
-  (`QUERYPROXY_SCIM_ENABLED`). Dedicated bearer tokens
-  (`php artisan queryproxy:scim-token create|revoke|list`), stored as
-  SHA-256 only. `active=false` and `DELETE` suspend the user, never delete;
-  `active=true` lifts only a suspension SCIM itself set, never one an
-  administrator set. SCIM sees only users it created or SSO-linked users,
-  never local accounts. Group membership applies `QUERYPROXY_OIDC_ROLE_MAP`.
-  New audit events `scim.*`.
-- Schema explorer backend (ADR-029): `GET /connections/{connection}/schema`
-  returns the tables, views and columns of a connection for the Studio,
-  read through fixed catalog queries in a read-only session with its own
-  short timeout (`QUERYPROXY_SCHEMA_TIMEOUT`, default 5 s) and without an
-  approval. Only users with access to the connection can read it; on
-  MySQL/MariaDB only the connection's own database is listed. Columns
-  matched by a column masking rule are flagged `masked`. Large catalogs are
-  cut at `QUERYPROXY_SCHEMA_MAX_COLUMNS` (default 20000) with the default
-  schema kept first. The result is cached per connection
-  (`QUERYPROXY_SCHEMA_CACHE_TTL`, default 3600 s); a rate-limited manual
-  refresh skips the cache (`QUERYPROXY_SCHEMA_REFRESH_LIMIT`, default 3 per
-  minute). Each live read is recorded as `schema.read` in the audit log;
-  reads served from the cache are not.
+  (`QUERYPROXY_SCIM_ENABLED`). Dedicated bearer tokens, stored as SHA-256
+  only, are managed in Settings > SCIM (system admins: the endpoint URL, the
+  token list with creator, last use and status; a new token's value is shown
+  once, after a fresh password, TOTP or SSO confirmation as for API tokens;
+  revoking) or with `php artisan queryproxy:scim-token create|revoke|list`.
+  `active=false` and `DELETE` suspend the user, never delete; `active=true`
+  lifts only a suspension SCIM itself set, never one an administrator set.
+  SCIM sees only users it created or SSO-linked users, never local accounts.
+  Group membership applies `QUERYPROXY_OIDC_ROLE_MAP`. New audit events
+  `scim.*`.
+- Schema explorer and smart editor in the Query Studio (ADR-029): a
+  collapsible side panel lists schemas, tables, views and columns of the
+  selected connection with search and refresh; columns covered by a masking
+  rule show a lock, and clicking a name inserts it into the editor. The SQL
+  editor completes table and column names in the dialect of the connection's
+  driver (PostgreSQL, MySQL, MariaDB, SQL Server, SQLite), and a "Format"
+  button (Ctrl/Cmd+Shift+F) reformats the statement. On narrow screens the
+  panel opens as a drawer. `GET /connections/{connection}/schema` reads the
+  catalog through fixed queries in a read-only session with its own short
+  timeout (`QUERYPROXY_SCHEMA_TIMEOUT`, default 5 s) and without an approval.
+  Only users with access to the connection can read it; on MySQL/MariaDB only
+  the connection's own database is listed. Large catalogs are cut at
+  `QUERYPROXY_SCHEMA_MAX_COLUMNS` (default 20000) with the default schema kept
+  first. The result is cached per connection (`QUERYPROXY_SCHEMA_CACHE_TTL`,
+  default 3600 s); a rate-limited manual refresh skips the cache
+  (`QUERYPROXY_SCHEMA_REFRESH_LIMIT`, default 3 per minute). Each live read is
+  recorded as `schema.read` in the audit log; reads served from the cache are
+  not. New dependency: `sql-formatter`, loaded only when formatting.
 - Slack app: OAuth v2 install (`/integrations/slack/install`), bot-token
   messages that update in place (approved, rejected, cancelled, running,
   completed, failed), a thread summary with status, row count, duration and
   link (no SQL), opt-in direct messages to approvers, the `/queryproxy`
   slash command with a request modal, Events API handling for
   `app_uninstalled` and `tokens_revoked`, and a weekly e-mail based identity
-  suggestion scan whose suggestions an administrator confirms on the web.
-  The incoming-webhook mode is unchanged. New audit events `slack.installed`
-  and `slack.uninstalled`. New settings: `QUERYPROXY_SLACK_CLIENT_ID`,
+  suggestion scan. The incoming-webhook mode is unchanged. The ChatOps page
+  gains an Add to Slack button, the installed workspace and channel, an
+  opt-in switch for direct messages to approvers and a Remove app action;
+  admins confirm or dismiss the Slack ID suggestions on the Users page. New
+  audit events `slack.installed` and `slack.uninstalled` (the latter also
+  records `removed_by_user`). New settings: `QUERYPROXY_SLACK_CLIENT_ID`,
   `QUERYPROXY_SLACK_CLIENT_SECRET`, `QUERYPROXY_SLACK_SIGNING_SECRET`,
   `QUERYPROXY_SLACK_RATE_LIMIT`. Slack endpoints are limited to 120
   requests per minute per address before signature verification and to a
   per-workspace budget (default 300 per minute) after it (ADR-004
   amendment); Teams keeps `throttle:60,1`. Two migrations make
   `chat_integrations.webhook_url` and `signing_secret` nullable.
-- Settings > SCIM for system admins: shows the SCIM endpoint URL, lists
-  SCIM tokens (name, creator, last use, status), creates tokens (value
-  shown once, after a fresh password, TOTP or SSO confirmation as for API
-  tokens) and revokes them. While SCIM is switched off the page explains
-  how to enable it. After an SSO re-confirmation started there, the admin
-  comes back to the SCIM page.
-- Slack settings: an Add to Slack button, the installed workspace and
-  channel, an opt-in switch for direct messages to approvers and a Remove
-  app action on the ChatOps page; admins confirm or dismiss e-mail based
-  Slack ID suggestions on the Users page. `slack.uninstalled` now also
-  records `removed_by_user`.
-- Schema explorer and smart editor in the Query Studio (ADR-029): a
-  collapsible side panel lists schemas, tables, views and columns of the
-  selected connection with search and refresh; columns covered by a
-  masking rule show a lock. Clicking a name inserts it into the editor. The
-  SQL editor completes table and column names from the connection's schema
-  in the dialect of its driver (PostgreSQL, MySQL, MariaDB, SQL Server,
-  SQLite), and a "Format" button (Ctrl/Cmd+Shift+F) reformats the
-  statement. On narrow screens the panel opens as a drawer. New
-  dependency: `sql-formatter`, loaded only when formatting.
 
 ### Changed
 

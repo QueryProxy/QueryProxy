@@ -49,12 +49,28 @@ It is a single Laravel monolith with no external dependencies by default.
   grant ends by itself.
 - **Single sign-on:** OpenID Connect (Keycloak, Entra ID, Okta, Google and other
   providers with discovery) with team roles taken from the provider's groups.
-  MFA for these users is enforced at the provider.
+  MFA for these users is enforced at the provider. Signing out also ends the
+  provider's session when it publishes an `end_session_endpoint`.
+- **SCIM provisioning:** the identity provider creates, updates and suspends
+  users and syncs groups over SCIM 2.0 (`/scim/v2`, off by default). Removing
+  someone suspends the account, ending sessions and tokens; nothing is deleted.
+- **External secret references:** a connection's password can be a reference to
+  HashiCorp Vault, AWS Secrets Manager or Azure Key Vault, resolved when the
+  connection opens and never stored; a system administrator sets which paths
+  each team may reference.
+- **Schema explorer:** the Query Studio lists the schemas, tables, views and
+  columns of a connection beside the editor, marks masked columns, and completes
+  table and column names in the dialect of the connection's driver.
 - **REST API:** `/api/v1` with scoped personal access tokens that always expire,
   for CI and scripts. Requests still wait for human approval; the API has no
   override. The description is in [`docs/openapi.yaml`](docs/openapi.yaml).
-- **ChatOps:** Slack messages with interactive Approve / Reject buttons and
-  Microsoft Teams cards with an HMAC-verified action endpoint.
+- **`qp` command-line client:** files a request, waits for approval and prints
+  the result from a terminal or pipeline (separate repository
+  [`QueryProxy/qp`](https://github.com/QueryProxy/qp)).
+- **ChatOps:** Slack messages with interactive Approve / Reject buttons that
+  update in place (a Slack app with OAuth install and a `/queryproxy` command, or
+  an incoming webhook) and Microsoft Teams cards with an HMAC-verified action
+  endpoint.
 - **Async execution:** approved queries run on a queue worker; reads stream
   through database cursors into NDJSON files with constant memory usage.
 - **Dynamic data masking:** column-pattern, content-regex and checksum
@@ -66,7 +82,12 @@ It is a single Laravel monolith with no external dependencies by default.
   optional SIEM sinks (stdout, syslog, signed webhook).
 - **Kubernetes:** a Helm chart (`deploy/helm/queryproxy`) with separate web,
   worker and scheduler Deployments and a high-availability reference setup on
-  PostgreSQL and S3. With SQLite it renders one all-in-one pod.
+  PostgreSQL and S3. With SQLite it renders one all-in-one pod. Each release
+  publishes the chart to `oci://ghcr.io/queryproxy/charts/queryproxy`, signed
+  with cosign.
+- **PostgreSQL-compatible targets:** CockroachDB and YugabyteDB are tested in CI
+  as target databases; [`docs/compatibility.md`](docs/compatibility.md) lists
+  what differs.
 - **Defence in depth on the target:** reads run in a read-only session with
   statement and lock timeouts (SQL Server has no such session: give it a
   separate read credential), new connections require TLS, a running query can
@@ -185,13 +206,17 @@ Settings live in `.env`; `.env.example` lists the full set.
 | `QUERYPROXY_LOCK_TIMEOUT` | `5` | Seconds a statement waits for a lock on the target database (1 to 3600) |
 | `QUERYPROXY_CONNECTION_SLOTS` | `2` | Requests that may run on one target connection at once; `0` disables the limit |
 | `QUERYPROXY_CONNECTION_SLOT_RETRY_DELAY` | `5` | Seconds before a request that found every slot busy retries |
+| `QUERYPROXY_SCHEMA_TIMEOUT` / `_CACHE_TTL` / `_REFRESH_LIMIT` / `_MAX_COLUMNS` | `5` / `3600` / `3` / `20000` | Schema explorer: catalog read timeout in seconds, cache lifetime in seconds (`0` = off), manual refreshes per connection and minute, and the most columns one read returns |
 | `QUERYPROXY_RESULT_DISK` | `local` | Disk for result files (`s3` supported) |
 | `QUERYPROXY_RESULT_TTL_DAYS` | `30` | Retention for stored results |
 | `QUERYPROXY_REQUIRE_2FA` | `none` | Enforce TOTP 2FA: `none`, `admins`, `dba` or `all` |
 | `QUERYPROXY_LOCAL_LOGIN` | `all` | Who may sign in with a password: `all`, `admins_only` or `none` |
 | `QUERYPROXY_OIDC_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | none | Turn on OpenID Connect sign-in; also `_SCOPES`, `_GROUP_CLAIM` and `_ROLE_MAP`, see the [SSO guide](https://queryproxy.com/docs/sso-oidc/) |
+| `QUERYPROXY_SCIM_ENABLED` / `QUERYPROXY_SCIM_RATE_LIMIT` | `false` / `300` | Turn on SCIM 2.0 provisioning under `/scim/v2`, and the requests per minute for each SCIM token; see the [SCIM guide](https://queryproxy.com/docs/scim/) |
 | `QUERYPROXY_API_TOKEN_MAX_DAYS` / `QUERYPROXY_API_RATE_LIMIT` | `90` / `60` | Longest API token lifetime in days, and calls per minute for each token |
 | `QUERYPROXY_CHAT_INCLUDE_SQL` | `literals_redacted` | SQL preview in chat: `literals_redacted`, `full` or `none` (`true` means `full`, `false` means `none`) |
+| `QUERYPROXY_SLACK_CLIENT_ID` / `_CLIENT_SECRET` / `_SIGNING_SECRET` | none | Credentials of the Slack app; `QUERYPROXY_SLACK_RATE_LIMIT` (default `300`) is the requests per minute for each workspace. See the [Slack guide](https://queryproxy.com/docs/slack-integration/) |
+| `QUERYPROXY_SECRET_CACHE_TTL` / `QUERYPROXY_SECRET_TIMEOUT` | `300` / `5` | External secret references: seconds a resolved value stays in memory (`0` = off) and the store timeout; the `QUERYPROXY_VAULT_*`, `QUERYPROXY_AWS_REGION` and `QUERYPROXY_AZURE_*` settings are in the [secret references guide](https://queryproxy.com/docs/external-secrets/) |
 | `QUERYPROXY_PENDING_REMIND_AFTER` | `4` | Hours before one reminder for a `pending` request; `0` turns it off. Requests never expire |
 | `QUERYPROXY_METRICS_TOKEN` / `QUERYPROXY_METRICS_ALLOWED_IPS` | none | Turn on `GET /metrics` for Prometheus (bearer token and/or address allowlist); off until one is set |
 | `QUERYPROXY_SIEM_SINKS` | none | Export audit events to `stdout`, `syslog` and/or `webhook`; the `QUERYPROXY_SIEM_*` settings are in the [audit export guide](https://queryproxy.com/docs/audit-export/) |
@@ -348,8 +373,12 @@ results are published weekly.
 - [Slack integration](https://queryproxy.com/docs/slack-integration/) and
   [Teams integration](https://queryproxy.com/docs/teams-integration/)
 - [Single sign-on with OpenID Connect](https://queryproxy.com/docs/sso-oidc/)
+- [SCIM provisioning](https://queryproxy.com/docs/scim/)
 - [REST API and personal access tokens](https://queryproxy.com/docs/api/)
+- [The `qp` command-line client](https://queryproxy.com/docs/cli/)
 - [Kubernetes, Helm and high availability](https://queryproxy.com/docs/kubernetes/)
+- [External secret references](https://queryproxy.com/docs/external-secrets/)
+- [PostgreSQL-compatible databases](https://queryproxy.com/docs/compatibility/)
 
 All pages are at [queryproxy.com/docs](https://queryproxy.com/docs).
 
