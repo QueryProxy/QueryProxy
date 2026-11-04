@@ -95,6 +95,11 @@ All notable changes to QueryProxy are documented here. The format follows
   tokens) and revokes them. While SCIM is switched off the page explains
   how to enable it. After an SSO re-confirmation started there, the admin
   comes back to the SCIM page.
+- Slack settings: an Add to Slack button, the installed workspace and
+  channel, an opt-in switch for direct messages to approvers and a Remove
+  app action on the ChatOps page; admins confirm or dismiss e-mail based
+  Slack ID suggestions on the Users page. `slack.uninstalled` now also
+  records `removed_by_user`.
 
 ### Changed
 
@@ -111,6 +116,9 @@ All notable changes to QueryProxy are documented here. The format follows
   (the server commits before DDL); the read session is now also read-only
   session-wide there. "Stop" now works for running statements on
   CockroachDB (`CANCEL QUERIES`).
+- Saving a Slack signing secret on a row that has none (an app-only
+  install) no longer asks for a current secret, and a webhook URL can no
+  longer be saved without a signing secret.
 
 ### Security
 

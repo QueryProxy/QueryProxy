@@ -186,7 +186,7 @@ enum AuditEvent: string
             self::ChatIdentityRemoved => 'A chat identity was unlinked from a user.',
 
             self::SlackInstalled => 'The QueryProxy Slack app was installed for a team through OAuth v2 (metadata.slack_team_id, metadata.slack_team_name, metadata.channel_id, metadata.scopes). The bot token is never recorded.',
-            self::SlackUninstalled => 'The Slack app installation of a team ended and its bot token was deleted (metadata.slack_team_id, metadata.reason = app_uninstalled | tokens_revoked | token_rejected). Written without an actor: Slack reported it.',
+            self::SlackUninstalled => 'The Slack app installation of a team ended and its bot token was deleted (metadata.slack_team_id, metadata.reason = app_uninstalled | tokens_revoked | token_rejected | removed_by_user). Written without an actor when Slack reported it; removed_by_user names the admin or DBA who removed it on the ChatOps settings page.',
 
             self::RequestSubmitted => 'A query request was submitted for approval (metadata.channel = web | api).',
             self::RequestApproved => 'A query request was approved (metadata.override marks an admin override; an override always carries metadata.reason).',
