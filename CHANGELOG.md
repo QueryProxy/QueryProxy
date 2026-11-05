@@ -8,6 +8,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Fixed
 
+- Removing the Slack app from ChatOps now revokes the bot token on Slack (`auth.revoke`) and clears `installed_by` / `installed_at`; a failed revoke is logged and audited but never keeps the token locally. A concurrent `app_uninstalled` / `tokens_revoked` event no longer writes a second audit entry.
 - Rejecting a Slack identity suggestion is now permanent: the weekly scan no longer proposes the same match again (`dismissed_at` on `slack_identity_suggestions`).
 - Narrow screens: the sidebar now collapses into a menu-button drawer below the `md` breakpoint (Esc and outside click close it), so the app layout no longer overflows horizontally on phones.
 

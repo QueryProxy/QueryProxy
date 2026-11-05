@@ -7,6 +7,10 @@ use App\Models\ChatIdentity;
 use App\Models\ChatIntegration;
 use App\Models\SlackIdentitySuggestion;
 use App\Models\User;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Livewire\Livewire;
 use Tests\Support\SlackApp;
 
@@ -126,6 +130,7 @@ test('a dba of another team cannot touch this team\'s installation', function ()
 
 test('a dba removes the app: the token is deleted, the shell row goes and the removal is audited', function () {
     [$team, $dba, $developer] = uiSlackSetup();
+    SlackApp::fakeApi();
     uiSuggestion($team, $developer);
 
     Livewire::actingAs($dba)->test(ChatOps::class)
@@ -138,9 +143,135 @@ test('a dba removes the app: the token is deleted, the shell row goes and the re
         ->and(SlackIdentitySuggestion::count())->toBe(0)
         ->and($log->user_id)->toBe($dba->id)
         ->and($log->team_id)->toBe($team->id)
-        ->and($log->metadata)->toBe(['slack_team_id' => SlackApp::WORKSPACE, 'reason' => 'removed_by_user'])
+        ->and($log->metadata)->toBe(['slack_team_id' => SlackApp::WORKSPACE, 'reason' => 'removed_by_user', 'token_revoked' => true])
         ->and(json_encode($log->metadata))->not->toContain('xoxb-');
 });
+
+test('removing the app revokes the bot token on Slack with that very token', function () {
+    [$team, $dba] = uiSlackSetup();
+    SlackApp::fakeApi();
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request) => str_ends_with($request->url(), '/auth.revoke')
+        && $request->hasHeader('Authorization', 'Bearer '.SlackApp::BOT_TOKEN));
+});
+
+test('removing the app clears the token and who/when installed it', function () {
+    [$team, $dba, , , $chat] = uiSlackSetup([
+        'webhook_url' => 'https://hooks.slack.com/services/T000/B000/XXX',
+        'signing_secret' => 'team-secret',
+        'installed_by' => null,
+        'installed_at' => now(),
+    ]);
+    $chat->forceFill(['installed_by' => $dba->id])->save();
+    SlackApp::fakeApi();
+
+    expect($chat->fresh()->installed_by)->toBe($dba->id)->and($chat->fresh()->installed_at)->not->toBeNull();
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    $chat->refresh();
+
+    expect($chat->bot_token)->toBeNull()
+        ->and($chat->installed_by)->toBeNull()
+        ->and($chat->installed_at)->toBeNull();
+});
+
+test('a Slack failure on revoke does not keep the installation locally', function (string $failure, string $expectedError) {
+    [$team, $dba, , , $chat] = uiSlackSetup([
+        'webhook_url' => 'https://hooks.slack.com/services/T000/B000/XXX',
+        'signing_secret' => 'team-secret',
+        'installed_at' => now(),
+    ]);
+    Http::fake(['slack.com/api/auth.revoke' => match ($failure) {
+        'server_error' => Http::response('boom', 500),
+        'not_ok' => Http::response(['ok' => false, 'error' => 'invalid_auth']),
+        'connection' => Http::failedConnection(),
+    }]);
+    Log::spy();
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    $chat->refresh();
+    $log = AuditLog::where('action', 'slack.uninstalled')->sole();
+
+    expect($chat->bot_token)->toBeNull()
+        ->and($chat->slack_team_id)->toBeNull()
+        ->and($chat->installed_at)->toBeNull()
+        ->and($log->metadata)->toBe([
+            'slack_team_id' => SlackApp::WORKSPACE,
+            'reason' => 'removed_by_user',
+            'token_revoked' => false,
+            'revoke_error' => $expectedError,
+        ])
+        ->and(json_encode($log->metadata))->not->toContain('xoxb-');
+
+    Log::shouldHaveReceived('warning')->once()->withArgs(fn (string $message, array $context) => str_contains($message, 'auth.revoke')
+        && $context['error'] === $expectedError
+        && ! str_contains(json_encode($context), 'xoxb-'));
+})->with([
+    'slack 500' => ['server_error', 'http_500'],
+    'ok false' => ['not_ok', 'invalid_auth'],
+    'connection error' => ['connection', 'connection_failed'],
+]);
+
+test('a failed revoke on a row without a webhook still deletes the shell row', function () {
+    [$team, $dba] = uiSlackSetup();
+    Http::fake(['slack.com/api/auth.revoke' => Http::response('boom', 500)]);
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    expect(ChatIntegration::where('team_id', $team->id)->exists())->toBeFalse();
+});
+
+test('a tokens_revoked event arriving after a removal finds nothing and writes no second audit', function () {
+    [$team, $dba] = uiSlackSetup(['webhook_url' => 'https://hooks.slack.com/services/T000/B000/XXX', 'signing_secret' => 'team-secret']);
+    SlackApp::fakeApi();
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    SlackApp::postJson($this, route('webhooks.slack.events'), [
+        'type' => 'event_callback',
+        'team_id' => SlackApp::WORKSPACE,
+        'event' => ['type' => 'tokens_revoked', 'tokens' => ['oauth' => [], 'bot' => ['U_BOT']]],
+    ])->assertOk();
+
+    expect(AuditLog::where('action', 'slack.uninstalled')->count())->toBe(1)
+        ->and(AuditLog::where('action', 'slack.uninstalled')->sole()->metadata['reason'])->toBe('removed_by_user');
+});
+
+test('the events handler re-reads the row under lock and skips an installation that changed after the first query', function (array $change, bool $tokenSurvives) {
+    [, , , $integration] = SlackApp::team();
+
+    // Change the row right after the handler's first query loaded it, as a
+    // concurrent removal or re-install would: only the locked re-read sees it.
+    $changed = false;
+    ChatIntegration::retrieved(function (ChatIntegration $loaded) use (&$changed, $change) {
+        if (! $changed) {
+            $changed = true;
+            DB::table('chat_integrations')->where('id', $loaded->id)->update($change);
+        }
+    });
+
+    try {
+        SlackApp::postJson($this, route('webhooks.slack.events'), [
+            'type' => 'event_callback',
+            'team_id' => SlackApp::WORKSPACE,
+            'event' => ['type' => 'tokens_revoked', 'tokens' => ['oauth' => [], 'bot' => ['U_BOT']]],
+        ])->assertOk();
+    } finally {
+        ChatIntegration::flushEventListeners();
+    }
+
+    expect($changed)->toBeTrue()
+        ->and(AuditLog::where('action', 'slack.uninstalled')->exists())->toBeFalse()
+        ->and(filled($integration->fresh()->bot_token))->toBe($tokenSurvives);
+})->with([
+    'already ended by someone else' => [['slack_team_id' => null, 'bot_token' => null], false],
+    'now a different bot user' => [['bot_user_id' => 'U_REINSTALLED'], true],
+]);
 
 test('removing the app keeps a webhook that was set up beside it', function () {
     [$team, $dba] = uiSlackSetup([
@@ -148,6 +279,7 @@ test('removing the app keeps a webhook that was set up beside it', function () {
         'signing_secret' => 'team-secret',
         'dm_approvers' => true,
     ]);
+    SlackApp::fakeApi();
 
     Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
 
@@ -164,6 +296,7 @@ test('removing the app keeps a webhook that was set up beside it', function () {
 
 test('removing the app drops pending suggestions but keeps the dismissed ones', function () {
     [$team, $dba, $developer, $admin] = uiSlackSetup();
+    SlackApp::fakeApi();
     $other = User::factory()->create();
     $team->users()->attach($other, ['role' => 'developer']);
     $pending = uiSuggestion($team, $developer);
@@ -177,6 +310,7 @@ test('removing the app drops pending suggestions but keeps the dismissed ones', 
 
 test('suggestions of another team in the same workspace survive a removal', function () {
     [$team, $dba, $developer] = uiSlackSetup();
+    SlackApp::fakeApi();
     [$otherTeam, , $otherDeveloper] = SlackApp::team([], '_OTHER');
     uiSuggestion($team, $developer);
     $kept = uiSuggestion($otherTeam, $otherDeveloper, 'U_OTHER');
@@ -248,8 +382,12 @@ test('switching the DM switch tells the user it was saved', function () {
 
 test('an admin removing the whole integration also records the app uninstall', function () {
     [$team, , , $admin] = uiSlackSetup();
+    SlackApp::fakeApi();
 
     Livewire::actingAs($admin)->test(ChatOps::class)->call('remove', 'slack')->assertHasNoErrors();
+
+    Http::assertSent(fn (Request $request) => str_ends_with($request->url(), '/auth.revoke')
+        && $request->hasHeader('Authorization', 'Bearer '.SlackApp::BOT_TOKEN));
 
     $uninstall = AuditLog::where('action', 'slack.uninstalled')->sole();
     $removal = AuditLog::where('action', 'chat_integration.removed')->sole();
