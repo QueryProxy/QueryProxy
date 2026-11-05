@@ -6,6 +6,10 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Narrow screens: the sidebar now collapses into a menu-button drawer below the `md` breakpoint (Esc and outside click close it), so the app layout no longer overflows horizontally on phones.
+
 ## [0.4.1] - 2026-11-04
 
 ### Added

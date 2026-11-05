@@ -29,6 +29,7 @@
         'refresh' => '<path d="M20 12a8 8 0 10-2.4 5.7"/><path d="M20 6.5V12h-5.4"/>',
         'lock' => '<rect x="4.5" y="10.5" width="15" height="9.5" rx="2"/><path d="M8 10.5V7.6a4 4 0 018 0v2.9"/><path d="M12 14.3v2"/>',
         'key' => '<circle cx="8" cy="12" r="4"/><path d="M12 12h9"/><path d="M17.5 12v3.5"/><path d="M20.5 12v2.5"/>',
+        'menu' => '<path d="M4 6.5h16"/><path d="M4 12h16"/><path d="M4 17.5h16"/>',
         'dots' => '<circle cx="12" cy="5.5" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="12" cy="18.5" r="1.2"/>',
         'arrow-right' => '<path d="M5 12h13"/><path d="M13 7l5 5-5 5"/>',
         'arrow-left' => '<path d="M19 12H6"/><path d="M11 7l-5 5 5 5"/>',
