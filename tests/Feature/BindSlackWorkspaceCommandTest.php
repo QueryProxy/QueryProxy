@@ -36,7 +36,7 @@ test('declining the confirmation changes nothing', function () {
     $identity = unboundSlackIdentity('U_ONE');
 
     $this->artisan('queryproxy:chat:bind-slack-workspace', ['team_id' => 'T0123ABC'])
-        ->expectsConfirmation('Bind 1 Slack identity without a workspace to T0123ABC? Those Slack members will be able to act as their QueryProxy users from that workspace.', 'no')
+        ->expectsConfirmation('Bind 1 Slack identity without a workspace to T0123ABC? That Slack member will be able to act as their QueryProxy user from that workspace.', 'no')
         ->expectsOutputToContain('Nothing was changed.')
         ->assertFailed();
 
@@ -81,7 +81,7 @@ test('a workspace the app is not installed in is flagged before the question', f
 
     $this->artisan('queryproxy:chat:bind-slack-workspace', ['team_id' => 'T0123ABC'])
         ->expectsOutputToContain('is not a workspace the app is installed in')
-        ->expectsConfirmation('Bind 1 Slack identity without a workspace to T0123ABC? Those Slack members will be able to act as their QueryProxy users from that workspace.', 'no')
+        ->expectsConfirmation('Bind 1 Slack identity without a workspace to T0123ABC? That Slack member will be able to act as their QueryProxy user from that workspace.', 'no')
         ->assertFailed();
 });
 

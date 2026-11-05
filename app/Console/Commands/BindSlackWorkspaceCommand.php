@@ -51,8 +51,11 @@ class BindSlackWorkspaceCommand extends Command
             }
 
             $what = $count === 1 ? 'identity' : 'identities';
+            $who = $count === 1
+                ? 'That Slack member will be able to act as their QueryProxy user'
+                : 'Those Slack members will be able to act as their QueryProxy users';
 
-            if (! $this->confirm("Bind {$count} Slack {$what} without a workspace to {$workspaceId}? Those Slack members will be able to act as their QueryProxy users from that workspace.")) {
+            if (! $this->confirm("Bind {$count} Slack {$what} without a workspace to {$workspaceId}? {$who} from that workspace.")) {
                 $this->line('Nothing was changed.');
 
                 return self::FAILURE;

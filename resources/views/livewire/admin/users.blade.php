@@ -127,12 +127,16 @@
         <x-ui.alert tone="pending" icon="shield" class="mb-2.5">
             <div class="flex flex-wrap items-center gap-2.5">
                 <span>
-                    {{ $unboundSlackUserIds->count() }} Slack {{ $unboundSlackUserIds->count() === 1 ? 'ID has' : 'IDs have' }} no workspace and match nothing, so those members cannot act from Slack.
+                    @if ($unboundSlackUserIds->count() === 1)
+                        1 Slack ID has no workspace and matches nothing, so that member cannot act from Slack.
+                    @else
+                        {{ $unboundSlackUserIds->count() }} Slack IDs have no workspace and match nothing, so those members cannot act from Slack.
+                    @endif
                     Enter the workspace ID above to bind them in one step.
                 </span>
                 @if ($bindTarget !== null)
                     <x-ui.action wire:click="bindUnboundSlackIdentities"
-                                 wire:confirm="Bind {{ $unboundSlackUserIds->count() }} Slack {{ $unboundSlackUserIds->count() === 1 ? 'ID' : 'IDs' }} without a workspace to {{ $bindTarget }}? Those Slack members will be able to act as their QueryProxy users from {{ $bindTarget }}. Check the ID: a wrong one has to be corrected user by user."
+                                 wire:confirm="Bind {{ $unboundSlackUserIds->count() }} Slack {{ $unboundSlackUserIds->count() === 1 ? 'ID' : 'IDs' }} without a workspace to {{ $bindTarget }}? {{ $unboundSlackUserIds->count() === 1 ? 'That Slack member' : 'Those Slack members' }} will be able to act as their QueryProxy {{ $unboundSlackUserIds->count() === 1 ? 'user' : 'users' }} from {{ $bindTarget }}. Check the ID: a wrong one has to be corrected user by user."
                                  tone="accent">Bind {{ $unboundSlackUserIds->count() }} to {{ $bindTarget }}</x-ui.action>
                 @else
                     <span class="text-mute-3">No valid workspace ID entered yet (T followed by letters and digits).</span>

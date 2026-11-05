@@ -805,18 +805,31 @@ test('a Slack ID without a workspace is marked in the table', function () {
 
     Livewire::actingAs($admin)->test(Users::class)
         ->assertSee('No workspace')
-        ->assertSee('match nothing')
+        ->assertSee('1 Slack ID has no workspace and matches nothing, so that member cannot act from Slack.')
         // No id entered: no bind button, only the request for one.
         ->assertSee('No valid workspace ID entered yet')
         ->assertDontSee('Bind 1 to')
         ->set('slackWorkspaceId', 't0abc12')
         // The button and its confirmation name the id and the number of identities.
         ->assertSee('Bind 1 to T0ABC12')
-        ->assertSeeHtml('Bind 1 Slack ID without a workspace to T0ABC12?');
+        ->assertSeeHtml('Bind 1 Slack ID without a workspace to T0ABC12?')
+        ->assertSeeHtml('That Slack member will be able to act as their QueryProxy user from T0ABC12.');
 
     ChatIdentity::where('user_id', $person->id)->update(['team_id' => SlackApp::WORKSPACE]);
 
     Livewire::actingAs($admin)->test(Users::class)->assertDontSee('No workspace');
+});
+
+test('the unbound Slack ID banner uses the plural form for several identities', function () {
+    [, , , $admin] = uiSlackSetup();
+    foreach (['U_ONE', 'U_TWO'] as $externalId) {
+        ChatIdentity::create(['user_id' => User::factory()->create()->id, 'provider' => 'slack', 'external_id' => $externalId]);
+    }
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->assertSee('2 Slack IDs have no workspace and match nothing, so those members cannot act from Slack.')
+        ->set('slackWorkspaceId', 't0abc12')
+        ->assertSeeHtml('Those Slack members will be able to act as their QueryProxy users from T0ABC12.');
 });
 
 test('the bind action gives every unbound Slack ID the entered workspace, audited, and leaves the rest', function () {
