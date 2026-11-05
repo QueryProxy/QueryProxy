@@ -277,7 +277,7 @@ class Users extends Component
         $this->assertAdmin();
         $this->resetErrorBag('suggestions');
 
-        $suggestion = SlackIdentitySuggestion::query()->where('status', SlackIdentitySuggestion::PENDING)->find($suggestionId);
+        $suggestion = SlackIdentitySuggestion::query()->pending()->find($suggestionId);
 
         if (! $suggestion) {
             $this->addError('suggestions', 'This suggestion no longer exists.');
@@ -322,15 +322,19 @@ class Users extends Component
         session()->flash('status', "Slack ID {$suggestion->slack_user_id} linked to \"{$user->email}\".");
     }
 
+    /**
+     * Rejecting keeps the row, marked as dismissed, so the weekly scan does not
+     * propose the same Slack member for this user again.
+     */
     public function rejectSlackSuggestion(int $suggestionId): void
     {
         $this->assertAdmin();
         $this->resetErrorBag('suggestions');
 
         SlackIdentitySuggestion::query()
-            ->where('status', SlackIdentitySuggestion::PENDING)
+            ->pending()
             ->whereKey($suggestionId)
-            ->delete();
+            ->update(['status' => SlackIdentitySuggestion::DISMISSED, 'dismissed_at' => now()]);
     }
 
     /**
@@ -341,7 +345,7 @@ class Users extends Component
     private function slackSuggestions(): Builder
     {
         return SlackIdentitySuggestion::query()
-            ->where('status', SlackIdentitySuggestion::PENDING)
+            ->pending()
             ->whereHas('user', fn ($query) => $query->whereRaw('LOWER(users.email) = LOWER(slack_identity_suggestions.matched_email)'))
             ->whereNotIn('user_id', ChatIdentity::where('provider', 'slack')->select('user_id'))
             ->whereNotIn('slack_user_id', ChatIdentity::where('provider', 'slack')->select('external_id'))

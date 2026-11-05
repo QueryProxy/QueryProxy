@@ -162,6 +162,19 @@ test('removing the app keeps a webhook that was set up beside it', function () {
         ->and($chat->usesSlackBot())->toBeFalse();
 });
 
+test('removing the app drops pending suggestions but keeps the dismissed ones', function () {
+    [$team, $dba, $developer, $admin] = uiSlackSetup();
+    $other = User::factory()->create();
+    $team->users()->attach($other, ['role' => 'developer']);
+    $pending = uiSuggestion($team, $developer);
+    $dismissed = uiSuggestion($team, $other, 'U_REJECTED', ['dismissed_at' => now()]);
+
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('uninstallSlack')->assertHasNoErrors();
+
+    expect(SlackIdentitySuggestion::find($pending->id))->toBeNull()
+        ->and(SlackIdentitySuggestion::find($dismissed->id))->not->toBeNull();
+});
+
 test('suggestions of another team in the same workspace survive a removal', function () {
     [$team, $dba, $developer] = uiSlackSetup();
     [$otherTeam, , $otherDeveloper] = SlackApp::team([], '_OTHER');
@@ -414,7 +427,7 @@ test('approving a suggestion links the Slack ID through the normal path and audi
         ]);
 });
 
-test('rejecting a suggestion deletes it and links nothing', function () {
+test('rejecting a suggestion keeps it as dismissed, hides it and links nothing', function () {
     [$team, , , $admin] = uiSlackSetup();
     $newcomer = User::factory()->create();
     $team->users()->attach($newcomer, ['role' => 'developer']);
@@ -424,9 +437,17 @@ test('rejecting a suggestion deletes it and links nothing', function () {
         ->call('rejectSlackSuggestion', $suggestion->id)
         ->assertHasNoErrors();
 
-    expect(SlackIdentitySuggestion::count())->toBe(0)
+    expect(SlackIdentitySuggestion::pending()->count())->toBe(0)
+        ->and($suggestion->fresh()->dismissed_at)->not->toBeNull()
         ->and(ChatIdentity::where('user_id', $newcomer->id)->exists())->toBeFalse()
         ->and(AuditLog::where('action', 'chat_identity.linked')->exists())->toBeFalse();
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->assertDontSee('Slack matching suggestions')
+        ->call('approveSlackSuggestion', $suggestion->id)
+        ->assertHasErrors('suggestions');
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->exists())->toBeFalse();
 });
 
 test('only a system admin can approve or reject', function () {

@@ -55,7 +55,14 @@ class SlackIdentitySuggester
 
         $linkedUserIds = ChatIdentity::query()->where('provider', ChatProvider::Slack->value)->pluck('user_id');
         $linkedSlackIds = ChatIdentity::query()->where('provider', ChatProvider::Slack->value)->pluck('external_id');
-        $alreadySuggested = SlackIdentitySuggestion::query()->where('slack_team_id', $workspaceId)->pluck('user_id');
+        // Dismissed rows are left out: a user whose suggestion was rejected is
+        // looked up again, because only the rejected pair (user, Slack member)
+        // stays rejected. If the address now points at another member, that one
+        // is proposed.
+        $alreadySuggested = SlackIdentitySuggestion::query()
+            ->where('slack_team_id', $workspaceId)
+            ->whereNull('dismissed_at')
+            ->pluck('user_id');
 
         $users = $integration->team->users()
             ->active()
@@ -93,6 +100,19 @@ class SlackIdentitySuggester
                 continue;
             }
 
+            // The pair an admin rejected is not proposed again. Looked up after
+            // the Slack call, so a rejection that landed meanwhile counts too.
+            $dismissed = SlackIdentitySuggestion::query()
+                ->where('user_id', $user->id)
+                ->where('slack_team_id', $workspaceId)
+                ->whereNotNull('dismissed_at')
+                ->where('slack_user_id', $member['id'])
+                ->exists();
+
+            if ($dismissed) {
+                continue;
+            }
+
             SlackIdentitySuggestion::query()->updateOrCreate(
                 ['user_id' => $user->id, 'slack_team_id' => $workspaceId],
                 [
@@ -100,6 +120,8 @@ class SlackIdentitySuggester
                     'slack_user_id' => $member['id'],
                     'matched_email' => $user->email,
                     'status' => SlackIdentitySuggestion::PENDING,
+                    // A different member than the rejected one starts over.
+                    'dismissed_at' => null,
                 ],
             );
 

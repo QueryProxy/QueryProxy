@@ -159,8 +159,10 @@ class ChatOps extends Component
 
         $integration->clearSlackInstallation();
 
-        // Suggestions came from the workspace that was just disconnected.
-        SlackIdentitySuggestion::where('team_id', $team->id)
+        // Suggestions came from the workspace that was just disconnected. The
+        // ones an admin dismissed stay, so installing again does not bring
+        // back a match that was already rejected.
+        SlackIdentitySuggestion::pending()->where('team_id', $team->id)
             ->when($workspaceId, fn ($query) => $query->where('slack_team_id', $workspaceId))
             ->delete();
 

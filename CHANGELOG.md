@@ -8,6 +8,7 @@ All notable changes to QueryProxy are documented here. The format follows
 
 ### Fixed
 
+- Rejecting a Slack identity suggestion is now permanent: the weekly scan no longer proposes the same match again (`dismissed_at` on `slack_identity_suggestions`).
 - Narrow screens: the sidebar now collapses into a menu-button drawer below the `md` breakpoint (Esc and outside click close it), so the app layout no longer overflows horizontally on phones.
 
 ## [0.4.1] - 2026-11-04
