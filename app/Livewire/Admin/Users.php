@@ -7,6 +7,7 @@ use App\Models\ChatIntegration;
 use App\Models\SlackIdentitySuggestion;
 use App\Models\User;
 use App\Services\Auth\TwoFactorService;
+use App\Services\Chat\SlackWorkspaceBinder;
 use App\Services\Users\UserLifecycle;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
@@ -28,6 +29,12 @@ class Users extends Component
     public string $password = '';
 
     public bool $isAdmin = false;
+
+    /**
+     * Slack workspace a typed Slack member id belongs to. Left empty, the one
+     * workspace the Slack app is installed in is used.
+     */
+    public string $slackWorkspaceId = '';
 
     /**
      * Route middleware only guards the initial page load; every action must
@@ -216,11 +223,75 @@ class Users extends Component
 
         abort_unless(in_array($provider, ['slack', 'teams'], true), 422);
 
-        $error = $this->linkChatIdentity(User::findOrFail($userId), $provider, $externalId);
+        // The previous attempt's message must not outlive a successful one.
+        $this->resetErrorBag('chat_id');
+
+        $workspaceId = null;
+
+        // A Slack member id only means something inside its workspace; Teams
+        // identities carry none.
+        if ($provider === 'slack' && trim($externalId) !== '') {
+            $user = User::findOrFail($userId);
+            $workspaceId = $this->resolveSlackWorkspace($user);
+
+            if ($workspaceId === null) {
+                $this->addError('chat_id', 'Choose the Slack workspace of this ID first: enter its workspace ID (T0123ABC) above the table.');
+
+                return;
+            }
+        }
+
+        $error = $this->linkChatIdentity(User::findOrFail($userId), $provider, $externalId, workspaceId: $workspaceId);
 
         if ($error !== null) {
-            $this->addError('email', $error);
+            $this->addError('chat_id', $error);
         }
+    }
+
+    /**
+     * The workspace a hand-typed Slack member id is linked in: the one entered
+     * on the page, else the single workspace the app is installed in for the
+     * user's own teams. Null when neither names exactly one.
+     */
+    private function resolveSlackWorkspace(User $user): ?string
+    {
+        if (trim($this->slackWorkspaceId) !== '') {
+            return SlackWorkspaceBinder::normalize($this->slackWorkspaceId);
+        }
+
+        $installed = ChatIntegration::query()
+            ->where('provider', 'slack')
+            ->whereNotNull('bot_token')
+            ->whereNotNull('slack_team_id')
+            ->whereIn('team_id', $user->teams()->select('teams.id'))
+            ->distinct()
+            ->pluck('slack_team_id');
+
+        return $installed->count() === 1 ? $installed->first() : null;
+    }
+
+    /**
+     * Bind every Slack identity that has no workspace to the workspace entered
+     * on the page. The id must be typed: nothing is inferred from the
+     * installations, because the identities left unbound are exactly those the
+     * installations could not name. Until this runs they match nothing.
+     */
+    public function bindUnboundSlackIdentities(): void
+    {
+        $this->assertAdmin();
+        $this->resetErrorBag('chat_id');
+
+        $workspaceId = SlackWorkspaceBinder::normalize($this->slackWorkspaceId);
+
+        if ($workspaceId === null) {
+            $this->addError('chat_id', 'Enter the Slack workspace ID (T0123ABC) above the table first; it is never filled in for you.');
+
+            return;
+        }
+
+        $bound = app(SlackWorkspaceBinder::class)->bind($workspaceId, auth()->user());
+
+        session()->flash('status', "{$bound} Slack ".($bound === 1 ? 'identity' : 'identities')." bound to workspace {$workspaceId}.");
     }
 
     /**
@@ -228,8 +299,9 @@ class Users extends Component
      * when the id cannot be linked, so each caller shows it where it belongs.
      *
      * @param  array<string, mixed>  $auditContext  extra audit metadata, e.g. where the id came from
+     * @param  string|null  $workspaceId  the Slack workspace of a Slack id (stored as `team_id`); null for Teams
      */
-    private function linkChatIdentity(User $user, string $provider, string $externalId, array $auditContext = []): ?string
+    private function linkChatIdentity(User $user, string $provider, string $externalId, array $auditContext = [], ?string $workspaceId = null): ?string
     {
         $externalId = trim($externalId);
 
@@ -251,12 +323,12 @@ class Users extends Component
 
         ChatIdentity::updateOrCreate(
             ['user_id' => $user->id, 'provider' => $provider],
-            ['external_id' => $externalId],
+            ['external_id' => $externalId, 'team_id' => $provider === 'slack' ? $workspaceId : null],
         );
 
         audit()->record('chat_identity.linked', metadata: [
             'user' => $user->email, 'provider' => $provider, 'external_id' => $externalId,
-        ] + $auditContext);
+        ] + ($provider === 'slack' ? ['slack_team_id' => $workspaceId] : []) + $auditContext);
 
         if ($provider === 'slack') {
             // Whatever way the id got here, the user no longer needs a proposal.
@@ -295,7 +367,9 @@ class Users extends Component
             ->whereNotNull('bot_token')
             ->exists();
 
-        $alreadyLinked = $user && ChatIdentity::where('user_id', $user->id)->where('provider', 'slack')->exists();
+        // An identity without a workspace (made before they were bound) does not
+        // count: confirming the suggestion binds it.
+        $alreadyLinked = $user && ChatIdentity::where('user_id', $user->id)->where('provider', 'slack')->whereNotNull('team_id')->exists();
 
         // The match was made on an address the user may no longer have (SCIM,
         // OIDC or an admin changed it); the e-mail is the only evidence there is.
@@ -311,7 +385,7 @@ class Users extends Component
         $error = $this->linkChatIdentity($user, 'slack', $suggestion->slack_user_id, [
             'source' => 'slack_suggestion',
             'slack_team_id' => $suggestion->slack_team_id,
-        ]);
+        ], $suggestion->slack_team_id);
 
         if ($error !== null) {
             $this->addError('suggestions', $error);
@@ -347,8 +421,12 @@ class Users extends Component
         return SlackIdentitySuggestion::query()
             ->pending()
             ->whereHas('user', fn ($query) => $query->whereRaw('LOWER(users.email) = LOWER(slack_identity_suggestions.matched_email)'))
-            ->whereNotIn('user_id', ChatIdentity::where('provider', 'slack')->select('user_id'))
-            ->whereNotIn('slack_user_id', ChatIdentity::where('provider', 'slack')->select('external_id'))
+            ->whereNotIn('user_id', ChatIdentity::where('provider', 'slack')->whereNotNull('team_id')->select('user_id'))
+            ->whereNotExists(fn ($query) => $query->selectRaw('1')
+                ->from('chat_identities')
+                ->where('chat_identities.provider', 'slack')
+                ->whereColumn('chat_identities.external_id', 'slack_identity_suggestions.slack_user_id')
+                ->whereColumn('chat_identities.user_id', '!=', 'slack_identity_suggestions.user_id'))
             ->whereExists(fn ($query) => $query->selectRaw('1')
                 ->from('chat_integrations')
                 ->whereColumn('chat_integrations.team_id', 'slack_identity_suggestions.team_id')
@@ -361,6 +439,8 @@ class Users extends Component
         return view('livewire.admin.users', [
             'users' => User::withCount('teams')->orderBy('name')->get(),
             'slackIds' => ChatIdentity::where('provider', 'slack')->pluck('external_id', 'user_id'),
+            'bindTarget' => SlackWorkspaceBinder::normalize($this->slackWorkspaceId),
+            'unboundSlackUserIds' => ChatIdentity::where('provider', 'slack')->whereNull('team_id')->pluck('user_id')->flip(),
             'teamsIds' => ChatIdentity::where('provider', 'teams')->pluck('external_id', 'user_id'),
             'suggestions' => $this->slackSuggestions()->with(['user', 'team'])->orderBy('id')->limit(self::SUGGESTION_LIMIT)->get(),
             'suggestionTotal' => $this->slackSuggestions()->count(),

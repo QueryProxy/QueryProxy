@@ -52,8 +52,8 @@ class SlackApp
         $team->users()->attach($dba, ['role' => 'dba']);
         $team->users()->attach($developer, ['role' => 'developer']);
 
-        ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA'.$memberSuffix]);
-        ChatIdentity::create(['user_id' => $developer->id, 'provider' => 'slack', 'external_id' => 'U_DEV'.$memberSuffix]);
+        ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA'.$memberSuffix, 'team_id' => self::WORKSPACE]);
+        ChatIdentity::create(['user_id' => $developer->id, 'provider' => 'slack', 'external_id' => 'U_DEV'.$memberSuffix, 'team_id' => self::WORKSPACE]);
 
         return [$team, $dba, $developer, self::install($team, $integration)];
     }

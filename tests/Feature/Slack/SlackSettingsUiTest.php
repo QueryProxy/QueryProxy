@@ -6,6 +6,7 @@ use App\Models\AuditLog;
 use App\Models\ChatIdentity;
 use App\Models\ChatIntegration;
 use App\Models\SlackIdentitySuggestion;
+use App\Models\Team;
 use App\Models\User;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\DB;
@@ -498,7 +499,7 @@ test('suggestions that can no longer be acted on are not listed', function () {
     $team->users()->attach($held, ['role' => 'developer']);
 
     // dba and developer already have identities; give the rest one reason each to be stale.
-    ChatIdentity::create(['user_id' => $linked->id, 'provider' => 'slack', 'external_id' => 'U_LINKED']);
+    ChatIdentity::create(['user_id' => $linked->id, 'provider' => 'slack', 'external_id' => 'U_LINKED', 'team_id' => SlackApp::WORKSPACE]);
     uiSuggestion($team, $linked, 'U_STALE_LINKED');
     uiSuggestion($team, $gone, 'U_STALE_DELETED');
     $gone->delete();
@@ -695,4 +696,191 @@ test('the actions column of the suggestions table has an accessible name', funct
     uiSuggestion($team, $person, 'U_PERSON');
 
     Livewire::actingAs($admin)->test(Users::class)->assertSeeHtml('<span class="sr-only">Actions</span>');
+});
+
+// --- Slack identities are bound to a workspace (plan v0.4.2, Faz 03) -------------------------
+
+test('a typed Slack ID is linked in the one workspace the app is installed in', function () {
+    [$team, , , $admin] = uiSlackSetup();
+    $newcomer = User::factory()->create();
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasNoErrors();
+
+    $log = AuditLog::where('action', 'chat_identity.linked')->where('metadata->user', $newcomer->email)->sole();
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->sole()->team_id)->toBe(SlackApp::WORKSPACE)
+        ->and($log->metadata['slack_team_id'])->toBe(SlackApp::WORKSPACE);
+});
+
+test('a typed Slack ID takes the workspace entered on the page, which also serves webhook-only setups', function () {
+    [$team, , , $admin, $chat] = uiSlackSetup();
+    $chat->clearSlackInstallation();
+    $newcomer = User::factory()->create();
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+
+    $component = Livewire::actingAs($admin)->test(Users::class)
+        // No installation to name the workspace and none entered: nothing is linked.
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasErrors('chat_id');
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->exists())->toBeFalse();
+
+    $component->set('slackWorkspaceId', 'not a workspace')
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasErrors('chat_id');
+
+    $component->set('slackWorkspaceId', 't_elsewhere')
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasNoErrors();
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->sole()->team_id)->toBe('T_ELSEWHERE');
+});
+
+test('with two workspaces installed a typed Slack ID needs the workspace entered', function () {
+    [$team, , , $admin] = uiSlackSetup();
+    $second = Team::factory()->create();
+    SlackApp::install($second, ['slack_team_id' => 'T_SECOND']);
+    $newcomer = User::factory()->create();
+    // A member of both teams: their own teams name two workspaces.
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+    $second->users()->attach($newcomer, ['role' => 'developer']);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasErrors('chat_id')
+        ->set('slackWorkspaceId', 'T_SECOND')
+        ->call('updateSlackId', $newcomer->id, 'U_TYPED')
+        ->assertHasNoErrors();
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->sole()->team_id)->toBe('T_SECOND');
+});
+
+test('approving a suggestion binds the identity to the workspace the suggestion came from', function () {
+    [$team, , , $admin] = uiSlackSetup();
+    $newcomer = User::factory()->create();
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+    $suggestion = uiSuggestion($team, $newcomer, 'U_NEWCOMER');
+
+    Livewire::actingAs($admin)->test(Users::class)->call('approveSlackSuggestion', $suggestion->id)->assertHasNoErrors();
+
+    expect(ChatIdentity::where('user_id', $newcomer->id)->sole()->team_id)->toBe(SlackApp::WORKSPACE);
+});
+
+test('a suggestion for a user whose identity has no workspace is listed, and approving binds it', function () {
+    [$team, , , $admin] = uiSlackSetup();
+    $person = User::factory()->create();
+    $team->users()->attach($person, ['role' => 'developer']);
+    ChatIdentity::create(['user_id' => $person->id, 'provider' => 'slack', 'external_id' => 'U_UNBOUND']);
+    $suggestion = uiSuggestion($team, $person, 'U_UNBOUND');
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->assertSee($person->email)
+        ->call('approveSlackSuggestion', $suggestion->id)
+        ->assertHasNoErrors();
+
+    $identity = ChatIdentity::where('user_id', $person->id)->sole();
+
+    expect($identity->external_id)->toBe('U_UNBOUND')
+        ->and($identity->team_id)->toBe(SlackApp::WORKSPACE);
+});
+
+test('removing the app keeps the Slack identities, which then match nothing in another workspace', function () {
+    // Decision: identities belong to people, not to one team's installation, and a workspace can
+    // serve several teams; the workspace binding already keeps them from matching elsewhere.
+    [$team, $dba] = uiSlackSetup();
+
+    Http::fake(['slack.com/api/*' => Http::response(['ok' => true])]);
+    Livewire::actingAs($dba)->test(ChatOps::class)->call('remove', 'slack');
+
+    expect(ChatIdentity::where('provider', 'slack')->whereNotNull('team_id')->count())->toBe(2);
+});
+
+test('a Slack ID without a workspace is marked in the table', function () {
+    [, , , $admin] = uiSlackSetup();
+    $person = User::factory()->create(['name' => 'Passive Person']);
+    ChatIdentity::create(['user_id' => $person->id, 'provider' => 'slack', 'external_id' => 'U_PASSIVE']);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->assertSee('No workspace')
+        ->assertSee('match nothing')
+        // No id entered: no bind button, only the request for one.
+        ->assertSee('No valid workspace ID entered yet')
+        ->assertDontSee('Bind 1 to')
+        ->set('slackWorkspaceId', 't0abc12')
+        // The button and its confirmation name the id and the number of identities.
+        ->assertSee('Bind 1 to T0ABC12')
+        ->assertSeeHtml('Bind 1 Slack ID without a workspace to T0ABC12?');
+
+    ChatIdentity::where('user_id', $person->id)->update(['team_id' => SlackApp::WORKSPACE]);
+
+    Livewire::actingAs($admin)->test(Users::class)->assertDontSee('No workspace');
+});
+
+test('the bind action gives every unbound Slack ID the entered workspace, audited, and leaves the rest', function () {
+    [, $dba, $developer, $admin] = uiSlackSetup();
+    $one = User::factory()->create();
+    $two = User::factory()->create();
+    $teamsUser = User::factory()->create();
+    ChatIdentity::create(['user_id' => $one->id, 'provider' => 'slack', 'external_id' => 'U_ONE']);
+    ChatIdentity::create(['user_id' => $two->id, 'provider' => 'slack', 'external_id' => 'U_TWO']);
+    ChatIdentity::create(['user_id' => $teamsUser->id, 'provider' => 'teams', 'external_id' => 'AAD_ONE']);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->set('slackWorkspaceId', 't_bound')
+        ->call('bindUnboundSlackIdentities')
+        ->assertHasNoErrors();
+
+    $logs = AuditLog::where('action', 'chat_identity.linked')->where('metadata->source', 'workspace_bind')->get();
+
+    expect(ChatIdentity::whereIn('external_id', ['U_ONE', 'U_TWO'])->pluck('team_id')->unique()->all())->toBe(['T_BOUND'])
+        // Already bound identities and Teams identities are not touched.
+        ->and(ChatIdentity::where('user_id', $dba->id)->sole()->team_id)->toBe(SlackApp::WORKSPACE)
+        ->and(ChatIdentity::where('provider', 'teams')->sole()->team_id)->toBeNull()
+        ->and($logs)->toHaveCount(2)
+        ->and($logs->pluck('user_id')->unique()->all())->toBe([$admin->id])
+        ->and($logs->first()->metadata['slack_team_id'])->toBe('T_BOUND');
+});
+
+test('the bind action needs a valid workspace and an admin', function () {
+    [, , $developer, $admin] = uiSlackSetup();
+    SlackApp::install(Team::factory()->create(), ['slack_team_id' => 'T_SECOND']);
+    $person = User::factory()->create();
+    ChatIdentity::create(['user_id' => $person->id, 'provider' => 'slack', 'external_id' => 'U_PASSIVE']);
+
+    // Nothing entered: no fallback to an installed workspace (two here, and the same with one);
+    // an enterprise id is not a workspace id.
+    Livewire::actingAs($admin)->test(Users::class)
+        ->call('bindUnboundSlackIdentities')->assertHasErrors('chat_id')
+        ->set('slackWorkspaceId', 'E0123ABC')->call('bindUnboundSlackIdentities')->assertHasErrors('chat_id');
+
+    expect(ChatIdentity::where('user_id', $person->id)->sole()->team_id)->toBeNull();
+
+    Livewire::actingAs($developer)->test(Users::class)->set('slackWorkspaceId', 'T_BOUND')->call('bindUnboundSlackIdentities')->assertForbidden();
+});
+
+test('a failed Slack ID link does not clear the error of the new user form', function () {
+    [, , , $admin] = uiSlackSetup();
+    $person = User::factory()->create();
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->set('email', 'not-an-email')
+        ->call('createUser')
+        ->assertHasErrors('email')
+        ->call('updateSlackId', $person->id, 'U_SOMEONE')
+        ->assertHasErrors('email');
+});
+
+test('the bind action never falls back to the one installed workspace', function () {
+    [, , , $admin] = uiSlackSetup();
+    $person = User::factory()->create();
+    ChatIdentity::create(['user_id' => $person->id, 'provider' => 'slack', 'external_id' => 'U_PASSIVE']);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->call('bindUnboundSlackIdentities')
+        ->assertHasErrors('chat_id');
+
+    expect(ChatIdentity::where('user_id', $person->id)->sole()->team_id)->toBeNull();
 });

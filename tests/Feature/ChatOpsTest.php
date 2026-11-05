@@ -46,7 +46,7 @@ function chatSetup(): array
         'enabled' => true,
     ]);
 
-    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA']);
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA', 'team_id' => 'T_WEBHOOK']);
 
     $request = QueryRequest::factory()->create([
         'team_id' => $team->id,
@@ -77,6 +77,7 @@ function slackPayload(QueryRequest $request, string $action, string $slackUserId
 
     return http_build_query(['payload' => json_encode([
         'type' => 'block_actions',
+        'team' => ['id' => 'T_WEBHOOK'],
         'user' => ['id' => $slackUserId],
         'actions' => [['action_id' => "queryproxy_{$action}", 'value' => $value]],
     ])]);
@@ -178,7 +179,7 @@ test('a signed slack approval naming a colleague is refused without a live actio
 
     $colleague = User::factory()->create();
     $team->users()->attach($colleague, ['role' => 'dba']);
-    ChatIdentity::create(['user_id' => $colleague->id, 'provider' => 'slack', 'external_id' => 'U_COLLEAGUE']);
+    ChatIdentity::create(['user_id' => $colleague->id, 'provider' => 'slack', 'external_id' => 'U_COLLEAGUE', 'team_id' => 'T_WEBHOOK']);
 
     // The attacker holds the signing secret (they rotated it, or it leaked) and
     // knows the colleague's Slack member ID, which is public in the workspace —
@@ -239,7 +240,7 @@ test('a slack identity mapped to a user outside the team is refused', function (
     [, , , $request] = chatSetup();
 
     $outsider = User::factory()->create();
-    ChatIdentity::create(['user_id' => $outsider->id, 'provider' => 'slack', 'external_id' => 'U_OUTSIDER']);
+    ChatIdentity::create(['user_id' => $outsider->id, 'provider' => 'slack', 'external_id' => 'U_OUTSIDER', 'team_id' => 'T_WEBHOOK']);
 
     $response = postSignedSlack($this, slackPayload($request, 'approve', 'U_OUTSIDER'));
 

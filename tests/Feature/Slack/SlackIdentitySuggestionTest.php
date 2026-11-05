@@ -366,3 +366,23 @@ test('rate limits that make no progress in a row stop the chain', function () {
     (new SuggestSlackIdentities($integration->id, 0, SuggestSlackIdentities::MAX_RATE_LIMIT_RETRIES))->handle(app(SlackIdentitySuggester::class));
     Queue::assertNothingPushed();
 });
+
+test('a user whose identity has no workspace is looked up, a bound one is not, and a member held by someone else is skipped', function () {
+    [$team, , , $integration] = SlackApp::team();
+    $unbound = User::factory()->create(['email' => 'unbound@example.com']);
+    $taker = User::factory()->create(['email' => 'taker@example.com']);
+    $team->users()->attach($unbound, ['role' => 'developer']);
+    $team->users()->attach($taker, ['role' => 'developer']);
+    ChatIdentity::create(['user_id' => $unbound->id, 'provider' => 'slack', 'external_id' => 'U_UNBOUND']);
+
+    lookupFake([
+        'unbound@example.com' => ['id' => 'U_UNBOUND', 'is_bot' => false, 'deleted' => false],
+        // U_DBA is already held by the team's DBA.
+        'taker@example.com' => ['id' => 'U_DBA', 'is_bot' => false, 'deleted' => false],
+    ]);
+
+    app(SlackIdentitySuggester::class)->suggestFor($integration);
+
+    expect(SlackIdentitySuggestion::pluck('user_id')->all())->toBe([$unbound->id]);
+
+});

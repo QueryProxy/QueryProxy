@@ -48,6 +48,10 @@
         <x-ui.alert tone="ok" icon="check" class="mb-3.5">{{ session('status') }}</x-ui.alert>
     @endif
 
+    @error('chat_id')
+        <x-ui.alert tone="danger" icon="shield" class="mb-3.5">{{ $message }}</x-ui.alert>
+    @enderror
+
     @error('suggestions')
         <x-ui.alert tone="danger" icon="shield" class="mb-3.5">{{ $message }}</x-ui.alert>
     @enderror
@@ -111,6 +115,32 @@
         </x-ui.panel>
     @endif
 
+    <div class="mb-2.5 flex items-center gap-2.5 text-[11.5px] text-mute-3">
+        <label for="slack-workspace-id" class="shrink-0">Slack workspace ID for typed Slack IDs</label>
+        <x-ui.input id="slack-workspace-id" type="text" wire:model.live.debounce.400ms="slackWorkspaceId"
+                    placeholder="{{ $workspaceNames->count() === 1 ? $workspaceNames->keys()->first() : 'T0123ABC' }}"
+                    class="h-[26px] w-40 font-mono text-[11.5px]" />
+        <span>A Slack member ID only works in the workspace it was linked in. Leave empty when the user's teams use one installed workspace.</span>
+    </div>
+
+    @if ($unboundSlackUserIds->isNotEmpty())
+        <x-ui.alert tone="pending" icon="shield" class="mb-2.5">
+            <div class="flex flex-wrap items-center gap-2.5">
+                <span>
+                    {{ $unboundSlackUserIds->count() }} Slack {{ $unboundSlackUserIds->count() === 1 ? 'ID has' : 'IDs have' }} no workspace and match nothing, so those members cannot act from Slack.
+                    Enter the workspace ID above to bind them in one step.
+                </span>
+                @if ($bindTarget !== null)
+                    <x-ui.action wire:click="bindUnboundSlackIdentities"
+                                 wire:confirm="Bind {{ $unboundSlackUserIds->count() }} Slack {{ $unboundSlackUserIds->count() === 1 ? 'ID' : 'IDs' }} without a workspace to {{ $bindTarget }}? Those Slack members will be able to act as their QueryProxy users from {{ $bindTarget }}. Check the ID: a wrong one has to be corrected user by user."
+                                 tone="accent">Bind {{ $unboundSlackUserIds->count() }} to {{ $bindTarget }}</x-ui.action>
+                @else
+                    <span class="text-mute-3">No valid workspace ID entered yet (T followed by letters and digits).</span>
+                @endif
+            </div>
+        </x-ui.alert>
+    @endif
+
     <x-ui.panel>
         <x-ui.table>
             <x-slot:head>
@@ -139,6 +169,9 @@
                         <x-ui.input type="text" value="{{ $slackIds[$u->id] ?? '' }}" placeholder="U0123ABC"
                                     wire:change="updateSlackId({{ $u->id }}, $event.target.value)"
                                     class="h-[26px] font-mono text-[11.5px]" />
+                        @if ($unboundSlackUserIds->has($u->id))
+                            <x-ui.badge tone="pending" class="mt-1" title="This Slack ID is not bound to a workspace, so it matches nothing until it is bound.">No workspace · not bound</x-ui.badge>
+                        @endif
                     </x-ui.td>
                     <x-ui.td>
                         <x-ui.input type="text" value="{{ $teamsIds[$u->id] ?? '' }}" placeholder="AAD object ID"

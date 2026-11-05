@@ -147,13 +147,14 @@ test('a suspended chat identity no longer resolves on slack', function () {
         'team_id' => $team->id, 'provider' => 'slack', 'webhook_url' => 'https://hooks.slack.com/services/T0/B0/X',
         'signing_secret' => SUSPEND_SLACK_SECRET, 'enabled' => true,
     ]);
-    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_SUSPENDED']);
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_SUSPENDED', 'team_id' => 'T_WEBHOOK']);
 
     app(UserLifecycle::class)->suspend($dba);
 
     $token = ChatApprovalToken::issueFor($request);
     $body = http_build_query(['payload' => json_encode([
         'type' => 'block_actions',
+        'team' => ['id' => 'T_WEBHOOK'],
         'user' => ['id' => 'U_SUSPENDED'],
         'actions' => [['action_id' => 'queryproxy_approve', 'value' => "approve:{$request->id}:{$token}"]],
     ])]);
