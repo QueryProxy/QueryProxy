@@ -103,6 +103,17 @@ class SlackClient
     }
 
     /**
+     * Revoke the bot token on Slack's side (`auth.revoke`), so it stops working
+     * even if a copy of it outlives the local one.
+     *
+     * @throws SlackApiException
+     */
+    public function revoke(string $token): void
+    {
+        $this->call('auth.revoke', $this->client($token)->asForm(), []);
+    }
+
+    /**
      * @param  array<string, mixed>  $body
      * @return array<string, mixed>
      *

@@ -7,6 +7,9 @@ use App\Enums\ChatProvider;
 use App\Models\ChatIntegration;
 use App\Models\SlackIdentitySuggestion;
 use App\Models\Team;
+use App\Services\Chat\SlackApiException;
+use App\Services\Chat\SlackClient;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Title;
 use Livewire\Component;
@@ -110,13 +113,14 @@ class ChatOps extends Component
     }
 
     /**
-     * Forget the Slack app installation of this team: the bot token is deleted
-     * and the pending identity suggestions of that workspace go with it. Unlike
-     * removing the whole integration this is open to the team's DBAs, because
-     * installing again is one OAuth round trip and needs no secret. The app
-     * itself stays in the Slack workspace until someone removes it there.
+     * Forget the Slack app installation of this team: the bot token is revoked
+     * on Slack and deleted here, and the pending identity suggestions of that
+     * workspace go with it. Unlike removing the whole integration this is open
+     * to the team's DBAs, because installing again is one OAuth round trip and
+     * needs no secret. The app stays listed in the Slack workspace, but its
+     * token is dead; someone can remove it there as well.
      */
-    public function uninstallSlack(): void
+    public function uninstallSlack(SlackClient $slack): void
     {
         $team = $this->team();
         $this->assertDba($team);
@@ -131,11 +135,11 @@ class ChatOps extends Component
             return;
         }
 
-        $this->forgetSlackApp($integration, $team);
+        $this->forgetSlackApp($integration, $team, $slack);
 
         $this->slackDmApprovers = false;
 
-        session()->flash('status', 'Slack app removed. Remove it from the workspace in Slack as well to revoke its access there.');
+        session()->flash('status', 'Slack app removed and its bot token revoked. Remove the app from the workspace in Slack as well.');
     }
 
     /** The team's Slack row, if the app is installed on it. */
@@ -149,18 +153,37 @@ class ChatOps extends Component
     }
 
     /**
-     * Drop the bot token and what hangs off it. A row that has no webhook mode
-     * behind it would be an empty shell, so it is deleted; one with a webhook
-     * keeps working in webhook mode.
+     * Drop the bot token and what hangs off it locally, then revoke the token
+     * on Slack (`auth.revoke`). The local installation goes first so the
+     * `tokens_revoked` event Slack may send in answer no longer matches a row
+     * and cannot audit the same removal twice. A failed revoke (network, 5xx,
+     * `ok: false`) is logged and audited but never keeps the token here. A row
+     * that has no webhook mode behind it would be an empty shell, so it is
+     * deleted; one with a webhook keeps working in webhook mode.
      */
-    private function forgetSlackApp(ChatIntegration $integration, Team $team): void
+    private function forgetSlackApp(ChatIntegration $integration, Team $team, SlackClient $slack): void
     {
         $workspaceId = $integration->slack_team_id;
+        $token = (string) $integration->bot_token;
+        $revokeError = null;
 
         $integration->clearSlackInstallation();
 
-        // Suggestions came from the workspace that was just disconnected.
-        SlackIdentitySuggestion::where('team_id', $team->id)
+        try {
+            $slack->revoke($token);
+        } catch (SlackApiException $e) {
+            $revokeError = $e->slackError;
+
+            Log::warning('QueryProxy: Slack auth.revoke failed, removing the installation locally anyway', [
+                'team_id' => $team->id,
+                'error' => $e->slackError,
+            ]);
+        }
+
+        // Suggestions came from the workspace that was just disconnected. The
+        // ones an admin dismissed stay, so installing again does not bring
+        // back a match that was already rejected.
+        SlackIdentitySuggestion::pending()->where('team_id', $team->id)
             ->when($workspaceId, fn ($query) => $query->where('slack_team_id', $workspaceId))
             ->delete();
 
@@ -173,6 +196,8 @@ class ChatOps extends Component
         audit()->record(AuditEvent::SlackUninstalled, team: $team, metadata: [
             'slack_team_id' => $workspaceId,
             'reason' => 'removed_by_user',
+            'token_revoked' => $revokeError === null,
+            ...($revokeError !== null ? ['revoke_error' => $revokeError] : []),
         ]);
     }
 
@@ -200,7 +225,7 @@ class ChatOps extends Component
      * reversible day-to-day control is the `enabled` flag, which stays with the
      * team's DBAs; only a system admin may tear the integration down.
      */
-    public function remove(string $provider): void
+    public function remove(string $provider, SlackClient $slack): void
     {
         $team = $this->team();
         $this->assertDba($team);
@@ -220,7 +245,7 @@ class ChatOps extends Component
         $wasInstalled = false;
 
         if ($provider === ChatProvider::Slack && ($installed = $this->installedSlack($team))) {
-            $this->forgetSlackApp($installed, $team);
+            $this->forgetSlackApp($installed, $team, $slack);
             $this->slackDmApprovers = false;
             $wasInstalled = true;
         }

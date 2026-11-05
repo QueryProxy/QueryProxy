@@ -64,6 +64,8 @@ class ChatIntegration extends Model
             'slack_team_id' => null,
             'slack_team_name' => null,
             'slack_channel_id' => null,
+            'installed_by' => null,
+            'installed_at' => null,
         ])->save();
     }
 

@@ -63,16 +63,19 @@ class SlackRequestForm
     }
 
     /**
-     * Suspended and soft-deleted users do not resolve: their chat identity is dead.
+     * The member must be linked in the workspace the request came from: an
+     * identity without a workspace, or from another one, does not resolve.
+     * Suspended and soft-deleted users do not resolve either: their chat
+     * identity is dead.
      */
-    public function resolveUser(string $slackUserId): ?User
+    public function resolveUser(string $slackUserId, string $workspaceId): ?User
     {
         if ($slackUserId === '') {
             return null;
         }
 
         return ChatIdentity::query()
-            ->where('provider', ChatProvider::Slack->value)
+            ->forSlackWorkspace($workspaceId)
             ->where('external_id', $slackUserId)
             ->whereHas('user', fn ($query) => $query->active())
             ->first()
@@ -173,7 +176,7 @@ class SlackRequestForm
         $workspaceId = (string) ($payload['team']['id'] ?? '');
         $slackUserId = (string) ($payload['user']['id'] ?? '');
 
-        $user = $this->resolveUser($slackUserId);
+        $user = $this->resolveUser($slackUserId, $workspaceId);
 
         if ($user === null) {
             return $this->errors(self::BLOCK_CONNECTION, 'Your Slack account is not linked to a QueryProxy user. Ask an admin to link it.');

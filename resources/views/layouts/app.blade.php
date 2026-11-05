@@ -21,13 +21,30 @@
     $isDba = $role === \App\Enums\TeamRole::Dba || $user?->isAdmin();
 @endphp
 
-<div class="grid min-h-screen grid-cols-[232px_minmax(0,1fr)]">
-    <aside class="flex min-h-0 flex-col border-r border-line bg-header">
+<div x-data="{ sidebarOpen: false }"
+     @keydown.escape.window="sidebarOpen = false"
+     @resize.window="if (window.innerWidth >= 768) sidebarOpen = false"
+     class="grid min-h-screen grid-cols-1 md:grid-cols-[232px_minmax(0,1fr)]">
+    {{-- Below md the sidebar is an off-canvas drawer; from md up it is the static first grid column. --}}
+    <div x-show="sidebarOpen" x-cloak x-transition.opacity
+         @click="sidebarOpen = false"
+         class="fixed inset-0 z-40 bg-canvas/70 md:hidden"
+         aria-hidden="true"></div>
+
+    <aside id="app-sidebar"
+           x-trap.noscroll="sidebarOpen"
+           aria-label="Primary"
+           data-open="false"
+           :data-open="sidebarOpen ? 'true' : 'false'"
+           class="fixed inset-y-0 left-0 z-50 flex min-h-0 w-[min(232px,88vw)] flex-col border-r border-line bg-header transition-[transform,visibility] duration-200 max-md:data-[open=false]:invisible max-md:data-[open=false]:-translate-x-full md:static md:z-auto md:w-auto md:transition-none">
         <div class="flex h-12 items-center gap-2.5 border-b border-line px-3.5">
             <a href="{{ route('dashboard') }}" class="flex items-center gap-2.5 text-ink">
                 <x-app-logo />
                 <span class="font-display text-[12.5px] font-semibold uppercase tracking-[0.16em]">QueryProxy</span>
             </a>
+            <x-ui.btn variant="ghost" size="sm" icon="x" class="ml-auto size-10! px-0! md:hidden"
+                      @click="sidebarOpen = false"
+                      aria-label="Close navigation"></x-ui.btn>
         </div>
 
         @if ($user)
@@ -119,6 +136,12 @@
 
     <div class="flex min-w-0 flex-col">
         <header class="flex h-12 shrink-0 items-center gap-3 border-b border-line bg-header px-4">
+            <x-ui.btn variant="ghost" size="sm" icon="menu" class="-ml-2 size-10! px-0! md:hidden"
+                      @click="sidebarOpen = ! sidebarOpen"
+                      aria-label="Open navigation"
+                      aria-controls="app-sidebar"
+                      aria-expanded="false"
+                      x-bind:aria-expanded="sidebarOpen ? 'true' : 'false'"></x-ui.btn>
             <span class="truncate font-mono text-[12px] text-mute-3">
                 {{ $team ? \Illuminate\Support\Str::slug($team->name) : 'no-team' }}<span class="text-hairline"> / </span><span class="text-ink-3">{{ $title ? \Illuminate\Support\Str::slug($title) : 'dashboard' }}</span>
             </span>

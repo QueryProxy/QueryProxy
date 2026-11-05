@@ -712,6 +712,26 @@ final class IntegrationTarget
         };
     }
 
+    /**
+     * Wait until the server no longer runs a statement on session $id, polling
+     * every $intervalMs for up to $seconds. The signal that stops a statement
+     * is answered before the server has cleaned the statement up (SQL Server
+     * lists a killed request for a moment longer), so a single look right
+     * after Stop can still see it. Returns whether it is gone.
+     *
+     * @param  string|null  $token  see statementRunning()
+     */
+    public function waitUntilStatementGone(int $id, ?string $token = null, float $seconds = 5, int $intervalMs = 150): bool
+    {
+        $deadline = microtime(true) + $seconds;
+
+        while ($this->statementRunning($id, $token) && microtime(true) < $deadline) {
+            usleep($intervalMs * 1000);
+        }
+
+        return ! $this->statementRunning($id, $token);
+    }
+
     /** Whether the server still has session $id at all (see statementRunning() for $token). */
     public function sessionExists(int $id, ?string $token = null): bool
     {

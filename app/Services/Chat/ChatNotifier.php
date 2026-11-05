@@ -767,8 +767,10 @@ class ChatNotifier
                 ->whereNull('users.suspended_at')
                 ->pluck('users.id');
 
+            // Only members linked in the workspace the bot is installed in: an
+            // id from another workspace would message a stranger or nobody.
             $slackIds = ChatIdentity::query()
-                ->where('provider', ChatProvider::Slack->value)
+                ->forSlackWorkspace($integration->slack_team_id)
                 ->whereIn('user_id', $approverIds)
                 ->pluck('external_id');
 

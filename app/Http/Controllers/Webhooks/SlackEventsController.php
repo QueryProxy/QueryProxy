@@ -9,6 +9,7 @@ use App\Models\ChatIntegration;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Slack Events API (ADR-027). Only the Slack app's own signing secret is
@@ -66,12 +67,25 @@ class SlackEventsController extends Controller
             ->get();
 
         foreach ($integrations as $integration) {
-            $integration->clearSlackInstallation();
+            // Idempotent: a removal that got there first (the ChatOps page, a
+            // rejected token, a repeated event) already cleared and audited
+            // this installation, so the locked re-read finds nothing to end.
+            DB::transaction(function () use ($integration, $workspaceId, $botUserIds, $reason) {
+                $current = ChatIntegration::query()->lockForUpdate()->find($integration->id);
 
-            audit()->record(AuditEvent::SlackUninstalled, team: $integration->team, metadata: [
-                'slack_team_id' => $workspaceId,
-                'reason' => $reason,
-            ], system: true);
+                if (! $current
+                    || $current->slack_team_id !== $workspaceId
+                    || ($botUserIds !== null && ! in_array($current->bot_user_id, $botUserIds, true))) {
+                    return;
+                }
+
+                $current->clearSlackInstallation();
+
+                audit()->record(AuditEvent::SlackUninstalled, team: $current->team, metadata: [
+                    'slack_team_id' => $workspaceId,
+                    'reason' => $reason,
+                ], system: true);
+            });
         }
     }
 }

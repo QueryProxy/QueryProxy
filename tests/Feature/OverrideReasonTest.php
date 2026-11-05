@@ -69,6 +69,7 @@ function overrideSlackPress(object $test, QueryRequest $request, string $slackUs
 {
     $body = http_build_query(['payload' => json_encode([
         'type' => 'block_actions',
+        'team' => ['id' => 'T_WEBHOOK'],
         'user' => ['id' => $slackUserId],
         'actions' => [['action_id' => 'queryproxy_approve', 'value' => "approve:{$request->id}:{$token}"]],
     ])]);
@@ -171,7 +172,7 @@ test('a slack approve press that would be an override is not applied and answers
 
     [$team, , $admin, $request] = overrideSetup();
     overrideChatIntegrations($team);
-    ChatIdentity::create(['user_id' => $admin->id, 'provider' => 'slack', 'external_id' => 'U_ADMIN']);
+    ChatIdentity::create(['user_id' => $admin->id, 'provider' => 'slack', 'external_id' => 'U_ADMIN', 'team_id' => 'T_WEBHOOK']);
 
     $token = ChatApprovalToken::issueFor($request);
 
@@ -194,7 +195,7 @@ test('a slack approve press by a regular dba is still applied', function () {
 
     [$team, $dba, , $request] = overrideSetup();
     overrideChatIntegrations($team);
-    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA']);
+    ChatIdentity::create(['user_id' => $dba->id, 'provider' => 'slack', 'external_id' => 'U_DBA', 'team_id' => 'T_WEBHOOK']);
 
     overrideSlackPress($this, $request, 'U_DBA', ChatApprovalToken::issueFor($request))->assertOk();
 

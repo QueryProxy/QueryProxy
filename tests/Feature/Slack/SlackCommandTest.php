@@ -1,6 +1,8 @@
 <?php
 
+use App\Enums\QueryRequestStatus;
 use App\Models\AuditLog;
+use App\Models\ChatApprovalToken;
 use App\Models\ChatIdentity;
 use App\Models\ChatIntegration;
 use App\Models\Connection;
@@ -13,6 +15,7 @@ use Illuminate\Http\Client\Request;
 use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Queue;
 use Tests\Support\SlackApp;
 
 function slashCommand(array $overrides = []): array
@@ -379,4 +382,102 @@ test('a refused modal submission can be corrected and sent again from the same m
     $send('DELETE FROM orders WHERE id = 7')->assertOk();
 
     expect(QueryRequest::count())->toBe(1);
+});
+
+// --- Slack identities are bound to a workspace (plan v0.4.2, Faz 03) -------------------------
+
+/** A Slack member id means nothing outside the workspace it was linked in. */
+function pressApprove(object $test, $request, string $token, string $workspace, string $slackUserId = 'U_DBA')
+{
+    return SlackApp::postForm($test, route('webhooks.slack'), ['payload' => json_encode([
+        'type' => 'block_actions',
+        'team' => ['id' => $workspace],
+        'user' => ['id' => $slackUserId],
+        'actions' => [['action_id' => 'queryproxy_approve', 'value' => "approve:{$request->id}:{$token}"]],
+    ])]);
+}
+
+test('an interaction from another workspace does not match an identity with the same Slack user id', function () {
+    Queue::fake();
+    Notification::fake();
+    SlackApp::fakeApi();
+
+    // The team moved to another workspace; its members' identities still carry the old one.
+    [$team, , $developer] = SlackApp::team(['slack_team_id' => 'T_OTHER']);
+    $request = SlackApp::request($team, $developer);
+
+    $response = pressApprove($this, $request, ChatApprovalToken::issueFor($request), 'T_OTHER');
+
+    expect($response->json('text'))->toContain('not linked')
+        ->and($request->fresh()->status)->toBe(QueryRequestStatus::Pending);
+
+    Queue::assertNothingPushed();
+});
+
+test('the same interaction from the workspace the identity was linked in is decided', function () {
+    Queue::fake();
+    Notification::fake();
+    SlackApp::fakeApi();
+
+    [$team, , $developer] = SlackApp::team();
+    $request = SlackApp::request($team, $developer);
+
+    pressApprove($this, $request, ChatApprovalToken::issueFor($request), SlackApp::WORKSPACE)->assertOk();
+
+    expect($request->fresh()->status)->toBe(QueryRequestStatus::Queued);
+});
+
+test('an identity without a workspace matches no interaction', function () {
+    Queue::fake();
+    Notification::fake();
+    SlackApp::fakeApi();
+
+    [$team, , $developer] = SlackApp::team();
+    ChatIdentity::where('external_id', 'U_DBA')->update(['team_id' => null]);
+    $request = SlackApp::request($team, $developer);
+
+    $response = pressApprove($this, $request, ChatApprovalToken::issueFor($request), SlackApp::WORKSPACE);
+
+    expect($response->json('text'))->toContain('not linked')
+        ->and($request->fresh()->status)->toBe(QueryRequestStatus::Pending);
+});
+
+test('a slash command from another workspace does not match an identity with the same Slack user id', function () {
+    SlackApp::fakeApi();
+
+    slackFormSetup();
+    // A second team installed the app in another workspace; U_DEV is linked in the first one only.
+    SlackApp::install(Team::factory()->create(), ['slack_team_id' => 'T_OTHER']);
+
+    $response = SlackApp::postForm($this, route('webhooks.slack.commands'), slashCommand(['team_id' => 'T_OTHER']));
+
+    expect($response->json('response_type'))->toBe('ephemeral')
+        ->and($response->json('text'))->toContain('not linked');
+
+    Http::assertNothingSent();
+});
+
+test('a slash command from an identity without a workspace opens no modal', function () {
+    SlackApp::fakeApi();
+
+    slackFormSetup();
+    ChatIdentity::where('external_id', 'U_DEV')->update(['team_id' => null]);
+
+    $response = SlackApp::postForm($this, route('webhooks.slack.commands'), slashCommand());
+
+    expect($response->json('text'))->toContain('not linked');
+
+    Http::assertNothingSent();
+});
+
+test('a modal submission from another workspace opens no request', function () {
+    SlackApp::fakeApi();
+
+    [$team, , , $granted] = slackFormSetup();
+    SlackApp::install(Team::factory()->create(), ['slack_team_id' => 'T_OTHER']);
+
+    $response = SlackApp::postForm($this, route('webhooks.slack'), viewSubmission('U_DEV', $granted->id, 'SELECT 1', null, 'T_OTHER'));
+
+    expect($response->json('errors.'.SlackRequestForm::BLOCK_CONNECTION))->toContain('not linked')
+        ->and(QueryRequest::count())->toBe(0);
 });

@@ -76,7 +76,7 @@
                                 <x-ui.btn :href="route('integrations.slack.install')" icon="slack">Add to Slack again</x-ui.btn>
                             @endif
                             <x-ui.action wire:click="uninstallSlack"
-                                         wire:confirm="Remove the Slack app from this team? The bot token is deleted and notifications stop, unless a webhook is set up. Remove the app in the Slack workspace as well to revoke its access there."
+                                         wire:confirm="Remove the Slack app from this team? The bot token is revoked on Slack and deleted here, and notifications stop, unless a webhook is set up."
                                          tone="danger">Remove app</x-ui.action>
                         </div>
                     @elseif ($slackAppAvailable)

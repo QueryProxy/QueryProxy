@@ -35,7 +35,8 @@ use Illuminate\Support\Facades\Gate;
  *  - the button value must carry a live, unused action token minted when the
  *    message was posted (so the caller must have seen our message, and each
  *    message decides exactly once);
- *  - the Slack ID must map to a ChatIdentity an admin created;
+ *  - the Slack ID must map to a ChatIdentity an admin created for the
+ *    workspace the click came from;
  *  - that user must belong to the integration's team.
  *
  * The QueryRequestPolicy then has the last word on role and self-review.
@@ -121,8 +122,10 @@ class SlackInteractionController extends Controller
             );
         }
 
+        // A Slack member id is only meaningful inside the workspace it was
+        // linked in: the identity must belong to the workspace of this click.
         $identity = ChatIdentity::query()
-            ->where('provider', 'slack')
+            ->forSlackWorkspace((string) ($payload['team']['id'] ?? ''))
             ->where('external_id', $slackUserId)
             // Suspended and soft-deleted users do not resolve: their chat identity is dead.
             ->whereHas('user', fn ($query) => $query->active())

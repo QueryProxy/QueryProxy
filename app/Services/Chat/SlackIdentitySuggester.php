@@ -53,9 +53,25 @@ class SlackIdentitySuggester
 
         $workspaceId = $integration->slack_team_id;
 
-        $linkedUserIds = ChatIdentity::query()->where('provider', ChatProvider::Slack->value)->pluck('user_id');
-        $linkedSlackIds = ChatIdentity::query()->where('provider', ChatProvider::Slack->value)->pluck('external_id');
-        $alreadySuggested = SlackIdentitySuggestion::query()->where('slack_team_id', $workspaceId)->pluck('user_id');
+        // A user is linked once they hold an identity bound to a workspace. One
+        // without a workspace (made before identities were bound) is not: the
+        // suggestion, once confirmed, binds it. A member already held by
+        // another user is not suggested again (the id is unique per provider).
+        $linkedUserIds = ChatIdentity::query()
+            ->where('provider', ChatProvider::Slack->value)
+            ->whereNotNull('team_id')
+            ->pluck('user_id');
+        $holderByMemberId = ChatIdentity::query()
+            ->where('provider', ChatProvider::Slack->value)
+            ->pluck('user_id', 'external_id');
+        // Dismissed rows are left out: a user whose suggestion was rejected is
+        // looked up again, because only the rejected pair (user, Slack member)
+        // stays rejected. If the address now points at another member, that one
+        // is proposed.
+        $alreadySuggested = SlackIdentitySuggestion::query()
+            ->where('slack_team_id', $workspaceId)
+            ->whereNull('dismissed_at')
+            ->pluck('user_id');
 
         $users = $integration->team->users()
             ->active()
@@ -89,7 +105,20 @@ class SlackIdentitySuggester
 
             // Bots and deactivated members are not people to link; a member
             // already linked to someone else is not suggested for a second user.
-            if ($member === null || $member['is_bot'] || $member['deleted'] || $linkedSlackIds->contains($member['id'])) {
+            if ($member === null || $member['is_bot'] || $member['deleted'] || ($holderByMemberId[$member['id']] ?? $user->id) !== $user->id) {
+                continue;
+            }
+
+            // The pair an admin rejected is not proposed again. Looked up after
+            // the Slack call, so a rejection that landed meanwhile counts too.
+            $dismissed = SlackIdentitySuggestion::query()
+                ->where('user_id', $user->id)
+                ->where('slack_team_id', $workspaceId)
+                ->whereNotNull('dismissed_at')
+                ->where('slack_user_id', $member['id'])
+                ->exists();
+
+            if ($dismissed) {
                 continue;
             }
 
@@ -100,6 +129,8 @@ class SlackIdentitySuggester
                     'slack_user_id' => $member['id'],
                     'matched_email' => $user->email,
                     'status' => SlackIdentitySuggestion::PENDING,
+                    // A different member than the rejected one starts over.
+                    'dismissed_at' => null,
                 ],
             );
 

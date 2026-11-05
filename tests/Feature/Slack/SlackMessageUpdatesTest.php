@@ -4,6 +4,7 @@ use App\Enums\QueryRequestStatus;
 use App\Jobs\ExecuteQueryRequest;
 use App\Models\AuditLog;
 use App\Models\ChatApprovalToken;
+use App\Models\ChatIdentity;
 use App\Models\Connection;
 use App\Models\QueryRequest;
 use App\Models\User;
@@ -422,4 +423,19 @@ test('the first card has no earlier card to retire', function () {
     app(ChatNotifier::class)->requestSubmitted($request);
 
     expect(slackCalls('chat.update'))->toBe([]);
+});
+
+test('approvers linked in another workspace get no direct message', function () {
+    Notification::fake();
+    SlackApp::fakeApi();
+
+    [$team, , $developer] = SlackApp::team(['dm_approvers' => true]);
+    ChatIdentity::where('external_id', 'U_DBA')->update(['team_id' => 'T_OTHER']);
+    $request = SlackApp::request($team, $developer, ['slack_channel' => null, 'slack_ts' => null]);
+
+    app(ChatNotifier::class)->requestSubmitted($request);
+
+    $channels = array_map(fn (Request $sent) => $sent['channel'], slackCalls('chat.postMessage'));
+
+    expect($channels)->toBe([SlackApp::CHANNEL]);
 });

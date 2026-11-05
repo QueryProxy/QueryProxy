@@ -30,7 +30,7 @@ class SlackCommandController extends Controller
             return $this->ephemeral('QueryProxy is not installed for this Slack workspace. Ask a DBA to install it.');
         }
 
-        $user = $form->resolveUser((string) $request->input('user_id'));
+        $user = $form->resolveUser((string) $request->input('user_id'), (string) $request->input('team_id'));
 
         if ($user === null) {
             return $this->ephemeral(

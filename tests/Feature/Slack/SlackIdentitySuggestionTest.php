@@ -1,6 +1,7 @@
 <?php
 
 use App\Jobs\SuggestSlackIdentities;
+use App\Livewire\Admin\Users;
 use App\Models\ChatIdentity;
 use App\Models\SlackIdentitySuggestion;
 use App\Models\User;
@@ -9,6 +10,8 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Schema;
+use Livewire\Livewire;
 use Tests\Support\SlackApp;
 
 function lookupFake(array $byEmail): void
@@ -95,6 +98,121 @@ test('a second run does not repeat lookups for users already suggested', functio
 
     expect(SlackIdentitySuggestion::count())->toBe(1);
     Http::assertSentCount(1);
+});
+
+test('a rejected suggestion is kept, hidden from the list and not proposed again by the next scan', function () {
+    [$team, , , $integration] = SlackApp::team();
+    $newcomer = User::factory()->create(['email' => 'new.person@example.com']);
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+    $admin = User::factory()->create(['is_admin' => true]);
+
+    lookupFake(['new.person@example.com' => ['id' => 'U_NEWCOMER', 'is_bot' => false, 'deleted' => false]]);
+
+    app(SlackIdentitySuggester::class)->suggestFor($integration);
+
+    Livewire::actingAs($admin)->test(Users::class)
+        ->assertSee('Slack matching suggestions')
+        ->call('rejectSlackSuggestion', SlackIdentitySuggestion::sole()->id)
+        ->assertDontSee('Slack matching suggestions');
+
+    $dismissed = SlackIdentitySuggestion::sole();
+
+    expect($dismissed->dismissed_at)->not->toBeNull()
+        ->and($dismissed->status)->toBe(SlackIdentitySuggestion::DISMISSED)
+        ->and(SlackIdentitySuggestion::pending()->count())->toBe(0);
+
+    // The weekly scan runs again: Slack names the same member, so nothing is proposed.
+    expect(app(SlackIdentitySuggester::class)->suggestFor($integration))->toBe(0);
+
+    $again = SlackIdentitySuggestion::sole();
+
+    expect($again->id)->toBe($dismissed->id)
+        ->and($again->dismissed_at)->not->toBeNull()
+        ->and(SlackIdentitySuggestion::pending()->count())->toBe(0)
+        ->and(ChatIdentity::where('user_id', $newcomer->id)->exists())->toBeFalse();
+
+    Livewire::actingAs($admin)->test(Users::class)->assertDontSee('Slack matching suggestions');
+});
+
+test('a rejected user is proposed again only when the address now points at another Slack member', function () {
+    [$team, , , $integration] = SlackApp::team();
+    $person = User::factory()->create(['email' => 'a@example.com']);
+    $team->users()->attach($person, ['role' => 'developer']);
+
+    // The member the address points at; changed below. Http::fake stubs do not replace each other.
+    $memberId = 'U_OLD';
+    Http::fake(function () use (&$memberId) {
+        return Http::response(['ok' => true, 'user' => ['id' => $memberId, 'is_bot' => false, 'deleted' => false]]);
+    });
+
+    app(SlackIdentitySuggester::class)->suggestFor($integration);
+    SlackIdentitySuggestion::sole()->update(['status' => SlackIdentitySuggestion::DISMISSED, 'dismissed_at' => now()]);
+
+    // Same member: still rejected.
+    expect(app(SlackIdentitySuggester::class)->suggestFor($integration))->toBe(0)
+        ->and(SlackIdentitySuggestion::pending()->count())->toBe(0);
+
+    // The address moved to another member: a fresh proposal on the same row.
+    $memberId = 'U_NEW';
+
+    expect(app(SlackIdentitySuggester::class)->suggestFor($integration))->toBe(1);
+
+    $row = SlackIdentitySuggestion::sole();
+
+    expect($row->slack_user_id)->toBe('U_NEW')
+        ->and($row->status)->toBe(SlackIdentitySuggestion::PENDING)
+        ->and($row->dismissed_at)->toBeNull()
+        ->and(SlackIdentitySuggestion::pending()->count())->toBe(1);
+});
+
+test('a rejection that lands while the lookup is in flight is not overwritten', function () {
+    [$team, , , $integration] = SlackApp::team();
+    $newcomer = User::factory()->create(['email' => 'new.person@example.com']);
+    $team->users()->attach($newcomer, ['role' => 'developer']);
+
+    // The batch query found no row for the user; a dismissed one appears while Slack answers.
+    Http::fake(function () use ($team, $newcomer) {
+        SlackIdentitySuggestion::create([
+            'team_id' => $team->id, 'user_id' => $newcomer->id, 'slack_team_id' => SlackApp::WORKSPACE,
+            'slack_user_id' => 'U_NEWCOMER', 'matched_email' => 'new.person@example.com',
+            'status' => 'pending', 'dismissed_at' => now(),
+        ]);
+
+        return Http::response(['ok' => true, 'user' => ['id' => 'U_NEWCOMER', 'is_bot' => false, 'deleted' => false]]);
+    });
+
+    expect(app(SlackIdentitySuggester::class)->suggestFor($integration))->toBe(0)
+        ->and(SlackIdentitySuggestion::sole()->dismissed_at)->not->toBeNull()
+        ->and(SlackIdentitySuggestion::pending()->count())->toBe(0);
+});
+
+test('only undismissed suggestions are pending', function () {
+    [$team] = SlackApp::team();
+    $one = User::factory()->create();
+    $two = User::factory()->create();
+
+    $open = SlackIdentitySuggestion::create([
+        'team_id' => $team->id, 'user_id' => $one->id, 'slack_team_id' => SlackApp::WORKSPACE,
+        'slack_user_id' => 'U_ONE', 'matched_email' => $one->email, 'status' => 'pending',
+    ]);
+    SlackIdentitySuggestion::create([
+        'team_id' => $team->id, 'user_id' => $two->id, 'slack_team_id' => SlackApp::WORKSPACE,
+        'slack_user_id' => 'U_TWO', 'matched_email' => $two->email, 'status' => 'pending', 'dismissed_at' => now(),
+    ]);
+
+    expect(SlackIdentitySuggestion::pending()->pluck('id')->all())->toBe([$open->id]);
+});
+
+test('the dismissed_at migration rolls back and applies again', function () {
+    $path = 'database/migrations/2026_11_04_000001_add_dismissed_at_to_slack_identity_suggestions.php';
+
+    expect(Schema::hasColumn('slack_identity_suggestions', 'dismissed_at'))->toBeTrue();
+
+    $this->artisan('migrate:rollback', ['--path' => $path, '--realpath' => false])->assertSuccessful();
+    expect(Schema::hasColumn('slack_identity_suggestions', 'dismissed_at'))->toBeFalse();
+
+    $this->artisan('migrate', ['--path' => $path])->assertSuccessful();
+    expect(Schema::hasColumn('slack_identity_suggestions', 'dismissed_at'))->toBeTrue();
 });
 
 test('a Slack error stops the run without failing', function () {
@@ -247,4 +365,24 @@ test('rate limits that make no progress in a row stop the chain', function () {
     Queue::fake();
     (new SuggestSlackIdentities($integration->id, 0, SuggestSlackIdentities::MAX_RATE_LIMIT_RETRIES))->handle(app(SlackIdentitySuggester::class));
     Queue::assertNothingPushed();
+});
+
+test('a user whose identity has no workspace is looked up, a bound one is not, and a member held by someone else is skipped', function () {
+    [$team, , , $integration] = SlackApp::team();
+    $unbound = User::factory()->create(['email' => 'unbound@example.com']);
+    $taker = User::factory()->create(['email' => 'taker@example.com']);
+    $team->users()->attach($unbound, ['role' => 'developer']);
+    $team->users()->attach($taker, ['role' => 'developer']);
+    ChatIdentity::create(['user_id' => $unbound->id, 'provider' => 'slack', 'external_id' => 'U_UNBOUND']);
+
+    lookupFake([
+        'unbound@example.com' => ['id' => 'U_UNBOUND', 'is_bot' => false, 'deleted' => false],
+        // U_DBA is already held by the team's DBA.
+        'taker@example.com' => ['id' => 'U_DBA', 'is_bot' => false, 'deleted' => false],
+    ]);
+
+    app(SlackIdentitySuggester::class)->suggestFor($integration);
+
+    expect(SlackIdentitySuggestion::pluck('user_id')->all())->toBe([$unbound->id]);
+
 });
