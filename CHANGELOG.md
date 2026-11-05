@@ -12,6 +12,10 @@ All notable changes to QueryProxy are documented here. The format follows
 
 - **Slack identities are now bound to a workspace (upgrade action may be needed).** A Slack member ID is only honoured in the Slack workspace it was linked in (`chat_identities.team_id`). The migration binds existing identities to the workspace their own teams installed the Slack app in. Identities it cannot assign (typically teams that use the incoming webhook only, users without a team, or users in teams of several workspaces) stay unbound and match nothing: their Approve/Reject buttons, `/queryproxy` and approver direct messages answer "not linked" until they are bound. After upgrading, bind them once: in *Teams & Users* type the workspace ID (`T0123ABC`) and use *Bind N to T…*, or run `php artisan queryproxy:chat:bind-slack-workspace T0123ABC` (asks for confirmation; in a non-interactive environment such as a Kubernetes Job or CI it fails unless `--force` is given). The workspace is always typed explicitly, never guessed, and only identities without a workspace are bound; each one is audited (`chat_identity.linked`, `source = workspace_bind`). An identity bound to a wrong workspace is corrected per user in *Teams & Users*.
 
+### Security
+
+- Symfony components updated to 7.4.23 (`symfony/filesystem`, `http-foundation`, `http-kernel`, `routing`, `yaml`) for the advisories published on 2026-11-04.
+
 ### Fixed
 
 - Removing the Slack app from ChatOps now revokes the bot token on Slack (`auth.revoke`) and clears `installed_by` / `installed_at`; a failed revoke is logged and audited but never keeps the token locally. A concurrent `app_uninstalled` / `tokens_revoked` event no longer writes a second audit entry.
