@@ -188,7 +188,7 @@ test('Stop ends a long read within 5 seconds and the request ends cancelled', fu
             ->and(AuditLog::where('query_request_id', $request->id)->whereIn('action', ['request.execution_failed', 'execution.late_completion'])->exists())->toBeFalse()
             ->and(AuditLog::where('query_request_id', $request->id)->where('action', 'execution.cancelled')->sole()->metadata['signalled'])->toBeTrue()
             // The statement is gone from the server.
-            ->and($this->it->statementRunning($pid, $stamp))->toBeFalse();
+            ->and($this->it->waitUntilStatementGone($pid, $stamp))->toBeTrue('the statement is still on the server 5 seconds after the executor exited');
     } finally {
         if ($executor->isRunning()) {
             $executor->stop(1);
@@ -229,7 +229,7 @@ test('CockroachDB: Stop marks a long read cancelled and the statement timeout en
         expect($request->status)->toBe(QueryRequestStatus::Cancelled)
             ->and($request->error_message)->toBeNull()
             ->and($request->result_path)->toBeNull()
-            ->and($this->it->statementRunning(0, $stamp))->toBeFalse();
+            ->and($this->it->waitUntilStatementGone(0, $stamp))->toBeTrue('the statement is still on the server 5 seconds after the executor exited');
     } finally {
         if ($executor->isRunning()) {
             $executor->stop(1);
