@@ -213,7 +213,7 @@ services:
   vault:
     # Dev mode: in-memory, unsealed, KV v2 mounted at secret/, and a fixed root
     # token. Test-only; never reachable beyond the loopback interface.
-    image: hashicorp/vault:1.20.4@sha256:268bb80aa9c6d13d65fcfa05c0c268caca068952240a8087291a6ce0b66e3a10
+    image: hashicorp/vault:1.21.4@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48c9ee8cea56fccfd2569
     command: ["server", "-dev", "-dev-root-token-id=queryproxy-test-root", "-dev-listen-address=0.0.0.0:8200"]
     cap_add:
       - IPC_LOCK
@@ -231,7 +231,7 @@ services:
     # Secure single node: TLS with the test CA, password logins. This is the
     # main CockroachDB server because an insecure one accepts no passwords at
     # all (no read-only login could be created on it) and offers no TLS.
-    image: cockroachdb/cockroach:v25.4.19@sha256:5f4ea15c81baedabf439ce53fc3fd0793c4d577e4abe295e9343d765112ce199
+    image: cockroachdb/cockroach:v25.4.20@sha256:d2504ac78282b77fc739055a5a614b4f47c1f6caa9bf57305a6d00f862084047
     # The key files must not be readable by others, and a bind-mounted file keeps
     # the mode of the host, so the certificates are copied first.
     # --advertise-addr=localhost: with the default (0.0.0.0) the node cannot
@@ -269,7 +269,7 @@ services:
 
   cockroachdb-notls:
     # Insecure mode: no TLS, and any password is accepted (it is never checked).
-    image: cockroachdb/cockroach:v25.4.19@sha256:5f4ea15c81baedabf439ce53fc3fd0793c4d577e4abe295e9343d765112ce199
+    image: cockroachdb/cockroach:v25.4.20@sha256:d2504ac78282b77fc739055a5a614b4f47c1f6caa9bf57305a6d00f862084047
     command: ["start-single-node", "--insecure", "--advertise-addr=localhost", "--http-addr=127.0.0.1:8080", "--cache=.25", "--max-sql-memory=.25"]
     tmpfs:
       - /cockroach/cockroach-data
