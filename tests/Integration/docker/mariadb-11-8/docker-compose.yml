@@ -15,7 +15,7 @@ services:
   mariadb-11-8:
     # TLS is on by default in 11.8 as in 11.4 (self-made certificate), so the
     # server meant to have none says so.
-    image: mariadb:11.8.9@sha256:c4124d1afa875e47f2892edf26b482fa54f796e2f342d3717a04ca091a22a9bd
+    image: mariadb:11.8.9@sha256:d36f18d65a0459510b8b0f643b226a6d299e3206486e2b64ff20754a6d291707
     command: ["--skip-ssl"]
     environment:
       MARIADB_ROOT_PASSWORD: queryproxy_test
@@ -31,7 +31,7 @@ services:
       retries: 40
 
   mariadb-11-8-tls:
-    image: mariadb:11.8.9@sha256:c4124d1afa875e47f2892edf26b482fa54f796e2f342d3717a04ca091a22a9bd
+    image: mariadb:11.8.9@sha256:d36f18d65a0459510b8b0f643b226a6d299e3206486e2b64ff20754a6d291707
     command:
       - --ssl-ca=/certs/ca.crt
       - --ssl-cert=/certs/server.crt
