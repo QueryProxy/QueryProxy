@@ -152,7 +152,7 @@ services:
   mariadb:
     # MariaDB 11.4 turns TLS on by itself (it makes a self-signed certificate
     # when none is given), so the server meant to have none has to say so.
-    image: mariadb:11.4.13@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+    image: mariadb:11.4.13@sha256:5e73baf8179b29f115101bb102763a47a017361f3e9792daccba6646c3ab1532
     command: ["--skip-ssl"]
     environment:
       MARIADB_ROOT_PASSWORD: queryproxy_test
@@ -168,7 +168,7 @@ services:
       retries: 40
 
   mariadb-tls:
-    image: mariadb:11.4.13@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+    image: mariadb:11.4.13@sha256:5e73baf8179b29f115101bb102763a47a017361f3e9792daccba6646c3ab1532
     command:
       - --ssl-ca=/certs/ca.crt
       - --ssl-cert=/certs/server.crt
