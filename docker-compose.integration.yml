@@ -57,7 +57,7 @@
 
 services:
   pgsql:
-    image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+    image: postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
     environment:
       POSTGRES_DB: queryproxy_test
       POSTGRES_USER: queryproxy_test
@@ -76,7 +76,7 @@ services:
       retries: 40
 
   pgsql-tls:
-    image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+    image: postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
     # PostgreSQL refuses a key file it does not own or that others can read,
     # and a bind-mounted file keeps the owner of the host. So the key is copied
     # to a place the server owns before the stock entrypoint starts it.
