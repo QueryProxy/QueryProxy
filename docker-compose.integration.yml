@@ -231,7 +231,7 @@ services:
     # Secure single node: TLS with the test CA, password logins. This is the
     # main CockroachDB server because an insecure one accepts no passwords at
     # all (no read-only login could be created on it) and offers no TLS.
-    image: cockroachdb/cockroach:v25.4.20@sha256:d2504ac78282b77fc739055a5a614b4f47c1f6caa9bf57305a6d00f862084047
+    image: cockroachdb/cockroach:v25.4.21@sha256:e13b6302b93dc8b5c29102b3611af4ce433947ce0536eb932846150780e83433
     # The key files must not be readable by others, and a bind-mounted file keeps
     # the mode of the host, so the certificates are copied first.
     # --advertise-addr=localhost: with the default (0.0.0.0) the node cannot
@@ -269,7 +269,7 @@ services:
 
   cockroachdb-notls:
     # Insecure mode: no TLS, and any password is accepted (it is never checked).
-    image: cockroachdb/cockroach:v25.4.20@sha256:d2504ac78282b77fc739055a5a614b4f47c1f6caa9bf57305a6d00f862084047
+    image: cockroachdb/cockroach:v25.4.21@sha256:e13b6302b93dc8b5c29102b3611af4ce433947ce0536eb932846150780e83433
     command: ["start-single-node", "--insecure", "--advertise-addr=localhost", "--http-addr=127.0.0.1:8080", "--cache=.25", "--max-sql-memory=.25"]
     tmpfs:
       - /cockroach/cockroach-data
